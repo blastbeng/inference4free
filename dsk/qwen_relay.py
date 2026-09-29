@@ -304,7 +304,14 @@ class QwenRelay:
         self._accept_dialogs()
         self._install_hook()
         self._loaded_at = time.time()
-        if self._composer() is None:
+        composer = None
+        deadline = time.time() + 20   # SPA may still be mounting after reload
+        while time.time() < deadline:
+            composer = self._composer()
+            if composer is not None:
+                break
+            time.sleep(1.5)
+        if composer is None:
             raise RuntimeError('qwen relay: composer not found on landing')
         logger.info('qwen relay: guest composer ready')
 
@@ -317,10 +324,13 @@ class QwenRelay:
                 pass
             self._page = None
         refresher._ensure_display()
+        # When the host egress is WAF-punished (completions silently held),
+        # DSF_QWEN_PROXY routes the relay browser through a proxy instead.
+        relay_proxy = (os.getenv('DSF_QWEN_PROXY', '') or '').strip() or None
         last: Optional[Exception] = None
         for attempt in range(3):
             try:
-                self._page = refresher._browser(headed=True)
+                self._page = refresher._browser(proxy=relay_proxy, headed=True)
                 self._open_home()
                 return
             except Exception as e:  # noqa: BLE001 — wedged tab / challenge
@@ -462,6 +472,53 @@ class QwenRelay:
         from DrissionPage.common import Actions
         Actions(page).key_down('Enter').key_up('Enter')
 
+    def _handle_age_gate(self) -> None:
+        """Dismiss the 2026-09 age-confirmation modal if it blocks the send.
+
+        The year dropdown renders in a portal OUTSIDE the modal element, so
+        menu items are searched document-wide; everything else is scoped to
+        the modal. The guest profile API rejects birthday updates, so the
+        UI path is the only autonomous one.
+        """
+        for _ in range(2):
+            try:
+                if not self._page.ele('css:.age-confirmation-modal', timeout=2):
+                    return
+                trig = self._page.ele(
+                    'css:.age-confirmation-modal '
+                    '.qwen-chat-v2-dropdown-menu-trigger', timeout=4)
+                if trig:
+                    trig.click()
+                    time.sleep(1.5)
+                    self._js(
+                        """var its=document.querySelectorAll('.qwen-chat-v2-dropdown-menu-item');
+              for (var i=0;i<its.length;i++){ if ((its[i].innerText||'').trim()==='1995'){ its[i].click(); break; } } return 'ok';""")
+                    time.sleep(1.2)
+                btn = self._page.ele(
+                    'css:.age-confirmation-modal '
+                    'button.qwen-chat-v2-btn-black', timeout=4)
+                if btn:
+                    btn.click()
+                time.sleep(4)
+            except Exception as e:  # noqa: BLE001
+                logger.warning('qwen relay: age gate handling failed: %s', e)
+                return
+
+    def _resend_if_swallowed(self, prompt: str) -> None:
+        """The first send click can be swallowed by the age gate: if the
+        editor still holds the prompt, click send again."""
+        try:
+            held = str(self._js(
+                'var ed=document.querySelector("textarea, '
+                'div[contenteditable=true]"); return ed ? '
+                '(ed.value || ed.textContent || "") : "";') or '')
+            if held.strip():
+                btn = self._page.ele('css:button.send-button', timeout=3)
+                if btn:
+                    btn.click()
+        except Exception:  # noqa: BLE001 — wait_entry will surface failures
+            pass
+
     def _wait_entry(self) -> Dict[str, Any]:
         deadline = time.time() + self.SEND_TIMEOUT
         while time.time() < deadline:
@@ -575,6 +632,8 @@ class QwenRelay:
                             f'model {model!r} is not offered in the qwen guest '
                             f'picker (offered: {", ".join(self._offered) or "?"})')
                     self._type_and_send(prompt)
+                    self._handle_age_gate()
+                    self._resend_if_swallowed(prompt)
                     entry = self._wait_entry()
                     yield from self._drain(int(entry['id']), model)
                     return

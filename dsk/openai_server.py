@@ -1572,6 +1572,31 @@ async def images_generations(body: ImageGenerationRequest, request: Request):
     return {"created": created, "data": data}
 
 
+def _child_reaper() -> None:
+    """Reap browser subprocesses left behind by DrissionPage launches.
+
+    As PID 1 the server receives every orphan; without this, crashed
+    chromium launches accumulate hundreds of zombies until the container's
+    pid limit chokes (observed: 500+ after a day of refresh cycles).
+    """
+    import signal
+    import time as _time
+
+    def _handler(signum, frame):  # noqa: ARG001 — signal signature
+        pass
+
+    signal.signal(signal.SIGCHLD, _handler)
+    while True:
+        try:
+            while True:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+        except (ChildProcessError, OSError):
+            pass
+        _time.sleep(5)
+
+
 def main():
     import uvicorn
 
@@ -1579,6 +1604,8 @@ def main():
     # refresher/copyist activity) on stderr alongside uvicorn's own logs.
     logging.basicConfig(level=logging.INFO,
                         format='%(levelname)s:%(name)s: %(message)s')
+    threading.Thread(target=_child_reaper, daemon=True,
+                     name='child-reaper').start()
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 

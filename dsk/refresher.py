@@ -133,9 +133,20 @@ class _State:
         self.inline_counts: Dict[str, Tuple[str, int]] = {}  # provider -> (hour, n)
         self.inline_last: Dict[str, Tuple[str, float]] = {}  # provider -> (ok|failed, ts)
         self.inline_threads: Dict[str, threading.Thread] = {}
+        # circuit breaker per (provider, rung): after N consecutive failures a
+        # rung cools down so e.g. an expensive browser login stops burning the
+        # daily budget on a hopelessly blocked egress (cheap rungs keep trying)
+        self.rung_fails: Dict[Tuple[str, str], int] = {}
+        self.rung_blocked_until: Dict[Tuple[str, str], float] = {}
 
 
 _STATE = _State()
+
+# Global signup serialization (council finding): two concurrent signups for
+# different providers still share the egress IP and mail backends — racing
+# them invites IP/email-domain bans. One signup at a time, process-wide
+# (the CLI is a separate OS context, hence a file lock, not a threading one).
+_SIGNUP_LOCK_PATH = _data_dir() / 'signup.lock'
 
 
 def _rotate_history(path) -> None:
@@ -2874,32 +2885,75 @@ def _entry_ts(entry: Dict[str, Any]) -> float:
         return 0.0
 
 
+def _breaker_n() -> int:
+    return max(1, int(os.getenv('DSF_BREAKER_N', '3') or 3))
+
+
+def _breaker_cooldown() -> float:
+    return max(60.0, float(os.getenv('DSF_BREAKER_COOLDOWN_S', '1800') or 1800))
+
+
+def _rung_open(name: str, rung: str) -> bool:
+    with _STATE.lock:
+        return time.time() < _STATE.rung_blocked_until.get((name, rung), 0.0)
+
+
+def _rung_result(name: str, rung: str, ok: bool) -> None:
+    with _STATE.lock:
+        key = (name, rung)
+        if ok:
+            _STATE.rung_fails[key] = 0
+            _STATE.rung_blocked_until.pop(key, None)
+            return
+        n = _STATE.rung_fails.get(key, 0) + 1
+        _STATE.rung_fails[key] = n
+        if n >= _breaker_n():
+            _STATE.rung_fails[key] = 0
+            _STATE.rung_blocked_until[key] = time.time() + _breaker_cooldown()
+    if not ok:
+        with _STATE.lock:
+            open_ = time.time() < _STATE.rung_blocked_until.get((name, rung), 0.0)
+        if open_:
+            _log_history(name, 'breaker-open',
+                         f'{rung}: {_breaker_n()} consecutive failures -> '
+                         f'{_breaker_cooldown():.0f}s cooldown')
+
+
 def _renew_locked(name: str, reason: str) -> Dict[str, Any]:
     steps: List[str] = []
     _log_history(name, 'renew-start', reason or 'proactive')
 
-    ok, detail = REFRESH[name]()
-    steps.append(f'refresh: {detail}')
-    _log_history(name, 'refresh', detail)
-    status = _verify(name)
+    if _rung_open(name, 'refresh'):
+        steps.append('refresh: skipped (breaker open)')
+        status = 'fail'
+    else:
+        ok, detail = REFRESH[name]()
+        steps.append(f'refresh: {detail}')
+        _log_history(name, 'refresh', detail)
+        status = _verify(name)
+        _rung_result(name, 'refresh', status == 'ok')
     if status == 'ok':
         _log_history(name, 'renewed', '; '.join(steps))
         return {'renewed': True, 'via': 'http-refresh', 'steps': steps}
 
-    if _env_bool('DSF_REFRESHER_LOGIN', True):
+    if _env_bool('DSF_REFRESHER_LOGIN', True) and not _rung_open(name, 'login'):
         ok, detail = browser_login(name)
         steps.append(f'login: {detail}')
         _log_history(name, 'browser-login', detail)
         status = _verify(name)
+        _rung_result(name, 'login', status == 'ok')
         if status == 'ok':
             _log_history(name, 'renewed', '; '.join(steps))
             return {'renewed': True, 'via': 'browser-login', 'steps': steps}
 
-    if _env_bool('DSF_REFRESHER_AUTOSIGNUP', True):
-        ok, detail = SIGNUP[name]()   # all providers: create what is missing
+    if _env_bool('DSF_REFRESHER_AUTOSIGNUP', True) \
+            and not _rung_open(name, 'signup'):
+        with _file_lock(_SIGNUP_LOCK_PATH):
+            ok, detail = SIGNUP[name]()   # all providers: create what is missing
         steps.append(f'signup: {detail}')
         _log_history(name, 'autosignup', detail)
         status = _verify(name)
+        _rung_result(name, 'signup', status == 'ok')
         if status == 'ok':
             _log_history(name, 'renewed', '; '.join(steps))
             return {'renewed': True, 'via': 'autosignup', 'steps': steps}
@@ -3077,7 +3131,9 @@ def main(argv: List[str]) -> int:  # pragma: no cover - CLI
         return 0
     if cmd == 'signup':
         prov = argv[2] if len(argv) > 2 else 'deepseek'
-        print(json.dumps(dict(zip(('ok', 'detail'), SIGNUP[prov]())), indent=2))
+        with _file_lock(_SIGNUP_LOCK_PATH):
+            result = SIGNUP[prov]()
+        print(json.dumps(dict(zip(('ok', 'detail'), result)), indent=2))
         return 0
     if cmd == 'bootstrap':
         print(json.dumps(bootstrap_all(), indent=2, default=str))
