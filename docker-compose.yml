@@ -160,3 +160,8 @@ services:
       # Persist cf_clearance cookies across container restarts (local ./data dir)
       - ./data:/data
     shm_size: "1gb"
+    # Guardrail for small hosts (8 GB RAM + zram): the z.ai browser pool and
+    # the python server sit well below ~1 GB after idle-reaper tuning; this
+    # cap only catches runaway leaks (renderer growth, browser pile-up)
+    # before they OOM the host. Container exit is handled by the systemd unit.
+    mem_limit: 2g

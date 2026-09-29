@@ -427,7 +427,7 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_DEFAULT_FALLBACKS` | *(none)* | Comma-separated fallbacks applied to every route |
 | `DSF_MAX_RETRIES` / `DSF_RETRY_BACKOFF` | `2` / `2.0` | Retries per provider before falling back + exponential backoff base (seconds) |
 | `DSF_RETRY_CAP` | `10` | Cap for a single retry wait (honored `Retry-After` included) — lower = faster fallback |
-| `DSF_FIRST_TOKEN_TIMEOUT` | `90` | Seconds a provider may take to emit its FIRST chunk before the router gives up on it and falls back immediately (0 disables) |
+| `DSF_FIRST_TOKEN_TIMEOUT` | `180` | Seconds a provider may take to emit its FIRST chunk before the router gives up on it and falls back immediately (0 disables) |
 | `DSF_PROVIDER_STALL_COOLDOWN` | `120` | Seconds a stalled target is skipped by the fallback chain after a first-token timeout |
 | `COOKIES_DIR` | *(none)* (Docker: `/data`) | Directory where provider cookie files are persisted |
 | `DSF_PROXY` / `DSF_PROXIES` | *(none)* | Single / comma-separated proxy URLs (always in the pool) |

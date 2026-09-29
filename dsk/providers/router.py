@@ -150,7 +150,7 @@ MODELS_TTL = float(os.getenv('DSF_MODELS_TTL', '300'))
 # is treated as unavailable so the router retries/falls back instead of
 # blocking until the full stream timeout. 0 disables. Default covers the
 # cold-start of browser-backed providers (z.ai).
-FIRST_TOKEN_TIMEOUT = max(0.0, float(os.getenv('DSF_FIRST_TOKEN_TIMEOUT', '90') or 90))
+FIRST_TOKEN_TIMEOUT = max(0.0, float(os.getenv('DSF_FIRST_TOKEN_TIMEOUT', '180') or 180))
 # After a first-token stall the target is skipped for this many seconds so a
 # fallback chain never pays the full deadline once per stalled model.
 PROVIDER_STALL_COOLDOWN = max(0.0,

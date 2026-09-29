@@ -1745,16 +1745,17 @@ def _mistral_kratos_submit(nodes: List[Dict[str, Any]],
     return data
 
 
-def _mistral_session_token(s) -> str:
-    """The Ory session cookie's value (name is ``ory_session_<random>`` or
-    ``ory_kratos_session`` depending on the deployment)."""
+def _mistral_session_token(s) -> Tuple[str, str]:
+    """(value, cookie_name) of the Ory session cookie — the name is
+    ``ory_session_<random>`` or ``ory_kratos_session`` depending on the
+    deployment, and the whoami refresh check must replay the exact name."""
     try:
         for name, value in dict(s.cookies).items():
             if name.startswith('ory_') and len(value or '') > 40:
-                return value
+                return value, name
     except Exception:  # noqa: BLE001
         pass
-    return ''
+    return '', ''
 
 
 def _mistral_kratos_login(email: str, password: str
@@ -1773,14 +1774,22 @@ def _mistral_kratos_login(email: str, password: str
         if r.status_code != 200:
             return None, f'login flow HTTP {r.status_code}'
         flow = r.json()
-        for step in range(3):
+        password_sent = False
+        for step in range(4):
             action, nodes = _mistral_kratos_nodes(flow)
             if not action:
                 break
-            fields = {'identifier': email}
-            if any(((n or {}).get('attributes') or {}).get('name')
-                   == 'password' for n in nodes):
+            names = [((n or {}).get('attributes') or {}).get('name')
+                     for n in nodes]
+            fields: Dict[str, str] = {}
+            if 'identifier' in names:
+                # the custom schema re-asks for the identifier on every step
+                fields['identifier'] = email
+            if 'password' in names and not password_sent:
                 fields['password'] = password
+                password_sent = True
+            if not fields:
+                break  # nothing to submit
             r = s.post(action, data=_mistral_kratos_submit(nodes, fields),
                        headers={'Accept': 'application/json'},
                        timeout=30)
@@ -1799,8 +1808,10 @@ def _mistral_kratos_login(email: str, password: str
                    for m in (n.get('messages') if isinstance(n, dict)
                              else []) or []):
                 return None, 'login rejected: invalid credentials'
-        token = _mistral_session_token(s)
+        token, cookie_name = _mistral_session_token(s)
         if token:
+            _save_jar('mistral', {'session_token': token,
+                                  'session_cookie_name': cookie_name})
             return token, 'session token obtained'
         return None, 'login completed but no ory_* session cookie'
     except Exception as e:  # noqa: BLE001
@@ -1858,12 +1869,14 @@ def _mistral_kratos_signup(email: str, password: str,
             state = str(flow.get('state') or '')
             if 'failed' in state or 'error' in state:
                 return None, f'registration rejected (state={state})'
-        token = _mistral_session_token(s)
+        token, cookie_name = _mistral_session_token(s)
         if not token and result:
             # exotic deployment: token only inside the JSON payload
             token = str((result.get('session') or {}).get('session_token')
                         or result.get('session_token') or '')
         if token:
+            _save_jar('mistral', {'session_token': token,
+                                  'session_cookie_name': cookie_name})
             # best-effort email verification — a verified account is more
             # durable; failure here is non-fatal (the session already works)
             try:
@@ -1911,7 +1924,6 @@ def signup_mistral() -> Tuple[bool, str]:
     # 1) pure-HTTP Kratos registration (no browser, no wall)
     token, detail = _mistral_kratos_signup(email, password, session)
     if token:
-        _save_jar('mistral', {'session_token': token, 'email': email})
         _save_account('mistral', email, password, session.get('backend', ''))
         return True, (f'account created via HTTP Kratos, session exported '
                      f'({session.get("backend")}: {email})')
@@ -1958,6 +1970,7 @@ def signup_mistral() -> Tuple[bool, str]:
         if jar_cookies.get('ory_kratos_session'):
             # the provider reads the ``session_token`` jar key
             _save_jar('mistral', {'session_token': jar_cookies['ory_kratos_session'],
+                                  'session_cookie_name': 'ory_kratos_session',
                                   'email': email})
             _save_account('mistral', email, password, session.get('backend', ''))
             return True, (f'account created, session cookie exported '

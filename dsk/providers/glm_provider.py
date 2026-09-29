@@ -466,6 +466,10 @@ class _ZaiBrowser:
         options.set_argument('--disable-gpu')
         options.set_argument('--disable-blink-features=AutomationControlled')
         options.set_argument('--window-size=1440,900')
+        # Memory trim (8 GB SBC): no BFCache renderers held behind the active
+        # tab, no audio utility process — both showed up in RSS profiles.
+        options.set_argument('--disable-back-forward-cache')
+        options.set_argument('--mute-audio')
         if ZAI_HEADLESS or not os.environ.get('DISPLAY'):
             options.headless(True)
         self._page = ChromiumPage(addr_or_opts=options)
@@ -557,6 +561,29 @@ class _ZaiBrowser:
             if time.time() > idle_at:
                 return  # deliver whatever arrived
             time.sleep(0.3)
+
+    # ------------------------------------------------------------- reaping
+    def reap_if_idle(self, stale_after: float) -> None:
+        """Close the browser if it has sat idle past ``stale_after`` seconds.
+
+        ask() already recycles stale sessions on arrival — but that only runs
+        when a request comes in, so the full Chromium footprint stayed
+        resident for the whole idle window. This frees it without traffic
+        (matters on small hosts); the next ask cold-starts a fresh session.
+        Uses a zero-timeout FIFO acquire so a reap can never race an
+        in-flight request or jump the queue of waiting ones."""
+        if self._page is None or self._last_used <= 0:
+            return
+        if not self._busy.acquire(timeout=0):
+            return
+        try:
+            if (self._page is not None and self._last_used > 0
+                    and time.time() - self._last_used > stale_after):
+                logger.debug('z.ai session idle %.0fs — reaper closing',
+                             time.time() - self._last_used)
+                self.close()
+        finally:
+            self._busy.release()
 
     # ------------------------------------------------------------------ ask
     def ask(self, prompt: str, upstream: str, thinking: bool,
@@ -737,6 +764,7 @@ _ZAI_POOL_NEXT = [0]
 def _zai_browser() -> '_ZaiBrowser':
     """Next browser session from the parallel pool (round-robin)."""
     n = _zai_parallel()
+    _start_zai_reaper()
     with _ZAI_POOL_LOCK:
         while len(_ZAI_POOL) < n:
             _ZAI_POOL.append(_ZaiBrowser())
@@ -756,6 +784,39 @@ def _close_zai_pool() -> None:
 
 
 atexit.register(_close_zai_pool)
+
+
+_ZAI_REAPER_THREAD: Optional[threading.Thread] = None
+
+
+def _zai_reaper_loop(stale_after: float) -> None:
+    """Periodically close pool sessions idle beyond ``stale_after`` seconds.
+
+    Complements the on-arrival recycle in ask(): without this the ~400 MB
+    Chromium footprint of every pooled session stays resident for the whole
+    idle window (or forever, when no further requests arrive)."""
+    interval = max(30.0, min(60.0, stale_after / 4))
+    while True:
+        time.sleep(interval)
+        with _ZAI_POOL_LOCK:
+            sessions = list(_ZAI_POOL)
+        for b in sessions:
+            try:
+                b.reap_if_idle(stale_after)
+            except Exception:  # noqa: BLE001 — reaping is best effort
+                logger.debug('z.ai reaper failed on a session', exc_info=True)
+
+
+def _start_zai_reaper() -> None:
+    """Start the idle-session reaper once, when the pool is first used."""
+    global _ZAI_REAPER_THREAD
+    with _ZAI_POOL_LOCK:
+        if _ZAI_REAPER_THREAD is not None and _ZAI_REAPER_THREAD.is_alive():
+            return
+        _ZAI_REAPER_THREAD = threading.Thread(
+            target=_zai_reaper_loop, args=(_ZAI_STALE_AFTER,),
+            name='zai-idle-reaper', daemon=True)
+        _ZAI_REAPER_THREAD.start()
 
 
 def _zai_ask(prompt: str, upstream: str, thinking: bool,

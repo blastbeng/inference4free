@@ -80,13 +80,29 @@ class DeepSeekAPI:
             cookies_path = Path(cookies_dir) / 'cookies.json'
         else:
             cookies_path = Path(__file__).parent / 'cookies.json'
+        self.cookies = self._load_cookies_file(cookies_path)
+
+    @staticmethod
+    def _load_cookies_file(cookies_path) -> Dict[str, str]:
+        """Cookies from the jar file.
+
+        The credential bot (dsk/refresher.py) writes the FLAT jar format
+        ``{cookie_name: value, ...}`` (same store as data/*_cookies.json);
+        the legacy bypass server wrote ``{"cookies": {...}, "user_agent": ...}``.
+        Both are accepted — the flat bot jar is what keeps WAF tokens fresh.
+        """
         try:
             with open(cookies_path, 'r') as f:
                 cookie_data = json.load(f)
-                self.cookies = cookie_data.get('cookies', {})
-        except (FileNotFoundError, json.JSONDecodeError) as e:
+            if isinstance(cookie_data, dict):
+                nested = cookie_data.get('cookies')
+                if isinstance(nested, dict) and nested:
+                    return {k: v for k, v in nested.items() if k and v}
+                return {k: v for k, v in cookie_data.items()
+                        if k and isinstance(v, str) and k != 'user_agent'}
+        except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
             print(f"\033[93mWarning: Could not load cookies from {cookies_path}: {e}\033[0m", file=sys.stderr)
-            self.cookies = {}
+        return {}
 
     def _get_headers(self, pow_response: Optional[str] = None) -> Dict[str, str]:
         headers = {
@@ -109,29 +125,38 @@ class DeepSeekAPI:
         return headers
 
     def _refresh_cookies(self) -> None:
-        """Run the cookie refresh script and reload cookies"""
-        try:
-            # Get path to bypass.py
-            script_path = Path(__file__).parent / 'bypass.py'
+        """Reload cookies from the credential bot's jar (flat format).
 
-            # Run the script
-            subprocess.run([sys.executable, script_path], check=True)
-
-            # Wait briefly for cookies file to be written
-            time.sleep(2)
-
-            # Reload cookies
-            cookies_dir = os.getenv('COOKIES_DIR')
-            if cookies_dir and Path(cookies_dir).is_dir():
-                cookies_path = Path(cookies_dir) / 'cookies.json'
-            else:
-                cookies_path = Path(__file__).parent / 'cookies.json'
-            with open(cookies_path, 'r') as f:
-                cookie_data = json.load(f)
-                self.cookies = cookie_data.get('cookies', {})
-
-        except Exception as e:
-            print(f"\033[93mWarning: Failed to refresh cookies: {e}\033[0m", file=sys.stderr)
+        The credential bot (dsk/refresher.py) re-logs in headlessly and
+        refreshes data/cookies.json (WAF token + session cookies) on every
+        renewal cycle, so reloading the file is the reliable refresh path.
+        The legacy bypass-server subprocess (port-collides with the main
+        server on 8000 and expects Cloudflare cookies DeepSeek no longer
+        issues) only runs as a last resort when the jar carries no WAF
+        token at all.
+        """
+        cookies_dir = os.getenv('COOKIES_DIR')
+        if cookies_dir and Path(cookies_dir).is_dir():
+            cookies_path = Path(cookies_dir) / 'cookies.json'
+        else:
+            cookies_path = Path(__file__).parent / 'cookies.json'
+        fresh = self._load_cookies_file(cookies_path)
+        has_waf = any(k in fresh for k in ('aws-waf-token', 'cf_clearance'))
+        if fresh and has_waf:
+            self.cookies = fresh
+            return
+        if not has_waf:
+            try:
+                # legacy path: standalone bypass server harvests a WAF token
+                script_path = Path(__file__).parent / 'bypass.py'
+                subprocess.run([sys.executable, script_path], check=True,
+                               timeout=180)
+                time.sleep(2)
+                fresh = self._load_cookies_file(cookies_path)
+            except Exception as e:
+                print(f"\033[93mWarning: bypass cookie refresh failed: {e}\033[0m", file=sys.stderr)
+        if fresh:
+            self.cookies = fresh
 
     def _make_request(self, method: str, endpoint: str, json_data: Dict[str, Any], pow_required: bool = False, no_proxy: bool = False) -> Any:
         url = f"{self.BASE_URL}{endpoint}"
@@ -302,10 +327,13 @@ class DeepSeekAPI:
             for chunk in response.iter_lines():
                 try:
                     parsed = self._parse_chunk(chunk)
-                    if parsed:
-                        yield parsed
-                        if parsed.get('finish_reason') == 'stop':
-                            break
+                    # the initial snapshot can carry MULTIPLE fragments
+                    # (thinking + response) in one event
+                    for item in (parsed if isinstance(parsed, list)
+                                 else ([parsed] if parsed else [])):
+                        yield item
+                        if item.get('finish_reason') == 'stop':
+                            return
                 except APIError:
                     raise
                 except Exception as e:
@@ -363,9 +391,28 @@ class DeepSeekAPI:
         path = data.get('p', '')
         value = data.get('v')
 
-        # Initial message snapshot: nothing to stream
+        # Initial message snapshot: DeepSeek can deliver the WHOLE reply
+        # pre-formed inside response fragments (short prompts get no patch
+        # events at all) — emit the fragment contents or short answers are
+        # silently lost.
         if isinstance(value, dict):
-            return None
+            resp = value.get('response') or value
+            chunks: List[Dict[str, Any]] = []
+            for frag in (resp.get('fragments') or []):
+                if not isinstance(frag, dict):
+                    continue
+                ftext = frag.get('content') or ''
+                if not ftext:
+                    continue
+                if str(frag.get('type') or '').upper() == 'THINKING':
+                    chunks.append({'content': ftext, 'type': 'thinking',
+                                   'finish_reason': None})
+                else:
+                    chunks.append({'content': ftext, 'type': 'text',
+                                   'finish_reason': None})
+            if not chunks:
+                return None
+            return chunks[0] if len(chunks) == 1 else chunks
 
         # Completion signal
         if 'status' in path and value == 'FINISHED':
