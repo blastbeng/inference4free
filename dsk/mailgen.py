@@ -171,7 +171,8 @@ def _mailtm_create() -> Optional[Dict[str, Any]]:
 
 def _mailtm_fetch_otp(session: Dict[str, Any], sender_needle: str,
                       code_re: re.Pattern, max_age_min: float,
-                      deadline: float, seen_ids: set) -> Optional[str]:
+                      deadline: float, seen_ids: set,
+                      after_ts: Optional[float] = None) -> Optional[str]:
     """Poll the temp-mail inbox (mail.tm or mail.gw) until a fresh OTP shows."""
     api = str(session.get('api') or MAILTM_API)
     while time.time() < deadline:
@@ -235,7 +236,8 @@ def _tempmail_create() -> Optional[Dict[str, Any]]:
 
 def _tempmail_fetch_otp(session: Dict[str, Any], sender_needle: str,
                         code_re: re.Pattern, max_age_min: float,
-                        deadline: float, seen_ids: set) -> Optional[str]:
+                        deadline: float, seen_ids: set,
+                        after_ts: Optional[float] = None) -> Optional[str]:
     """Poll the tempmail.lol inbox for the verification code."""
     token = session.get('token') or ''
     while time.time() < deadline:
@@ -408,7 +410,9 @@ def _emailnator_create() -> Optional[Dict[str, Any]]:
 
 def _emailnator_fetch_otp(session: Dict[str, Any], sender_needle: str,
                           code_re: re.Pattern, max_age_min: float,
-                          deadline: float, seen_ids: set) -> Optional[str]:
+                          deadline: float, seen_ids: set,
+                          after_ts: Optional[float] = None
+                          ) -> Optional[str]:
     """Poll the emailnator gmail inbox for the verification code."""
     address = session.get('address') or ''
     while time.time() < deadline:
@@ -421,6 +425,12 @@ def _emailnator_fetch_otp(session: Dict[str, Any], sender_needle: str,
             if not mid or mid in seen_ids or msg.get('locked'):
                 continue
             seen_ids.add(mid)
+            if after_ts is not None:
+                try:
+                    if float(msg.get('timestamp') or 0) <= after_ts:
+                        continue  # stale email: its code was already invalidated
+                except (TypeError, ValueError):
+                    pass
             sender = str(msg.get('from') or '').lower()
             subject = str(msg.get('subject') or '').lower()
             if sender_needle and sender_needle not in sender \
@@ -451,7 +461,8 @@ def _imap_catchall_create() -> Optional[Dict[str, Any]]:
 
 def _imap_fetch_otp(session: Dict[str, Any], sender_needle: str,
                     code_re: re.Pattern, max_age_min: float,
-                    deadline: float, seen_ids: set) -> Optional[str]:
+                    deadline: float, seen_ids: set,
+                    after_ts: Optional[float] = None) -> Optional[str]:
     from . import refresher
     # late import avoids a circular dependency (refresher imports mailgen)
     return refresher.imap_otp(max_wait_s=max(1, int(deadline - time.time())),
@@ -512,8 +523,17 @@ def create_email() -> Tuple[Optional[Dict[str, Any]], str]:
 def fetch_otp(session: Dict[str, Any], max_wait_s: int = 180,
               sender_needle: Optional[str] = None,
               code_re: Optional[re.Pattern] = None,
-              max_age_min: float = 30.0) -> Optional[str]:
-    """Block until the OTP lands in the generated mailbox (or timeout)."""
+              max_age_min: float = 30.0,
+              after_ts: Optional[float] = None) -> Optional[str]:
+    """Block until the OTP lands in the generated mailbox (or timeout).
+
+    ``after_ts``: only accept messages that ARRIVED after this unix timestamp.
+    Critical for shared inboxes (emailnator gmail dot-variants host every bot
+    account's mail): a verification email from an earlier request is still
+    sitting in the inbox but its code was already invalidated when a new one
+    was requested — without the cut the fetcher grabs the stale code and the
+    verification silently fails.
+    """
     if not session:
         return None
     sender_needle = (sender_needle
@@ -526,7 +546,7 @@ def fetch_otp(session: Dict[str, Any], max_wait_s: int = 180,
         or _mailtm_fetch_otp
     try:
         return fetcher(session, sender_needle, code_re, max_age_min,
-                       time.time() + max_wait_s, set())
+                       time.time() + max_wait_s, set(), after_ts)
     except Exception as e:  # noqa: BLE001
         print(f'[mailgen] fetch_otp failed: {type(e).__name__}: {e}',
               file=__import__('sys').stderr)

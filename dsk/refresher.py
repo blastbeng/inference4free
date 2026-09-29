@@ -708,7 +708,29 @@ def refresh_mistral() -> Tuple[bool, str]:
     except Exception as e:  # noqa: BLE001
         return False, f'verify failed: {type(e).__name__}: {e}'
     if resp.status_code == 200:
-        return True, 'session valid'
+        # chat.mistral.ai gates model output on a VERIFIED address: a session
+        # over an unverified identity still hits the account-upsell wall.
+        # Converge verification autonomously here (mailbox OTP) so the ladder
+        # never needs a human.
+        try:
+            idn = (resp.json().get('identity') or {})
+            unverified = [a for a in (idn.get('verifiable_addresses') or [])
+                          if isinstance(a, dict) and not a.get('verified')]
+        except Exception:  # noqa: BLE001
+            unverified = []
+        if not unverified:
+            return True, 'session valid'
+        acc = _load_accounts().get('mistral') or {}
+        v_email = (unverified[0].get('value') or acc.get('email') or '')
+        mail_session = acc.get('mail_session') \
+            if isinstance(acc.get('mail_session'), dict) else None
+        if not mail_session and acc.get('backend'):
+            mail_session = {'backend': acc['backend'], 'address': v_email}
+        ok, detail = _mistral_verify_email(v_email, mail_session)
+        if ok:
+            _log_history('mistral', 'verify', detail)
+            return True, f'session valid (address verified: {detail})'
+        return False, f'account unverified; verification failed: {detail}'
     if resp.status_code in (401, 403):
         # Only a hand-imported ENV token may pass unverified: whoami cannot
         # replay the dynamic ``ory_session_<rand>`` cookie name for it. A
@@ -1816,6 +1838,110 @@ def _mistral_session_token(s) -> Tuple[str, str]:
     return '', ''
 
 
+def _mistral_verify_email(email: str,
+                          session: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+    """Verify a mistral account's address via the Ory Kratos verification
+    flow (pure HTTP, mailbox OTP). chat.mistral.ai gates model output on a
+    VERIFIED address — a session over an unverified identity still hits the
+    account-upsell wall (signup issues the session immediately, so this must
+    be converged separately; whoami shows verifiable_addresses[].verified).
+
+    Walks /self-service/verification/browser: submit the email to (re)send
+    the code, poll the signup mailbox, submit the code. Returns (ok, detail).
+    """
+    from curl_cffi import requests as cffi
+    s = cffi.Session(impersonate='chrome120')
+    s.headers.update({'User-Agent': _UA})
+    try:
+        r = s.get(f'{_MISTRAL_AUTH}/self-service/verification/browser',
+                  params={'return_to': 'https://chat.mistral.ai/'},
+                  headers={'Accept': 'application/json'}, timeout=30)
+        if r.status_code == 429:
+            return False, 'verification rate-limited (429) on flow init'
+        if r.status_code != 200:
+            return False, f'verification flow HTTP {r.status_code}'
+        flow = r.json()
+        # Freshness cut: codes belong to the ADDRESS and are invalidated by
+        # every new request — on the shared emailnator inbox, mails from
+        # earlier requests linger and Kratos rejects their codes with
+        # "invalid or has already been used". Only mails arriving AFTER our
+        # request carry a live code.
+        t_request: Optional[float] = None
+        for _step in range(6):
+            action, nodes = _mistral_kratos_nodes(flow)
+            if not action:
+                break
+            names = [((n or {}).get('attributes') or {}).get('name')
+                     for n in nodes]
+            fields: Dict[str, str] = {}
+            # 'code' FIRST: after the email step Kratos keeps BOTH nodes in
+            # the UI ('email' for resending, 'code' for submitting) — checking
+            # email first would re-send forever without ever submitting.
+            if 'code' in names:
+                if not session:
+                    return False, 'code step reached but no signup mailbox known'
+                t_request = t_request or time.time()
+                code = (mailgen.fetch_otp(session, max_wait_s=240,
+                                          sender_needle='mistral',
+                                          after_ts=t_request)
+                        or mailgen.fetch_otp(session, max_wait_s=60,
+                                             sender_needle='mistral',
+                                             after_ts=time.time()))
+                if not code:
+                    return False, 'verification code email not found'
+                fields['code'] = code
+            elif 'email' in names:
+                # code request — the freshness clock starts right here
+                t_request = time.time()
+                fields['email'] = email
+            if not fields:
+                break  # flow finished without asking for anything more
+            payload = _mistral_kratos_submit(nodes, fields)
+            payload['method'] = 'code'  # verification uses the code strategy
+            r = s.post(action, data=payload,
+                       headers={'Accept': 'application/json'}, timeout=30)
+            if r.status_code == 429:
+                return False, ('verification rate-limited (429) — '
+                               'backing off, next cycle retries')
+            try:
+                flow = r.json()
+            except ValueError:
+                flow = {}
+            if isinstance(flow, dict) and flow.get('error'):
+                err = flow['error'] or {}
+                return False, ('verification blocked: '
+                               f'{str(err.get("message") or err)[:120]}')
+            if not flow:
+                break  # redirected to return_to
+            state = str(flow.get('state') or '')
+            if state == 'passed_challenge':
+                return True, 'address verified'
+            if 'failed' in state or 'error' in state:
+                return False, f'verification rejected (state={state})'
+            # Kratos reports submit errors as flow-level ui.messages (not
+            # node messages): a rejected code means the fetched mail was
+            # stale — bump the cut so the next poll only takes newer mails
+            fmsgs = [str(m.get('text') or '')
+                     for m in (flow.get('ui') or {}).get('messages') or []]
+            if any(('invalid' in m.lower()
+                    or 'already been used' in m.lower()) for m in fmsgs):
+                t_request = time.time()
+        # no explicit state: accept only if the flow reports success nodes
+        try:
+            idn_msgs = [str(m.get('text', '')).lower()
+                        for n in (flow.get('ui') or {}).get('nodes', [])
+                        if isinstance(n, dict)
+                        for m in (n.get('messages') if isinstance(n, dict)
+                                  else []) or []]
+        except Exception:  # noqa: BLE001
+            idn_msgs = []
+        if any('verified' in m or 'success' in m for m in idn_msgs):
+            return True, 'address verified (flow messages)'
+        return False, f'verification inconclusive (state={flow.get("state")})'
+    except Exception as e:  # noqa: BLE001
+        return False, f'kratos verification failed: {type(e).__name__}: {e}'
+
+
 def _mistral_kratos_login(email: str, password: str
                           ) -> Tuple[Optional[str], str]:
     """Re-login on auth.mistral.ai (Ory Kratos, pure HTTP, no browser).
@@ -1851,10 +1977,15 @@ def _mistral_kratos_login(email: str, password: str
             r = s.post(action, data=_mistral_kratos_submit(nodes, fields),
                        headers={'Accept': 'application/json'},
                        timeout=30)
+            if r.status_code == 429:
+                return None, 'login rate-limited (429)'
             try:
                 flow = r.json()
             except ValueError:
                 flow = {}
+            if isinstance(flow, dict) and flow.get('error'):
+                err = flow['error'] or {}
+                return None, f'login blocked: {str(err.get("message") or err)[:120]}'
             if not flow:
                 # redirected (302 to return_to) — the session cookie is set
                 break
@@ -1915,10 +2046,15 @@ def _mistral_kratos_signup(email: str, password: str,
             r = s.post(action, data=_mistral_kratos_submit(nodes, fields),
                        headers={'Accept': 'application/json'},
                        timeout=30)
+            if r.status_code == 429:
+                return None, 'signup rate-limited (429)'
             try:
                 flow = r.json()
             except ValueError:
                 flow = {}
+            if isinstance(flow, dict) and flow.get('error'):
+                err = flow['error'] or {}
+                return None, f'signup blocked: {str(err.get("message") or err)[:120]}'
             if flow.get('session'):
                 result = flow  # registered; session issued
                 break
@@ -1935,33 +2071,13 @@ def _mistral_kratos_signup(email: str, password: str,
         if token:
             _save_jar('mistral', {'session_token': token,
                                   'session_cookie_name': cookie_name})
-            # best-effort email verification — a verified account is more
-            # durable; failure here is non-fatal (the session already works)
-            try:
-                vf = next((c.get('flow') for c in
-                           ((result or {}).get('continue_with') or [])
-                           if isinstance(c, dict)
-                           and c.get('action') == 'show_verification_ui'),
-                          None)
-                if vf and vf.get('id'):
-                    rv = s.get(f'{_MISTRAL_AUTH}/self-service/verification',
-                               params={'flow': vf['id']},
-                               headers={'Accept': 'application/json'},
-                               timeout=25)
-                    if rv.status_code == 200:
-                        vaction, vnodes = _mistral_kratos_nodes(rv.json())
-                        code = (mailgen.fetch_otp(session, max_wait_s=180,
-                                                  sender_needle='mistral')
-                                or mailgen.fetch_otp(session, max_wait_s=30,
-                                                    sender_needle=''))
-                        if code and vaction:
-                            vfields = {'code': code}
-                            s.post(vaction,
-                                   data=_mistral_kratos_submit(vnodes, vfields),
-                                   headers={'Accept': 'application/json'},
-                                   timeout=25)
-            except Exception:  # noqa: BLE001 — verification is optional
-                pass
+            # verification is REQUIRED upstream (chat.mistral.ai gates model
+            # output on a verified address - an unverified session still hits
+            # the account-upsell wall) but non-fatal here: refresh_mistral
+            # converges it on the next cycle via the mailbox OTP.
+            vok, vdetail = _mistral_verify_email(email, session)
+            _log_history('mistral', 'verify',
+                         vdetail if vok else f'pending: {vdetail}')
             return token, 'session token obtained'
         return None, 'signup completed but no ory_* session cookie'
     except Exception as e:  # noqa: BLE001
@@ -1982,7 +2098,8 @@ def signup_mistral() -> Tuple[bool, str]:
     # 1) pure-HTTP Kratos registration (no browser, no wall)
     token, detail = _mistral_kratos_signup(email, password, session)
     if token:
-        _save_account('mistral', email, password, session.get('backend', ''))
+        _save_account('mistral', email, password, session.get('backend', ''),
+                      extra={'mail_session': session})
         return True, (f'account created via HTTP Kratos, session exported '
                      f'({session.get("backend")}: {email})')
     # deterministic upstream verdicts — the browser flow hits the same wall
@@ -2030,7 +2147,8 @@ def signup_mistral() -> Tuple[bool, str]:
             _save_jar('mistral', {'session_token': jar_cookies['ory_kratos_session'],
                                   'session_cookie_name': 'ory_kratos_session',
                                   'email': email})
-            _save_account('mistral', email, password, session.get('backend', ''))
+            _save_account('mistral', email, password, session.get('backend', ''),
+                          extra={'mail_session': session})
             return True, (f'account created, session cookie exported '
                           f'({session.get("backend")}: {email})')
         return False, 'signup finished but no Ory session cookie captured'
