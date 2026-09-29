@@ -56,12 +56,13 @@ MISTRAL_CHAT_URL = f'{MISTRAL_BASE_URL}/api/chat'
 # Upstream default chat model id observed in the create-mode request.
 MISTRAL_MODEL = 'mistral-large-2411'
 
-# Mobile app user-agent — required by the tRPC/chat endpoints.
-MISTRAL_APP_UA = (
-    'le-chat-mobile/2.8.0 (build:20800191; os_name:android; '
-    'device_category:smartphone; device_model:unknown; '
-    'device_manufacturer:unknown)'
-)
+# 2026-09: the Android app UA (le-chat-mobile/2.8.0) makes the server replace
+# model output with an "This mode is no longer available — update your app"
+# patch; a desktop-browser UA with platform:'web' streams normally.
+MISTRAL_APP_UA = os.getenv('MISTRAL_UA', (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+))
 
 MISTRAL_CONTEXT_LENGTH = int(os.getenv('DSF_MISTRAL_CONTEXT_LENGTH', '131072'))
 MISTRAL_MAX_OUTPUT = int(os.getenv('DSF_MISTRAL_MAX_OUTPUT', '8192'))
@@ -97,6 +98,11 @@ def _headers(auth: bool = False, accept: str = 'application/json') -> Dict[str, 
     token = _session_token()
     if token:
         headers['Authorization'] = f'Bearer {token}'
+        # chat.mistral.ai classifies Bearer-only requests as anonymous quota;
+        # the Ory session cookie must ride along (council finding).
+        jar = load_jar('mistral') or env_cookies('MISTRAL') or {}
+        name = (jar.get('session_cookie_name') or '').strip() or 'ory_kratos_session'
+        headers['Cookie'] = f'{name}={token}'
     return headers
 
 
@@ -152,16 +158,28 @@ class MistralProvider(Provider):
             raise ProviderError('mistral file attachments are not supported yet')
         self._bootstrap(no_proxy=no_proxy)
         anonymous = not _session_token()
-        attempts = 2 if anonymous else 1
-        last_error: Optional[ProviderError] = None
         retry_id: Optional[str] = None
-        for attempt in range(attempts):
+        last_error: Optional[ProviderError] = None
+        max_attempts = 2 if anonymous else 1
+        attempt = 0
+        # NOTE: _stream_once is a GENERATOR — the account wall and the quota
+        # error raise lazily on the consumer's first next(), i.e. OUTSIDE any
+        # "try: return self._stream_once(...)" wrapper. The retries below only
+        # apply because the generator is drained INSIDE the try.
+        while attempt < max_attempts:
+            attempt += 1
+            emitted = False
             try:
-                return self._stream_once(prompt, no_proxy=no_proxy,
-                                         anon_id=retry_id)
+                for piece in self._stream_once(prompt, no_proxy=no_proxy,
+                                               anon_id=retry_id):
+                    emitted = True
+                    yield piece
+                return
             except ProviderRateLimitError as e:
                 last_error = e
-                if attempt + 1 < attempts:
+                if emitted:
+                    raise  # mid-stream: retrying would duplicate output
+                if attempt < max_attempts:
                     # Fresh anonymous identity resets the 5-msg/day quota.
                     # Generate the UUID HERE and pass it down: re-reading
                     # _anon_id() from the jar after the write would race with
@@ -171,11 +189,15 @@ class MistralProvider(Provider):
                     continue
                 raise
             except ProviderAuthError as e:
+                if emitted:
+                    raise  # mid-stream failure: surfaced as-is
                 # The account wall ALSO trips through pooled datacenter
                 # egresses even with a valid session — retry once direct
                 # before declaring the credential dead.
                 if not no_proxy and 'account upsell' in str(e):
-                    return self._stream_once(prompt, no_proxy=True)
+                    no_proxy = True
+                    max_attempts = attempt + 1  # grant exactly one direct retry
+                    continue
                 raise
         raise last_error or ProviderError('mistral stream failed')
 
@@ -187,12 +209,15 @@ class MistralProvider(Provider):
         body = {
             # 'create' starts the conversation and streams the answer in one
             # call; no 'agentId' key (a null value → HTTP 400).
-            'mode': 'create',
+            'mode': os.getenv('MISTRAL_CHAT_MODE', 'start'),
             'content': [{'type': 'text', 'text': prompt}],
             'files': [],
             'model': MISTRAL_MODEL,
             'stableAnonymousIdentifier': anon_id or _anon_id(),
-            'platform': 'mobile',
+            # 2026-09: the mobile-platform chat flow is deprecated server-side
+            # ("This mode is no longer available"); the web platform with an
+            # authenticated session (Bearer + Ory cookie) still serves free chat.
+            'platform': os.getenv('MISTRAL_PLATFORM', 'web'),
             'clientPromptData': {'currentDate': now},
             'supportedTaskCallbacks': [],
             'features': [],

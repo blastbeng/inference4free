@@ -33,7 +33,18 @@ logger = logging.getLogger(__name__)
 
 
 _CAPTURE_HOOK = r"""
+// A mid-stream reload (Aliyun interstitial, SPA route change) previously wiped
+// the capture buffer in memory. sessionStorage survives same-tab reloads, so
+// the buffer is mirrored there and restored on hook re-install.
+if (!window.__dsfCap) {
+  try { var __s = JSON.parse(sessionStorage.getItem('__dsfCapSave') || 'null');
+        if (__s && __s.reqs) window.__dsfCap = __s; } catch (e) {}
+}
 window.__dsfCap = window.__dsfCap || {reqs: [], seq: 0};
+window.__dsfPersist = window.__dsfPersist || function() {
+  try { sessionStorage.setItem('__dsfCapSave', JSON.stringify(window.__dsfCap)); }
+  catch (e) {}
+};
 window.__dsfEnc = window.__dsfEnc || function(text) {
   var bytes = new TextEncoder().encode(text);
   var bin = '';
@@ -65,9 +76,11 @@ if (!window.__dsfCapHooked) {
             if (step.done) { entry.done = true; return; }
             entry.chunks.push(window.__dsfEnc(
               dec.decode(step.value, {stream: true})));
+            window.__dsfPersist();
             return pump();
           });
-        })().catch(function(e) { entry.done = true; entry.err = String(e); });
+        })().catch(function(e) { entry.done = true; entry.err = String(e);
+                                 window.__dsfPersist(); });
       } catch (e) { entry.done = true; entry.err = String(e); }
       return r;
     }, function(e) { entry.done = true; entry.err = String(e); throw e; });
@@ -95,12 +108,14 @@ if (!window.__dsfCapHooked) {
           if (text.length > prev) {
             entry.chunks.push(window.__dsfEnc(text.slice(prev)));
             entry.xlen = text.length;
+            window.__dsfPersist();
           }
         } catch (e) {}
       });
       xhr.addEventListener('loadend', function() {
         entry.done = true;
         try { entry.status = xhr.status; } catch (e) {}
+        window.__dsfPersist();
       });
     }
     return os.apply(this, arguments);
@@ -186,6 +201,41 @@ class QwenRelay:
         except Exception:  # noqa: BLE001 — crashed/closed browser
             return False
 
+    def _wait_settle(self, timeout: float = 30.0) -> None:
+        """Wait out a mid-flight page reload (DrissionPage raises
+        ContextLostError until the new document is ready)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self._page.run_js('return 1;', timeout=10) == 1:
+                    return
+            except Exception:  # noqa: BLE001
+                time.sleep(1.5)
+        raise RuntimeError('qwen relay: page never settled after reload')
+
+    def _js(self, script: str, retries: int = 4):
+        """run_js that survives a mid-stream reload: waits for the tab to
+        settle, re-installs the capture hook (restoring the sessionStorage
+        mirror), then retries. Raises the last error if never recoverable."""
+        last: Optional[Exception] = None
+        for _ in range(retries):
+            try:
+                return self._page.run_js(script)
+            except Exception as e:  # noqa: BLE001
+                if 'ContextLost' not in type(e).__name__ \
+                        and 'refreshed' not in str(e):
+                    raise
+                last = e
+                logger.warning('qwen relay: page reloaded mid-stream — '
+                               'waiting for settle')
+                time.sleep(2)
+                try:
+                    self._wait_settle()
+                    self._page.run_js(_CAPTURE_HOOK)
+                except Exception:  # noqa: BLE001
+                    continue
+        raise last if last else RuntimeError('qwen relay: js failed')
+
     def _slider_pass(self) -> None:
         from dsk import refresher
         if 'Captcha Interception' in (self._page.title or ''):
@@ -205,15 +255,51 @@ class QwenRelay:
                 continue
 
     def _install_hook(self) -> None:
-        out = str(self._page.run_js(_CAPTURE_HOOK) or '')
-        if out != 'hooked':
-            raise RuntimeError(f'qwen relay hook failed: {out!r}')
+        for attempt in range(3):
+            try:
+                self._wait_settle(timeout=15)
+                out = str(self._page.run_js(_CAPTURE_HOOK) or '')
+                if out == 'hooked':
+                    return
+                raise RuntimeError(f'qwen relay hook failed: {out!r}')
+            except Exception:  # noqa: BLE001 — reload may race the install
+                if attempt == 2:
+                    raise
+                time.sleep(2)
+
+    def _age_gate_seed(self) -> None:
+        """Pre-seed the guest birth year so the SPA's age-verification gate
+        (introduced 2026-09) passes without human input.
+
+        The gate reads ``localStorage['qwen_account_birthday']`` keyed by the
+        user id from /api/v2/users/status and passes when
+        ``currentYear - birthYear > 18``. Seeding + reload is deterministic;
+        clicking through the modal is not (Continue ignores synthetic clicks).
+        """
+        try:
+            out = str(self._js(
+                """return fetch('/api/v2/users/status', {credentials:'include'})
+            .then(function(r){return r.json();})
+            .then(function(j){ var d = (j && (j.data || j)) || {};
+              var id = d.id || (d.userInfo && d.userInfo.id) || null;
+              if (!id) return 'noid';
+              localStorage.setItem('qwen_account_birthday',
+                JSON.stringify({id: id, birthday: '1990-06-15'}));
+              return 'seeded'; });""") or '')
+            if 'seeded' in out:
+                self._page.get('https://chat.qwen.ai/')
+                time.sleep(5)
+                self._wait_settle()
+        except Exception as e:  # noqa: BLE001 — best-effort gate bypass
+            logger.warning('qwen relay: age-gate seed failed: %s', e)
 
     def _open_home(self) -> None:
         """(Re)load the landing composer and reinstall the hook."""
         page = self._page
         page.get('https://chat.qwen.ai/')
         time.sleep(6)
+        self._wait_settle()      # the landing sometimes reloads once more
+        self._age_gate_seed()
         self._slider_pass()
         self._accept_dialogs()
         self._install_hook()
@@ -231,8 +317,25 @@ class QwenRelay:
                 pass
             self._page = None
         refresher._ensure_display()
-        self._page = refresher._browser(headed=True)
-        self._open_home()
+        last: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                self._page = refresher._browser(headed=True)
+                self._open_home()
+                return
+            except Exception as e:  # noqa: BLE001 — wedged tab / challenge
+                last = e
+                logger.warning('qwen relay build attempt %d failed: %s',
+                               attempt + 1, e)
+                try:
+                    if self._page is not None:
+                        self._page.quit()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._page = None
+                time.sleep(3)
+        raise RuntimeError(
+            f'qwen relay: could not build a working session: {last}')
 
     def _ensure(self) -> None:
         if self._alive() and (time.time() - self._loaded_at) <= self.RELOAD_TTL:
@@ -333,7 +436,7 @@ class QwenRelay:
 
     def _type_and_send(self, prompt: str) -> None:
         page = self._page
-        typed = str(page.run_js(
+        typed = str(self._js(
             'var ed = document.querySelector("#chat-input, '
             'div[contenteditable=true], textarea");'
             'if (!ed) return "no-editor";'
@@ -347,6 +450,15 @@ class QwenRelay:
                 raise RuntimeError(f'qwen relay: cannot type ({typed})')
             ele.input(prompt)
         time.sleep(0.8)
+        # 2026-09 UI: Enter no longer submits; a dedicated send-button does.
+        # Fall back to Enter for older UIs.
+        try:
+            btn = page.ele('css:button.send-button', timeout=3)
+            if btn:
+                btn.click()
+                return
+        except Exception:  # noqa: BLE001
+            pass
         from DrissionPage.common import Actions
         Actions(page).key_down('Enter').key_up('Enter')
 
@@ -354,7 +466,7 @@ class QwenRelay:
         deadline = time.time() + self.SEND_TIMEOUT
         while time.time() < deadline:
             time.sleep(self.POLL_S)
-            raw = self._page.run_js('return window.__dsfCapList();') or '[]'
+            raw = self._js('return window.__dsfCapList();') or '[]'
             try:
                 listing = json.loads(raw) or []
             except ValueError:
@@ -365,7 +477,7 @@ class QwenRelay:
                            'request')
 
     def _take(self, eid: int, consumed: int) -> Optional[Dict[str, Any]]:
-        raw = self._page.run_js(
+        raw = self._js(
             f'return window.__dsfCapTake({int(eid)}, {int(consumed)});')
         if not raw:
             return None
@@ -455,22 +567,36 @@ class QwenRelay:
             raise RuntimeError('qwen relay disabled')
         with self._lock:
             self._ensure()
-            try:
-                self._open_home()
-                if not self._select_model(model):
-                    raise RuntimeError(
-                        f'model {model!r} is not offered in the qwen guest '
-                        f'picker (offered: {", ".join(self._offered) or "?"})')
-                self._type_and_send(prompt)
-                entry = self._wait_entry()
-                yield from self._drain(int(entry['id']), model)
-            except RelayPunish:
-                logger.warning('qwen relay: stream failed; rebuilding session')
+            for attempt in (1, 2):
                 try:
-                    self._build()
+                    self._open_home()
+                    if not self._select_model(model):
+                        raise RuntimeError(
+                            f'model {model!r} is not offered in the qwen guest '
+                            f'picker (offered: {", ".join(self._offered) or "?"})')
+                    self._type_and_send(prompt)
+                    entry = self._wait_entry()
+                    yield from self._drain(int(entry['id']), model)
+                    return
+                except RelayPunish:
+                    logger.warning('qwen relay: stream failed; rebuilding session')
+                    try:
+                        self._build()
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning('qwen relay rebuild failed: %s', e)
+                    raise
                 except Exception as e:  # noqa: BLE001
-                    logger.warning('qwen relay rebuild failed: %s', e)
-                raise
+                    # A reload can kill the run before any captured byte:
+                    # rebuild and replay the whole flow once (attempt 2).
+                    if attempt == 2 or 'ContextLost' not in type(e).__name__:
+                        raise
+                    logger.warning('qwen relay: context lost pre-stream; '
+                                   'rebuilding and retrying once')
+                    try:
+                        self._build()
+                    except Exception as e2:  # noqa: BLE001
+                        logger.warning('qwen relay rebuild failed: %s', e2)
+                        raise
 
 
 _RELAY: Optional[QwenRelay] = None

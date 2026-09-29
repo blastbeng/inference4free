@@ -306,6 +306,11 @@ class Router:
         # so later chain positions are served immediately instead of
         # re-waiting the full first-token deadline per target.
         self._stall_until: Dict[str, float] = {}
+        # Round-robin cursors for the auto routers: each request starts its
+        # chain at the NEXT healthy target, cycling among all of them instead
+        # of always serving the same first model (e.g. glm-4.7 on every call).
+        self._rr: Dict[str, int] = {}
+        self._rr_lock = threading.Lock()
         self._lock = threading.Lock()
         # Serializes whole discovery runs; request paths must never wait on
         # a slow provider's list_models (HF cold discovery takes minutes),
@@ -493,6 +498,9 @@ class Router:
         loop still probes every target and falls back on auth/rate/offline
         errors. Vision/image-gen requests are restricted to capable targets;
         explicit thinking/search requests to routes supporting the mode.
+        The healthy front of the chain is round-robin rotated per request:
+        successive calls cycle through every healthy target instead of
+        always starting at the same one.
         """
         ordered: List[str] = []
 
@@ -523,8 +531,13 @@ class Router:
         # or offline providers stay at the very back so the stream loop
         # still probes them — credentials can appear at any moment (the
         # renewal bot runs continuously).
-        chain = ([mid for mid, ok in flags if ok]
-                 + [mid for mid, ok in flags if not ok])
+        healthy = [mid for mid, ok in flags if ok]
+        unhealthy = [mid for mid, ok in flags if not ok]
+        # Round-robin the healthy front: every request starts at the next
+        # healthy target, spreading load across providers instead of
+        # pinning each call to the first one.
+        offset = self._rr_next(f'auto:{category}', len(healthy))
+        chain = healthy[offset:] + healthy[:offset] + unhealthy
         if category in ('vision', 'image_gen'):
             cap = 'image_gen' if category == 'image_gen' else 'vision'
             capable = [mid for mid in chain if getattr(self.routes[mid], cap)]
@@ -554,6 +567,8 @@ class Router:
         first (the rest stay at the back so the stream loop still probes
         them — credentials can appear at any moment). Explicit thinking/
         search requests restrict the chain to routes supporting the mode.
+        The healthy front of the chain is round-robin rotated per request:
+        successive calls cycle through every healthy model.
         """
         ordered: List[str] = [model_id for model_id, route in self.routes.items()
                               if route.provider_name == provider_name]
@@ -565,8 +580,24 @@ class Router:
                 if kept:
                     ordered = kept
         flags = [(mid, self._healthy_model(mid)) for mid in ordered]
-        return ([mid for mid, ok in flags if ok]
-                + [mid for mid, ok in flags if not ok])
+        healthy = [mid for mid, ok in flags if ok]
+        unhealthy = [mid for mid, ok in flags if not ok]
+        offset = self._rr_next(f'pauto:{provider_name}', len(healthy))
+        return healthy[offset:] + healthy[:offset] + unhealthy
+
+    def _rr_next(self, key: str, n: int) -> int:
+        """Next round-robin offset (0..n-1) for a router key.
+
+        Returns 0 when there is nothing to rotate (no/one healthy target);
+        the cursor keeps growing under its own lock so concurrent requests
+        never share the same offset.
+        """
+        if n <= 1:
+            return 0
+        with self._rr_lock:
+            pos = self._rr.get(key, 0)
+            self._rr[key] = pos + 1
+        return pos % n
 
     def register(self, route: Route) -> None:
         """Add/replace a route (used by tests and custom setups)."""
