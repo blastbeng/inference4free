@@ -72,6 +72,7 @@ import random
 import re
 import threading
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from email import message_from_bytes
 from pathlib import Path
@@ -163,6 +164,41 @@ def _log_history(provider: str, event: str, detail: Any = '') -> None:
 
 
 # --------------------------------------------------------------- cookie jars
+@contextmanager
+def _file_lock(path: Path):
+    """Exclusive advisory lock guarding cross-process jar/account writes.
+
+    The refresher daemon thread, the request-path ``renew_inline`` ladder and
+    CLI ``python -m dsk.refresher`` invocations are separate OS contexts that
+    all read-modify-write the same JSON files — without the lock they clobber
+    each other's updates (e.g. a fresh session token lost to a racing writer).
+    """
+    import fcntl
+    fh = open(str(path) + '.lock', 'w')
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield fh
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+def _norm_email(email: str) -> str:
+    """Normalize gmail/googlemail addresses: lowercase + strip dots from the
+    local part. emailnator hands out dot-variants of the SAME inbox, so
+    'a.b@gmail.com' and 'ab@gmail.com' are one mailbox — comparing them
+    naively orphans the signup mailbox and grows accounts.json unboundedly.
+    """
+    e = (email or '').strip().lower()
+    if '@' in e:
+        local, _, domain = e.partition('@')
+        if domain in ('gmail.com', 'googlemail.com'):
+            return local.replace('.', '') + '@gmail.com'
+    return e
+
+
 def _load_jar(name: str) -> Dict[str, str]:
     """Cookies as a flat {name: value} dict (jar file first, env fallback)."""
     jar: Dict[str, str] = {}
@@ -200,43 +236,56 @@ def _load_jar(name: str) -> Dict[str, str]:
 
 
 def _save_jar(name: str, updates: Dict[str, str]) -> None:
-    """Merge cookie updates into the jar file (atomic, bot-managed)."""
+    """Merge cookie updates into the jar file (atomic, bot-managed).
+
+    The read-modify-write runs under an advisory file lock: the refresher
+    daemon thread and CLI renewal processes both write these jars and would
+    otherwise clobber each other's updates (a fresh session token lost to a
+    racing writer). The tmp file is created 0o600 — write_text honours the
+    default umask, leaving a world-readable window before the chmod.
+    """
     path = _jar_path(name)
-    merged: Any
-    try:
-        existing = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else None
-    except (OSError, ValueError):
-        existing = None
-    if isinstance(existing, dict) and isinstance(existing.get('cookies'), dict):
-        base, fmt = dict(existing['cookies']), 'bypass'
-    elif isinstance(existing, list):
-        base = {str(e.get('name')): str(e.get('value'))
-                for e in existing if isinstance(e, dict) and e.get('name')}
-        fmt = 'list'
-    else:
-        base, fmt = dict(existing or {}), 'dict'
-    base.update({k: v for k, v in updates.items() if k and v})
-    if fmt == 'bypass':
-        merged = {'cookies': base,
-                  'user_agent': (existing or {}).get('user_agent', '')}
-    elif fmt == 'list':
-        merged = [{'name': k, 'value': v} for k, v in base.items()]
-    else:
-        merged = base
-    tmp = path.with_suffix(path.suffix + '.new')
-    tmp.write_text(json.dumps(merged, indent=2, ensure_ascii=False),
-                   encoding='utf-8')
-    os.replace(tmp, path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    with _file_lock(path):
+        merged: Any
+        try:
+            existing = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else None
+        except (OSError, ValueError):
+            existing = None
+        if isinstance(existing, dict) and isinstance(existing.get('cookies'), dict):
+            base, fmt = dict(existing['cookies']), 'bypass'
+        elif isinstance(existing, list):
+            base = {str(e.get('name')): str(e.get('value'))
+                    for e in existing if isinstance(e, dict) and e.get('name')}
+            fmt = 'list'
+        else:
+            base, fmt = dict(existing or {}), 'dict'
+        base.update({k: v for k, v in updates.items() if k and v})
+        if fmt == 'bypass':
+            merged = {'cookies': base,
+                      'user_agent': (existing or {}).get('user_agent', '')}
+        elif fmt == 'list':
+            merged = [{'name': k, 'value': v} for k, v in base.items()]
+        else:
+            merged = base
+        tmp = path.with_suffix(path.suffix + '.new')
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(merged, indent=2, ensure_ascii=False))
+        os.replace(tmp, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
 
 
 def _save_deepseek_token(token: str) -> Path:
     path = _data_dir() / 'deepseek_token'
     tmp = path.with_suffix('.new')
-    tmp.write_text(token.strip(), encoding='utf-8')
+    # create the tmp file with 0o600 from the start — write_text honours the
+    # default umask, leaving a world-readable window before the chmod
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        fh.write(token.strip())
     os.replace(tmp, path)
     try:
         path.chmod(0o600)
@@ -314,27 +363,33 @@ def _save_account(name: str, email: str, password: str,
     orphan the signup mailbox and break the activation-link polling on
     the next cycle.
     """
-    accs = _load_accounts()
-    prev = dict(accs.get(name) or {})
-    entry = {'email': email, 'password': password, 'backend': backend,
-             'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
-    if extra:
-        entry.update(extra)
-    same_email = (prev.get('email') or '') == (email or '')
-    if same_email and not entry.get('mail_session') and prev.get('mail_session'):
-        entry['mail_session'] = prev['mail_session']
-    if same_email and not entry.get('backend') and prev.get('backend'):
-        entry['backend'] = prev['backend']
-    accs[name] = entry
     path = _data_dir() / _ACCOUNTS_FILE
-    tmp = path.with_suffix('.new')
-    tmp.write_text(json.dumps(accs, indent=2, ensure_ascii=False),
-                   encoding='utf-8')
-    os.replace(tmp, path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    with _file_lock(path):
+        accs = _load_accounts()
+        prev = dict(accs.get(name) or {})
+        entry = {'email': email, 'password': password, 'backend': backend,
+                 'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+        if extra:
+            entry.update(extra)
+        # gmail dot-variants are the SAME emailnator inbox — compare normalized
+        # so the signup mailbox is never orphaned and accounts.json stays one
+        # entry per real mailbox
+        same_email = (_norm_email(prev.get('email') or '')
+                      == _norm_email(email or ''))
+        if same_email and not entry.get('mail_session') and prev.get('mail_session'):
+            entry['mail_session'] = prev['mail_session']
+        if same_email and not entry.get('backend') and prev.get('backend'):
+            entry['backend'] = prev['backend']
+        accs[name] = entry
+        tmp = path.with_suffix('.new')
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(accs, indent=2, ensure_ascii=False))
+        os.replace(tmp, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
 
 
 def _proxies_kwargs(url: str) -> Dict[str, Any]:
@@ -643,6 +698,7 @@ def refresh_mistral() -> Tuple[bool, str]:
                        'or mistral_cookies.json')
     jar = _load_jar('mistral') or {}
     token = (os.getenv('MISTRAL_SESSION_TOKEN', '') or '').strip()
+    env_token = bool(token)
     cookie_name = jar.get('session_cookie_name') or 'ory_kratos_session'
     if not token:
         token = jar.get('session_token') or ''
@@ -654,11 +710,13 @@ def refresh_mistral() -> Tuple[bool, str]:
     if resp.status_code == 200:
         return True, 'session valid'
     if resp.status_code in (401, 403):
-        if (not jar.get('session_cookie_name') and token):
-            # hand-imported token (env): whoami cannot replay the dynamic
-            # ``ory_session_<rand>`` cookie name — validated at request time
+        # Only a hand-imported ENV token may pass unverified: whoami cannot
+        # replay the dynamic ``ory_session_<rand>`` cookie name for it. A
+        # jar-sourced token being rejected is a REAL expiry — return False so
+        # the ladder escalates to re-login/signup instead of masking it.
+        if env_token and not jar.get('session_cookie_name'):
             return True, ('whoami cannot replay the session cookie name — '
-                          'token unverified (validated at request time)')
+                          'env token unverified (validated at request time)')
         return False, 'session token rejected — re-export from chat.mistral.ai'
     return True, (f'whoami unavailable (HTTP {resp.status_code}) — '
                   'token unverified (validated at request time)')
@@ -2783,6 +2841,10 @@ def renew_inline(name: str, detail: str = '') -> Dict[str, Any]:
     t = threading.Thread(target=_run, name=f'inline-renew-{name}', daemon=True)
     with _STATE.lock:
         _STATE.inline_threads[name] = t
+        # mark the silence window BEFORE the ladder starts: a browser re-login
+        # can run for minutes, and without this a burst of failing requests
+        # passes the 60s check repeatedly and stacks ladders on one provider
+        _STATE.inline_last[name] = ('running', now)
     t.start()
     _log_history(name, 'inline-renew-triggered', detail[:200])
     return {'triggered': True, 'reason': detail[:120]}
@@ -2799,6 +2861,13 @@ def refresh_cycle() -> Dict[str, Any]:
     for name in tuple(REFRESH):
         if not provider_enabled(name):
             continue  # disabled via DSF_PROVIDERS: no routes, no probes, no bot
+        with _STATE.lock:
+            if _STATE.renewing.get(name):
+                # an inline/ladder renewal is running for this provider —
+                # don't race a second ladder (its refresh would run the same
+                # rungs concurrently and double-log)
+                out[name] = 'skipped (renewal already running)'
+                continue
         if not _has_creds(name):
             if not _env_bool('DSF_REFRESHER_AUTOSIGNUP', True):
                 out[name] = 'skipped (no credentials, autosignup off)'

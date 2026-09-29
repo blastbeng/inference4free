@@ -18,6 +18,12 @@ import os
 ThinkingMode = Literal['detailed', 'simple', 'disabled']
 SearchMode = Literal['enabled', 'disabled']
 
+# Throttle for the legacy bypass.py subprocess (harvests a WAF token): it
+# blocks up to 180s INSIDE the request retry loop, so it must never fire more
+# than once per DSF_BYPASS_THROTTLE_S seconds per process.
+_LAST_BYPASS_TS = 0.0
+_BYPASS_THROTTLE_S = float(os.getenv('DSF_BYPASS_THROTTLE_S', '600') or 600)
+
 class DeepSeekError(Exception):
     """Base exception for all DeepSeek API errors"""
     pass
@@ -146,15 +152,31 @@ class DeepSeekAPI:
             self.cookies = fresh
             return
         if not has_waf:
-            try:
-                # legacy path: standalone bypass server harvests a WAF token
-                script_path = Path(__file__).parent / 'bypass.py'
-                subprocess.run([sys.executable, script_path], check=True,
-                               timeout=180)
-                time.sleep(2)
-                fresh = self._load_cookies_file(cookies_path)
-            except Exception as e:
-                print(f"\033[93mWarning: bypass cookie refresh failed: {e}\033[0m", file=sys.stderr)
+            # legacy path: standalone bypass server harvests a WAF token.
+            # The subprocess blocks up to 180s inside the request retry loop,
+            # serializing workers on every CF hit — throttle it to one run per
+            # DSF_BYPASS_THROTTLE_S; while throttled, signal the refresher
+            # daemon's ladder (browser re-login / signup) instead, which
+            # refreshes the jar without blocking any worker.
+            global _LAST_BYPASS_TS
+            now_ts = time.time()
+            if now_ts - _LAST_BYPASS_TS < _BYPASS_THROTTLE_S:
+                try:
+                    from dsk import refresher as _refresher
+                    _refresher.renew_inline('deepseek', 'no WAF token in jar '
+                                            '— daemon renewal signalled')
+                except Exception:
+                    pass
+            else:
+                _LAST_BYPASS_TS = now_ts
+                try:
+                    script_path = Path(__file__).parent / 'bypass.py'
+                    subprocess.run([sys.executable, script_path], check=True,
+                                   timeout=180)
+                    time.sleep(2)
+                    fresh = self._load_cookies_file(cookies_path)
+                except Exception as e:
+                    print(f"\033[93mWarning: bypass cookie refresh failed: {e}\033[0m", file=sys.stderr)
         if fresh:
             self.cookies = fresh
 

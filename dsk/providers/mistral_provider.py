@@ -154,14 +154,20 @@ class MistralProvider(Provider):
         anonymous = not _session_token()
         attempts = 2 if anonymous else 1
         last_error: Optional[ProviderError] = None
+        retry_id: Optional[str] = None
         for attempt in range(attempts):
             try:
-                return self._stream_once(prompt, no_proxy=no_proxy)
+                return self._stream_once(prompt, no_proxy=no_proxy,
+                                         anon_id=retry_id)
             except ProviderRateLimitError as e:
                 last_error = e
                 if attempt + 1 < attempts:
                     # Fresh anonymous identity resets the 5-msg/day quota.
-                    save_jar('mistral', {'stable_anon_id': str(uuid.uuid4())})
+                    # Generate the UUID HERE and pass it down: re-reading
+                    # _anon_id() from the jar after the write would race with
+                    # the refresher daemon's jar updates.
+                    retry_id = str(uuid.uuid4())
+                    save_jar('mistral', {'stable_anon_id': retry_id})
                     continue
                 raise
             except ProviderAuthError as e:
@@ -174,7 +180,9 @@ class MistralProvider(Provider):
         raise last_error or ProviderError('mistral stream failed')
 
     def _stream_once(self, prompt: str,
-                     no_proxy: bool = False) -> Generator[Dict[str, Any], None, None]:
+                     no_proxy: bool = False,
+                     anon_id: Optional[str] = None
+                     ) -> Generator[Dict[str, Any], None, None]:
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
         body = {
             # 'create' starts the conversation and streams the answer in one
@@ -183,7 +191,7 @@ class MistralProvider(Provider):
             'content': [{'type': 'text', 'text': prompt}],
             'files': [],
             'model': MISTRAL_MODEL,
-            'stableAnonymousIdentifier': _anon_id(),
+            'stableAnonymousIdentifier': anon_id or _anon_id(),
             'platform': 'mobile',
             'clientPromptData': {'currentDate': now},
             'supportedTaskCallbacks': [],
