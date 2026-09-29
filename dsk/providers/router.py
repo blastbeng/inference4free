@@ -41,6 +41,7 @@ import importlib
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -49,6 +50,7 @@ from typing import Any, Dict, Generator, List, Optional
 from .base import (
     Route,
     Provider,
+    FirstTokenTimeoutError,
     ProviderAuthError,
     ProviderError,
     ProviderRateLimitError,
@@ -76,7 +78,6 @@ PROVIDER_MODULES = (
     ('copilot', '.copilot_provider', 'CopilotProvider'),
     ('perplexity', '.perplexity_provider', 'PerplexityProvider'),
     ('glm', '.glm_provider', 'GlmProvider'),
-    ('huggingface', '.hf_provider', 'HuggingFaceProvider'),
 )
 
 OWNED_BY = {
@@ -91,12 +92,11 @@ OWNED_BY = {
     'copilot': 'microsoft',
     'perplexity': 'perplexity',
     'glm': 'zai',
-    'huggingface': 'huggingface',
 }
 
 # Public model-id namespaces: every model surfaced via /v1/models and the
 # playground carries its provider prefix (deepseek/deepseek-chat,
-# z.ai/glm-4.7, alibaba/qwen-3-max, huggingface/<space>, …). Routes stay
+# z.ai/glm-4.7, alibaba/qwen-3-max, …). Routes stay
 # keyed by the bare internal id — fallback chains, the auto router and the
 # providers themselves never see prefixed ids; resolve() maps them back.
 PUBLIC_PREFIX = {
@@ -111,29 +111,86 @@ PUBLIC_PREFIX = {
     'copilot': 'microsoft',
     'perplexity': 'perplexity',
     'glm': 'z.ai',
-    'huggingface': 'huggingface',
-    'openrouter': 'openrouter',
-    'groq': 'groq',
 }
+
+# Reverse of PUBLIC_PREFIX: 'z.ai' -> 'glm', used by resolve() so both the
+# public namespace prefix and the bare provider name select a provider's
+# auto router (z.ai/auto and glm/auto both work).
+_PREFIX_TO_PROVIDER = {prefix: name for name, prefix in PUBLIC_PREFIX.items()}
 
 
 def public_model_id(provider_name: str, model_id: str) -> str:
     """Namespace a provider model id for public (API/UI) consumption.
 
-    HuggingFace ids are internal ``hf-<space>`` tags; the public form drops
-    the redundant ``hf-`` (huggingface/<space>). Unknown providers pass ids
-    through unchanged so custom setups stay visible.
+    Unknown providers pass ids through unchanged so custom setups stay
+    visible.
     """
     prefix = PUBLIC_PREFIX.get(provider_name)
     if not prefix:
         return model_id
-    base = re.sub(r'^hf-', '', model_id) if provider_name == 'huggingface' else model_id
-    return f'{prefix}/{base}'
+    return f'{prefix}/{model_id}'
+
+
+def provider_auto_id(provider_name: str) -> str:
+    """Public id of a provider-scoped auto router (deepseek/auto, z.ai/auto,
+    alibaba/auto, …). Providers without a namespace prefix use
+    ``<provider_name>/auto`` so the id can never collide with the global
+    ``auto`` smart router."""
+    prefix = PUBLIC_PREFIX.get(provider_name)
+    return f'{prefix}/auto' if prefix else f'{provider_name}/auto'
 
 MAX_RETRIES = int(os.getenv('DSF_MAX_RETRIES', '2'))
 RETRY_BACKOFF = float(os.getenv('DSF_RETRY_BACKOFF', '2.0'))
-RETRY_CAP = 30.0
+# Cap for a single retry wait (honored Retry-After included): a request must
+# never stall tens of seconds on one backoff — better to fall back quickly.
+RETRY_CAP = max(1.0, float(os.getenv('DSF_RETRY_CAP', '10') or 10))
 MODELS_TTL = float(os.getenv('DSF_MODELS_TTL', '300'))
+# Deadline for the FIRST stream chunk (seconds). A provider that connects but
+# yields nothing within this window (hung proxy, busy upstream, stuck session)
+# is treated as unavailable so the router retries/falls back instead of
+# blocking until the full stream timeout. 0 disables. Default covers the
+# cold-start of browser-backed providers (z.ai).
+FIRST_TOKEN_TIMEOUT = max(0.0, float(os.getenv('DSF_FIRST_TOKEN_TIMEOUT', '90') or 90))
+# After a first-token stall the target is skipped for this many seconds so a
+# fallback chain never pays the full deadline once per stalled model.
+PROVIDER_STALL_COOLDOWN = max(0.0,
+                              float(os.getenv('DSF_PROVIDER_STALL_COOLDOWN', '120') or 120))
+
+
+def _first_chunk(gen, timeout: float) -> Optional[Dict[str, Any]]:
+    """Pull the generator's FIRST chunk under a deadline (thread-assisted).
+
+    Returns the first chunk, or None when the stream ended without emitting
+    anything. On timeout the stalled generator is abandoned and
+    ProviderUnavailableError is raised so the router retries / falls back —
+    instead of the request hanging until the full stream timeout.
+    Non-timeout exceptions raised by the generator propagate unchanged.
+    """
+    box: queue.Queue = queue.Queue()
+
+    def _pull():
+        try:
+            box.put(next(gen))
+        except StopIteration:
+            box.put(None)
+        except BaseException as exc:  # noqa: BLE001 — re-raised in caller
+            box.put(exc)
+
+    threading.Thread(target=_pull, name='first-token', daemon=True).start()
+    try:
+        item = box.get(timeout=timeout)
+    except queue.Empty:
+        try:
+            gen.close()  # no-op when the frame is executing in the worker
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+        raise FirstTokenTimeoutError(
+            f'no first token within {timeout:.0f}s (stalled upstream/proxy)')
+    if item is None:
+        return None
+    if isinstance(item, BaseException):
+        raise item
+    return item
 
 
 def _csv_env(name: str, default: str) -> List[str]:
@@ -173,10 +230,9 @@ AUTO_CATEGORIES: Dict[str, List[str]] = {
     'vision':      ['chatgpt', 'gemini', 'glm'],
     'translation': ['gemini', 'chatgpt', 'deepseek', 'glm', 'qwen', 'mistral'],
     'summarize':   ['chatgpt', 'gemini', 'glm', 'qwen', 'mistral', 'deepseek'],
-    'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt',
-                    'huggingface'],
+    'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt'],
     'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral',
-                    'kimi', 'huggingface'],
+                    'kimi'],
 }
 
 _RE_CODE_FENCE = re.compile(
@@ -245,6 +301,11 @@ class Router:
         # provider name -> {public prefixed id -> internal route id}; rebuilt
         # per provider in _apply_provider_models, consumed by resolve().
         self._aliases: Dict[str, Dict[str, str]] = {}
+        # target ('provider/model') -> epoch until which it is skipped after
+        # a first-token stall: a stalled upstream rarely recovers in seconds,
+        # so later chain positions are served immediately instead of
+        # re-waiting the full first-token deadline per target.
+        self._stall_until: Dict[str, float] = {}
         self._lock = threading.Lock()
         # Serializes whole discovery runs; request paths must never wait on
         # a slow provider's list_models (HF cold discovery takes minutes),
@@ -260,7 +321,7 @@ class Router:
             self._apply_fallbacks()
         except Exception as e:  # pragma: no cover - defensive
             logger.warning('deepseek route bootstrap failed: %s', e)
-        self._auto_route()
+        self._auto_routes()
 
     # -------------------------------------------------------------- discovery
     def refresh_models(self, auth_key: Optional[str] = None,
@@ -280,7 +341,7 @@ class Router:
                 try:
                     # Only DeepSeek can authenticate per-request (userToken as
                     # API key); the web providers use operator cookies.
-                    # OUTSIDE _lock: a slow discovery (huggingface cold start)
+                    # OUTSIDE _lock: a slow discovery (cold provider start)
                     # must not stall request routing for minutes.
                     discovered[name] = provider.list_models(
                         auth_key if name == 'deepseek' else None)
@@ -348,14 +409,13 @@ class Router:
             if self.routes.get(model_id) != route:
                 changed = True
             self.routes[model_id] = route
-            # Public namespace alias. Both the canonical prefixed id and
-            # (for huggingface) the hf--tagged variant resolve back here.
+            # Public namespace alias: the canonical prefixed id maps back.
             pub = public_model_id(name, model_id)
             aliases[pub] = model_id
-            if name == 'huggingface' and pub != f'huggingface/{model_id}':
-                aliases[f'huggingface/{model_id}'] = model_id
         self._aliases[name] = aliases
-        # Drop models of this provider that disappeared upstream.
+        # Drop models of this provider that disappeared upstream. Router-owned
+        # synthetic routes (the 'auto' smart routers) never match a real
+        # provider name, so re-discovery can never drop them.
         for model_id in [m for m, r in self.routes.items()
                          if r.provider_name == name and m not in wanted]:
             del self.routes[model_id]
@@ -372,8 +432,8 @@ class Router:
         explicit = _parse_fallbacks()
         default_chain = _csv_env('DSF_DEFAULT_FALLBACKS', '')
         for model_id, route in self.routes.items():
-            if model_id == AUTO_MODEL_ID:
-                continue  # dynamic chain, rebuilt per request
+            if route.provider_name == 'router':
+                continue  # auto routers: dynamic chain, rebuilt per request
             chain = explicit.get(model_id) or default_chain
             route.fallbacks = []
             for fallback in chain:
@@ -394,6 +454,32 @@ class Router:
             self.routes[AUTO_MODEL_ID] = route
         return route
 
+    def _provider_auto_route(self, provider_name: str) -> Route:
+        """Return (registering on first use) the synthetic '<prefix>/auto'
+        route of one provider: a smart router restricted to that provider's
+        own discovered models. Registered for every enabled provider so the
+        routes survive re-discovery (``_apply_provider_models`` never touches
+        router-owned routes)."""
+        model_id = provider_auto_id(provider_name)
+        route = self.routes.get(model_id)
+        if route is None or route.provider_name != 'router':
+            route = Route(
+                model_id=model_id,
+                provider_name='router',
+                upstream_model=provider_name,
+                vision=True, image_gen=True,
+            )
+            self.routes[model_id] = route
+        return route
+
+    def _auto_routes(self) -> None:
+        """(Re-)register every synthetic auto route: the global smart router
+        plus one per-provider router. Called at init and after provider
+        reloads; re-discovery preserves them."""
+        self._auto_route()
+        for name in self.providers:
+            self._provider_auto_route(name)
+
     def _auto_chain(self, category: str,
                     thinking_override: Optional[bool] = None,
                     search_override: Optional[bool] = None) -> List[str]:
@@ -412,7 +498,7 @@ class Router:
 
         def _expand(pref: str) -> None:
             for model_id, route in self.routes.items():
-                if route.model_id == AUTO_MODEL_ID or model_id in ordered:
+                if route.provider_name == 'router' or model_id in ordered:
                     continue
                 if (route.provider_name == pref
                         or route.model_id.startswith(pref + '-')):
@@ -420,8 +506,8 @@ class Router:
 
         for pref in AUTO_CATEGORIES.get(category, AUTO_CATEGORIES['general']):
             _expand(pref)
-        for model_id in self.routes:
-            if model_id != AUTO_MODEL_ID and model_id not in ordered:
+        for model_id, route in self.routes.items():
+            if route.provider_name != 'router' and model_id not in ordered:
                 ordered.append(model_id)
 
         for flag, requested in (('thinking_enabled', thinking_override),
@@ -432,17 +518,7 @@ class Router:
                 if kept:
                     ordered = kept
 
-        def _healthy(model_id: str) -> bool:
-            route = self.routes.get(model_id)
-            provider = self.providers.get(route.provider_name) if route else None
-            if provider is None:
-                return False
-            try:
-                return bool(provider.available())
-            except Exception:  # noqa: BLE001 — a broken probe means unproven
-                return False
-
-        flags = [(mid, _healthy(mid)) for mid in ordered]
+        flags = [(mid, self._healthy_model(mid)) for mid in ordered]
         # Healthy targets first (category order preserved); credential-less
         # or offline providers stay at the very back so the stream loop
         # still probes them — credentials can appear at any moment (the
@@ -454,7 +530,43 @@ class Router:
             capable = [mid for mid in chain if getattr(self.routes[mid], cap)]
             if capable:
                 chain = capable
-        return [mid for mid in chain if mid != AUTO_MODEL_ID]
+        return [mid for mid in chain
+                if self.routes.get(mid) is not None
+                and self.routes[mid].provider_name != 'router']
+
+    def _healthy_model(self, model_id: str) -> bool:
+        """Live credential/health probe for one route target."""
+        route = self.routes.get(model_id)
+        provider = self.providers.get(route.provider_name) if route else None
+        if provider is None:
+            return False
+        try:
+            return bool(provider.available())
+        except Exception:  # noqa: BLE001 — a broken probe means unproven
+            return False
+
+    def _provider_chain(self, provider_name: str,
+                        thinking_override: Optional[bool] = None,
+                        search_override: Optional[bool] = None) -> List[str]:
+        """Build the ordered chain for a '<prefix>/auto' provider router.
+
+        Every discovered model of that single provider, healthy targets
+        first (the rest stay at the back so the stream loop still probes
+        them — credentials can appear at any moment). Explicit thinking/
+        search requests restrict the chain to routes supporting the mode.
+        """
+        ordered: List[str] = [model_id for model_id, route in self.routes.items()
+                              if route.provider_name == provider_name]
+        for flag, requested in (('thinking_enabled', thinking_override),
+                                ('search_enabled', search_override)):
+            if requested:
+                kept = [mid for mid in ordered
+                        if getattr(self.routes[mid], flag)]
+                if kept:
+                    ordered = kept
+        flags = [(mid, self._healthy_model(mid)) for mid in ordered]
+        return ([mid for mid, ok in flags if ok]
+                + [mid for mid, ok in flags if not ok])
 
     def register(self, route: Route) -> None:
         """Add/replace a route (used by tests and custom setups)."""
@@ -483,6 +595,7 @@ class Router:
             self._apply_fallbacks()
         except Exception as e:  # pragma: no cover - defensive
             logger.warning('deepseek route bootstrap failed after reload: %s', e)
+        self._auto_routes()
         threading.Thread(target=self.refresh_models, kwargs={'force': True},
                          name='model-re-discovery', daemon=True).start()
         return changed
@@ -503,6 +616,13 @@ class Router:
         route = self.routes.get(model_id)
         if route is not None:
             return route
+        # '<prefix>/auto' or '<provider>/auto' selects the provider-scoped
+        # smart router (deepseek/auto, z.ai/auto, alibaba/auto, glm/auto…).
+        if model_id.endswith('/auto'):
+            prefix = model_id[:-len('/auto')]
+            name = _PREFIX_TO_PROVIDER.get(prefix, prefix)
+            if name in self.providers:
+                return self._provider_auto_route(name)
         route = self._resolve_alias(model_id)
         if route is not None:
             return route
@@ -518,7 +638,7 @@ class Router:
 
     def _resolve_alias(self, model_id: str) -> Optional[Route]:
         """Map a provider-prefixed public id (deepseek/deepseek-chat,
-        z.ai/glm-4.7, huggingface/<space>, …) back to its internal route."""
+        z.ai/glm-4.7, …) back to its internal route."""
         for aliases in self._aliases.values():
             mid = aliases.get(model_id)
             if mid:
@@ -535,7 +655,7 @@ class Router:
         """OpenAI-style /v1/models payload with agent-tooling metadata.
 
         Every id is provider-prefixed (deepseek/deepseek-chat, z.ai/glm-4.7,
-        alibaba/qwen-3-max, huggingface/<space>, …); resolve() accepts both
+        alibaba/qwen-3-max, …); resolve() accepts both
         the prefixed and the bare internal form.
         """
         auto = self.routes.get(AUTO_MODEL_ID)
@@ -564,6 +684,33 @@ class Router:
                 'image_gen': True,
                 'fallbacks': [],
             })
+        # Per-provider smart routers (deepseek/auto, z.ai/auto, …): listed
+        # right after the global auto. Capability flags are the union of the
+        # provider's discovered models (all-True before discovery completes
+        # so clients do not pre-gate — the router filters at serve time).
+        for r in self.routes.values():
+            if r.provider_name != 'router' or r.model_id == AUTO_MODEL_ID:
+                continue
+            siblings = [s for s in self.routes.values()
+                        if s.provider_name == r.upstream_model]
+            entries.append({
+                'id': r.model_id,
+                'object': 'model',
+                'created': 1700000000,
+                'owned_by': OWNED_BY.get(r.upstream_model, r.upstream_model),
+                'context_length': 131072,
+                'max_model_len': 131072,
+                'max_completion_tokens': 32768,
+                'max_tokens': 32768,
+                'thinking_enabled': (not siblings
+                                     or any(s.thinking_enabled for s in siblings)),
+                'search_enabled': (not siblings
+                                   or any(s.search_enabled for s in siblings)),
+                'vision': (not siblings or any(s.vision for s in siblings)),
+                'image_gen': (not siblings
+                              or any(s.image_gen for s in siblings)),
+                'fallbacks': [],
+            })
         entries.extend(
             {
                 'id': _pub(r.model_id),
@@ -581,7 +728,7 @@ class Router:
                 'image_gen': r.image_gen,
                 'fallbacks': [_pub(f) for f in r.fallbacks],
             }
-            for r in self.routes.values() if r.model_id != AUTO_MODEL_ID
+            for r in self.routes.values() if r.provider_name != 'router'
         )
         return entries
 
@@ -607,20 +754,38 @@ class Router:
         thinking = route.thinking_enabled if thinking_override is None else thinking_override
         search = route.search_enabled if search_override is None else search_override
 
-        if route.model_id == AUTO_MODEL_ID:
-            # Smart router: classify the request and build the chain from
-            # live provider state (preferred category models first, the rest
-            # as safety net). The loop below still handles rate limits, auth
-            # failures (with inline renewal), outages and blocks.
-            category = classify_request(prompt, bool(images), image_generation)
-            chain = self._auto_chain(category, thinking_override,
-                                     search_override)
-            if not chain:
-                raise ProviderError(
-                    'auto router found no available model — providers are '
-                    'still discovering or credentials are being renewed')
-            logger.info('auto router: category=%s chain=%s', category,
-                        ' -> '.join(chain[:5]) + ('…' if len(chain) > 5 else ''))
+        if route.provider_name == 'router':
+            if route.model_id == AUTO_MODEL_ID:
+                # Global smart router: classify the request and build the
+                # chain from live provider state (preferred category models
+                # first, the rest as safety net). The loop below still
+                # handles rate limits, auth failures (with inline renewal),
+                # outages and blocks.
+                category = classify_request(prompt, bool(images),
+                                            image_generation)
+                chain = self._auto_chain(category, thinking_override,
+                                         search_override)
+                if not chain:
+                    raise ProviderError(
+                        'auto router found no available model — providers '
+                        'are still discovering or credentials are renewed')
+                logger.info('auto router: category=%s chain=%s', category,
+                            ' -> '.join(chain[:5])
+                            + ('…' if len(chain) > 5 else ''))
+            else:
+                # Provider-scoped smart router ('<prefix>/auto'): the same
+                # serve-time machinery restricted to one provider's models.
+                chain = self._provider_chain(route.upstream_model,
+                                             thinking_override,
+                                             search_override)
+                if not chain:
+                    raise ProviderError(
+                        f'{route.model_id}: provider {route.upstream_model!r} '
+                        'has no discovered models yet — still discovering or '
+                        'credentials are being renewed')
+                logger.info('%s: chain=%s', route.model_id,
+                            ' -> '.join(chain[:5])
+                            + ('…' if len(chain) > 5 else ''))
         else:
             chain = [route.model_id] + [f for f in route.fallbacks
                                         if f != route.model_id]
@@ -642,12 +807,24 @@ class Router:
 
         for position, model_id in enumerate(chain):
             target = self.routes.get(model_id)
-            if target is None:
+            # Router-owned synthetic targets can only enter a chain via a
+            # hand-written DSF_FALLBACKS entry — they must never be served
+            # directly (their provider is the router itself).
+            if target is None or target.provider_name == 'router':
                 continue
             provider = self.providers.get(target.provider_name)
             if provider is None:
                 continue
             served_by = f'{target.provider_name}/{target.upstream_model}'
+            stall_key = f'{target.provider_name}/{target.upstream_model}'
+            stall_until = getattr(self, '_stall_until', None) or {}
+            if stall_until.get(stall_key, 0) > time.time():
+                # stalled moments ago: skip instead of re-waiting the full
+                # first-token deadline (the last chain target is still tried)
+                if position < len(chain) - 1:
+                    logger.info('skipping %s: stalled recently (cooldown)',
+                                served_by)
+                    continue
             attempt = 0
             while True:
                 attempt += 1
@@ -661,8 +838,26 @@ class Router:
                         no_proxy=no_proxy,
                         auth_key=auth_key,
                     )
+                    if FIRST_TOKEN_TIMEOUT > 0:
+                        # stall watchdog: a provider that connects but never
+                        # yields is retried/fallen back, never hung-up-on
+                        first = _first_chunk(gen, FIRST_TOKEN_TIMEOUT)
+                        if first is not None:
+                            emitted = True
+                            try:
+                                self._stall_until.pop(stall_key, None)
+                            except Exception:  # noqa: BLE001 — bookkeeping
+                                pass
+                            if isinstance(first, dict):
+                                first.setdefault('served_by', served_by)
+                            yield first
                     for chunk in gen:
-                        emitted = True
+                        if not emitted:  # first chunk: target recovered
+                            emitted = True
+                            try:
+                                self._stall_until.pop(stall_key, None)
+                            except Exception:  # noqa: BLE001 — bookkeeping
+                                pass
                         if isinstance(chunk, dict):
                             chunk.setdefault('served_by', served_by)
                         yield chunk
@@ -680,6 +875,22 @@ class Router:
                         continue
                     logger.warning('%s rate limited after %d attempts: %s',
                                    served_by, attempt - 1, e)
+                    break
+                except FirstTokenTimeoutError as e:
+                    # a stalled upstream does not recover within seconds:
+                    # skip the retry ladder, fall back right away and put the
+                    # target on a stall cooldown so later chain positions are
+                    # not re-waited either
+                    last_error = e
+                    if emitted:
+                        raise  # mid-stream failure: fallback would duplicate output
+                    try:
+                        self._stall_until[stall_key] = (time.time()
+                                                        + PROVIDER_STALL_COOLDOWN)
+                    except Exception:  # noqa: BLE001 — bookkeeping only
+                        pass
+                    logger.warning('%s stalled without first token, skipping '
+                                   'to fallback: %s', served_by, e)
                     break
                 except ProviderUnavailableError as e:
                     last_error = e

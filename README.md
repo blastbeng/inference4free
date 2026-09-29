@@ -425,6 +425,10 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_MODELS_TTL` | `300` | Seconds between dynamic model re-discovery across providers |
 | `DSF_FALLBACKS` | *(none)* | JSON map of per-model fallback chains, e.g. `{"deepseek-chat": ["deepseek-reasoner"]}` |
 | `DSF_DEFAULT_FALLBACKS` | *(none)* | Comma-separated fallbacks applied to every route |
+| `DSF_MAX_RETRIES` / `DSF_RETRY_BACKOFF` | `2` / `2.0` | Retries per provider before falling back + exponential backoff base (seconds) |
+| `DSF_RETRY_CAP` | `10` | Cap for a single retry wait (honored `Retry-After` included) — lower = faster fallback |
+| `DSF_FIRST_TOKEN_TIMEOUT` | `90` | Seconds a provider may take to emit its FIRST chunk before the router gives up on it and falls back immediately (0 disables) |
+| `DSF_PROVIDER_STALL_COOLDOWN` | `120` | Seconds a stalled target is skipped by the fallback chain after a first-token timeout |
 | `COOKIES_DIR` | *(none)* (Docker: `/data`) | Directory where provider cookie files are persisted |
 | `DSF_PROXY` / `DSF_PROXIES` | *(none)* | Single / comma-separated proxy URLs (always in the pool) |
 | `DSF_PROXY_LIST_URL` | *(none)* | URL fetching a dynamic proxy list (text/JSON), TTL-refreshed |
@@ -442,6 +446,7 @@ A llama.cpp-style chat playground is served at `http://localhost:18010/` (and `/
 | `DSF_PROXY_CHECK_TIMEOUT` | `8` | Per-probe timeout in seconds |
 | `DSF_PROXY_CHECK_CONCURRENCY` | `24` | Concurrent health probes |
 | `DSF_PROXY_MAX_LATENCY` | `1200` | ms — only proxies answering this fast get traffic (fast-only rotation) |
+| `DSF_PROXY_TOP_K` | `5` | Traffic is drawn from the K fastest proxies (by probe + runtime latency) instead of the whole pool |
 | `DSF_PROXY_DIRECT` | `true` | Include the no-proxy route in the rotation (`round` mode: direct first) |
 | `DSF_PROXY_ENSURE_TIMEOUT` | `90` | Seconds CLI one-shots wait for the warm-up health pass |
 | `DSF_ZAI_CONTEXT_LENGTH` | `10000` | Prompt budget (tokens) for the z.ai web transport — its browser input silently fails beyond ~40k characters |
@@ -532,7 +537,7 @@ DSF_PROXY_SOURCES=socks5=https://example.com/socks5.txt
 DSF_PROXY_LIST_URL=https://example.com/proxy-list.txt
 ```
 
-**Health checking** (`DSF_PROXY_CHECK=true`) — strongly recommended with free lists, where typically only ~10% of published proxies are alive at any moment: a background worker probes every pooled proxy concurrently and **only proxies that answer within `DSF_PROXY_MAX_LATENCY` (1200 ms) receive traffic** — slow exits never slow down responses. Combined with `DSF_PROXY_COOLDOWN`, a proxy that dies mid-session is skipped and traffic falls back to direct, so a dead pool never breaks the service.
+**Health checking** (`DSF_PROXY_CHECK=true`) — strongly recommended with free lists, where typically only ~10% of published proxies are alive at any moment: a background worker probes every pooled proxy concurrently and **only proxies that answer within `DSF_PROXY_MAX_LATENCY` (1200 ms) receive traffic** — slow exits never slow down responses. Selection is **latency-ranked** (`DSF_PROXY_TOP_K`): the fastest measured proxies get most of the traffic, and a proxy that turns out slow on real payloads is demoted at runtime (EMA of observed latency vs the same budget) until the next health pass re-validates it. Combined with `DSF_PROXY_COOLDOWN`, a proxy that dies mid-session is skipped and traffic falls back to direct, so a dead pool never breaks the service.
 
 **Selection is `random` by default** (`DSF_PROXY_MODE=round|single` also available). The no-proxy route is a first-class rotation candidate (`DSF_PROXY_DIRECT=true`); in `round` mode the direct route comes first. A proxy that fails is put on cooldown (`DSF_PROXY_COOLDOWN`, 120s). Providers that misbehave behind proxies (e.g. bot-protection false positives) can be pinned to direct with `DSF_PROXY_EXCLUDE=deepseek`.
 

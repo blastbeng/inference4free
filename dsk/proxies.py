@@ -211,6 +211,7 @@ class _State:
         self.pool: List[str] = []          # aggregated, capped, shuffled
         self.healthy: Dict[str, float] = {}  # proxy -> lease expiry (epoch)
         self.latency: Dict[str, float] = {}  # proxy -> last measured ms
+        self.runtime: Dict[str, float] = {}  # proxy -> runtime latency EMA (ms)
         self.fetched_at: float = 0.0
         self.checked_at: float = 0.0
         self.cooldown: Dict[str, float] = {}  # proxy -> retry-after (epoch)
@@ -295,6 +296,7 @@ def _refresh_pool() -> None:
         healthy_keys = set(_STATE.healthy) & set(pool)
         _STATE.healthy = {p: _STATE.healthy[p] for p in healthy_keys}
         _STATE.latency = {p: ms for p, ms in _STATE.latency.items() if p in set(pool)}
+        _STATE.runtime = {p: ms for p, ms in _STATE.runtime.items() if p in set(pool)}
         _STATE.cooldown = {p: t for p, t in _STATE.cooldown.items() if p in set(pool)}
         if errors:
             _STATE.last_error = '; '.join(errors[:3])
@@ -507,7 +509,7 @@ def get_proxy(provider: Optional[str] = None, direct_ok: bool = True) -> Optiona
                 # by another provider; share only if the pool is too small
                 taken = {pair[0] for pair in _STATE.assignments.values()}
                 distinct = [p for p in alive if p not in taken]
-                route = random.choice(distinct or alive)
+                route = _choose_route(distinct or alive)
             _STATE.assignments[key] = (route, now + _rotate_ttl())
             return None if route == DIRECT else route
         # provider=None: plain per-request selection (no stickiness)
@@ -520,7 +522,7 @@ def get_proxy(provider: Optional[str] = None, direct_ok: bool = True) -> Optiona
             route = alive[_STATE.rr % len(alive)]
             _STATE.rr += 1
             return None if route == DIRECT else route
-        route = random.choice(alive)
+        route = _choose_route(alive)
         return None if route == DIRECT else route
 
 
@@ -546,6 +548,71 @@ def mark_failure(proxy: Optional[str]) -> None:
         # force a fresh random assignment for every provider that used it
         _STATE.assignments = {prov: pair for prov, pair in _STATE.assignments.items()
                               if pair[0] != proxy}
+
+
+def mark_success(proxy: Optional[str], latency_ms: Optional[float] = None) -> None:
+    """Runtime latency feedback for a proxy that just completed a request.
+
+    Keeps an EMA of the observed latency and DEMOTES proxies that turn out
+    slower in real traffic than the health-pass budget (free lists often
+    answer a tiny probe fast, then crawl on real payloads). A demoted proxy
+    loses its healthy lease immediately and is re-validated on the next
+    health pass.
+    """
+    if not proxy or proxy == DIRECT or latency_ms is None:
+        return
+    cap = _max_latency_ms()
+    with _STATE.lock:
+        prev = _STATE.runtime.get(proxy)
+        ema = latency_ms if prev is None else 0.7 * prev + 0.3 * latency_ms
+        _STATE.runtime[proxy] = ema
+        if ema > cap and _STATE.healthy.pop(proxy, None) is not None:
+            print(f"\033[93m[proxies] {proxy} demoted: runtime latency "
+                  f"{ema:.0f} ms > {cap:.0f} ms budget\033[0m",
+                  file=__import__('sys').stderr)
+            _STATE.assignments = {prov: pair
+                                  for prov, pair in _STATE.assignments.items()
+                                  if pair[0] != proxy}
+
+
+def _rank_fastest(candidates: List[str]) -> List[str]:
+    """Rank `candidates` by observed latency and keep only the fastest ones.
+
+    Orders by runtime EMA first, health-pass measurement second, and keeps
+    the top DSF_PROXY_TOP_K (default 5) so the fastest proxies get most of
+    the traffic without hammering a single exit.
+    """
+    if len(candidates) <= 1:
+        return list(candidates)
+    cap = _max_latency_ms()
+
+    def _eff(p: str) -> float:
+        r = _STATE.runtime.get(p)
+        if r is not None:
+            return r
+        l = _STATE.latency.get(p)
+        return l if l is not None else cap
+
+    try:
+        top_k = max(1, int(os.getenv('DSF_PROXY_TOP_K', '5') or 5))
+    except ValueError:
+        top_k = 5
+    return sorted(candidates, key=_eff)[:top_k]
+
+
+def _choose_route(alive: List[str]) -> Optional[str]:
+    """Pick one rotation route from `alive` (which may contain DIRECT).
+
+    Real proxies are latency-ranked (fastest top-K) while the direct route
+    keeps its single fair share of the draw.
+    """
+    if not alive:
+        return None
+    real = [p for p in alive if p != DIRECT]
+    if not real:
+        return DIRECT
+    draw = ([DIRECT] if DIRECT in alive else []) + _rank_fastest(real)
+    return random.choice(draw)
 
 
 def proxies_kwargs(provider: Optional[str] = None,

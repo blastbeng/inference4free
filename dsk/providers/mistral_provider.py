@@ -164,6 +164,13 @@ class MistralProvider(Provider):
                     save_jar('mistral', {'stable_anon_id': str(uuid.uuid4())})
                     continue
                 raise
+            except ProviderAuthError as e:
+                # The account wall ALSO trips through pooled datacenter
+                # egresses even with a valid session — retry once direct
+                # before declaring the credential dead.
+                if not no_proxy and 'account upsell' in str(e):
+                    return self._stream_once(prompt, no_proxy=True)
+                raise
         raise last_error or ProviderError('mistral stream failed')
 
     def _stream_once(self, prompt: str,

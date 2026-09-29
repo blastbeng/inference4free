@@ -16,6 +16,7 @@ import binascii
 import logging
 import os
 import struct
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -99,8 +100,17 @@ def _resilient_request(url: str, extra: Dict[str, Any], do_request,
     px = extra.get('proxies') or {}
     if px:
         proxy = next(iter(px.values()), None)
+    t0 = time.monotonic()
     try:
-        return do_request(extra)
+        resp = do_request(extra)
+        if proxy and pooled:
+            # runtime latency feedback: the proxy pool demotes exits that
+            # answer real payloads slower than the health-pass budget
+            try:
+                _proxies.mark_success(proxy, (time.monotonic() - t0) * 1000.0)
+            except Exception:  # noqa: BLE001 — feedback is best-effort
+                pass
+        return resp
     except Exception as exc:  # noqa: BLE001 — classification below
         if not _looks_like_network_error(exc):
             raise
@@ -139,6 +149,15 @@ class ProviderRateLimitError(ProviderError):
 
 class ProviderUnavailableError(ProviderError):
     """Network or server-side failure. Retryable, then fallback."""
+
+
+class FirstTokenTimeoutError(ProviderUnavailableError):
+    """Upstream connected but emitted no first chunk within the deadline.
+
+    A stall almost never recovers within seconds, so the router skips the
+    per-provider retries and falls back immediately."""
+    def __init__(self, message: str):
+        super().__init__(message)
 
 
 class Provider:

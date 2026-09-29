@@ -76,6 +76,9 @@ ZAI_START_TIMEOUT = int(os.getenv('DSF_ZAI_START_TIMEOUT', '90'))
 # tuned so the lock frees before typical client timeouts cascade).
 ZAI_IDLE_TIMEOUT = int(os.getenv('DSF_ZAI_IDLE_TIMEOUT', '60'))
 ZAI_TOTAL_TIMEOUT = int(os.getenv('DSF_ZAI_TOTAL_TIMEOUT', '300'))
+# Bounded page-load: DrissionPage's page.get() waits FOREVER for the 'normal'
+# load event otherwise — a hung z.ai page stalled every GLM request.
+ZAI_LOAD_TIMEOUT = int(os.getenv('DSF_ZAI_LOAD_TIMEOUT', '30'))
 # Max time a queued request waits for the browser session slot (FIFO). With
 # concurrency, parallel glm requests queue here instead of failing fast.
 ZAI_BUSY_TIMEOUT = int(os.getenv('DSF_ZAI_BUSY_TIMEOUT', '180'))
@@ -466,8 +469,23 @@ class _ZaiBrowser:
         if ZAI_HEADLESS or not os.environ.get('DISPLAY'):
             options.headless(True)
         self._page = ChromiumPage(addr_or_opts=options)
-        self._page.get(ZAI_BASE_URL)
+        self._get(ZAI_BASE_URL)
         self._wait_ready()
+
+    def _get(self, url: str) -> None:
+        """Bounded page navigation: raises instead of waiting forever.
+
+        DrissionPage get() stops waiting after `timeout` (returns False when
+        the load event never fired) — without it the call can block forever
+        on a hung z.ai page."""
+        try:
+            ok = self._page.get(url, timeout=ZAI_LOAD_TIMEOUT)
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                f'z.ai page load failed: {exc}') from exc
+        if ok is False:
+            raise ProviderUnavailableError(
+                f'z.ai page did not load within {ZAI_LOAD_TIMEOUT}s')
 
     def _wait_ready(self) -> None:
         """Wait for the anonymous guest token the UI stores in localStorage."""
@@ -513,7 +531,7 @@ class _ZaiBrowser:
     def _new_chat(self) -> None:
         self._dismiss_alerts()
         if not self._click('#new-chat-button'):
-            self._page.get(ZAI_BASE_URL)
+            self._get(ZAI_BASE_URL)
             time.sleep(2)
 
     def _drain(self) -> Generator[str, None, None]:

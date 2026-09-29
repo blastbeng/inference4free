@@ -24,7 +24,6 @@ This module closes the loop autonomously:
                b. ask a free LLM to rewrite the module. Fixer chain (first
                   configured wins):
                     DSF_SELFHEAL_FIXER_*   any OpenAI-compatible endpoint
-                    DSF_OPENROUTER_API_KEY OpenRouter free models
                     local-self             this very server via 127.0.0.1,
                                            routed to a *working* provider
                c. validate the proposed file in a throwaway subprocess (real
@@ -50,8 +49,6 @@ Configuration (env):
     DSF_SELFHEAL_EXCLUDE          providers never probed/healed
     DSF_SELFHEAL_FIXER_BASE_URL / _API_KEY / _MODELS
                                   generic OpenAI-compatible fixer endpoint
-    DSF_OPENROUTER_API_KEY        enables the OpenRouter free-model fallback
-    DSF_SELFHEAL_OPENROUTER_MODELS  comma list (see default in code)
     DSF_SELFHEAL_LOCAL            allow using this server's own routes as the
                                   fixer (default true)
 
@@ -91,7 +88,6 @@ HEALABLE: Dict[str, Path] = {
     'copilot': _BASE / 'providers' / 'copilot_provider.py',
     'perplexity': _BASE / 'providers' / 'perplexity_provider.py',
     'glm': _BASE / 'providers' / 'glm_provider.py',
-    'huggingface': _BASE / 'providers' / 'hf_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -106,7 +102,6 @@ _MODULE_NAMES = {
     'copilot': 'dsk.providers.copilot_provider',
     'perplexity': 'dsk.providers.perplexity_provider',
     'glm': 'dsk.providers.glm_provider',
-    'huggingface': 'dsk.providers.hf_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -121,7 +116,6 @@ _PROVIDER_MODULES = {
     'copilot': 'dsk.providers.copilot_provider',
     'perplexity': 'dsk.providers.perplexity_provider',
     'glm': 'dsk.providers.glm_provider',
-    'huggingface': 'dsk.providers.hf_provider',
 }
 
 # Provider class name inside each module (used by probe/configured).
@@ -137,7 +131,6 @@ _PROVIDER_CLASSES = {
     'copilot': 'CopilotProvider',
     'perplexity': 'PerplexityProvider',
     'glm': 'GlmProvider',
-    'huggingface': 'HuggingFaceProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -165,8 +158,6 @@ _EVIDENCE_PATTERNS = {
                    r'ask_text', r'markdown_block'],
     'glm': [r'api/chat/completions', r'assistant/stream', r'refresh_token',
             r'chatglm', r'delta_content'],
-    'huggingface': [r'gradio_api/queue/[a-z]+', r'spacesSemantcSearch',
-                    r'/api/spaces', r'zerogpu'],
 }
 
 
@@ -275,17 +266,6 @@ def _probe_once(name: str) -> Tuple[str, str]:
             if verdict.startswith('unreachable'):
                 return 'network', verdict
             return 'structural', verdict
-        if name == 'huggingface':
-            # Best-effort discovery: an empty model list usually means every
-            # probe failed transiently (ZeroGPU quotas, proxy flaps) — that
-            # is NOT a structural break of the module, so never let the
-            # fixer LLM self-patch on top of it.
-            module = importlib.import_module(_PROVIDER_MODULES[name])
-            provider = getattr(module, _PROVIDER_CLASSES[name])()
-            models = provider.list_models()
-            if models:
-                return 'ok', f'{len(models)} working spaces'
-            return 'ok', '0 working spaces right now (transient, not structural)'
         module = importlib.import_module(_PROVIDER_MODULES[name])
         provider = getattr(module, _PROVIDER_CLASSES[name])()
         if not provider.available():
@@ -374,15 +354,14 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'kimi': 'https://www.kimi.com',
             'copilot': 'https://copilot.microsoft.com',
             'perplexity': 'https://www.perplexity.ai',
-            'glm': 'https://chat.z.ai',
-            'huggingface': ('https://huggingface.co/spaces'
-                            '?category=text-generation')}.get(
-            name, 'https://huggingface.co')
+            'glm': 'https://chat.z.ai'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []
     seen: set = set()
     total = 0
+    if not base:
+        return '(no evidence collected)'
     try:
         pages = [base]
         html = _fetch(base)
@@ -417,17 +396,6 @@ def _fixer_candidates() -> List[Dict[str, str]]:
         for m in [x.strip() for x in os.getenv('DSF_SELFHEAL_FIXER_MODELS', '').split(',')
                   if x.strip()]:
             out.append({'base': base, 'key': key, 'model': m, 'label': f'fixer:{m}'})
-    orkey = (os.getenv('DSF_OPENROUTER_API_KEY', '')
-             or os.getenv('DSF_SELFHEAL_OPENROUTER_KEY', '')).strip()
-    if orkey:
-        defaults = ('deepseek/deepseek-chat-v3.1:free,'
-                    'meta-llama/llama-3.3-70b-instruct:free,'
-                    'qwen/qwen3-235b-a22b:free')
-        for m in [x.strip() for x in
-                  os.getenv('DSF_SELFHEAL_OPENROUTER_MODELS', defaults).split(',')
-                  if x.strip()]:
-            out.append({'base': 'https://openrouter.ai/api/v1', 'key': orkey,
-                        'model': m, 'label': f'openrouter:{m}'})
     if _env_bool('DSF_SELFHEAL_LOCAL', True):
         out.append({'base': f"http://127.0.0.1:{os.getenv('DSF_PORT', '8000')}",
                     'key': os.getenv('DSF_API_KEY', '').strip(),
