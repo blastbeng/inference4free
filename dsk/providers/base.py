@@ -52,18 +52,18 @@ logger = logging.getLogger('dsk.providers.base')
 
 # Connect-phase cap for pooled proxies: free proxies die constantly and the
 # OS-level connect can otherwise hang for minutes before the total timeout.
-HTTP_CONNECT_TIMEOUT = int(os.getenv('DSF_HTTP_CONNECT_TIMEOUT', '6'))
+HTTP_CONNECT_TIMEOUT = int(os.getenv('I4F_HTTP_CONNECT_TIMEOUT', '6'))
 
 
 def provider_enabled(name: str) -> bool:
-    """DSF_PROVIDERS allowlist (comma-separated provider names).
+    """I4F_PROVIDERS allowlist (comma-separated provider names).
 
     Lets the operator run only a subset of providers (e.g. ``deepseek,glm``)
     with zero code changes: disabled providers get no routes on /v1/models,
     no health probes and no credential-bot signup attempts. Empty/unset (or
     ``all``/``*``) enables every provider.
     """
-    raw = (os.getenv('DSF_PROVIDERS', '') or '').strip().lower()
+    raw = (os.getenv('I4F_PROVIDERS', '') or '').strip().lower()
     if not raw or raw in ('all', '*'):
         return True
     return name.strip().lower() in {p.strip() for p in raw.split(',') if p.strip()}
@@ -228,6 +228,7 @@ class Route:
 
 def http_post_stream(url: str, headers: Optional[Dict[str, str]] = None,
                      json_body: Optional[Dict[str, Any]] = None,
+                     cookies: Optional[Dict[str, str]] = None,
                      timeout: int = 600, proxies: Optional[Dict[str, str]] = None,
                      no_proxy: bool = False):
     """POST and return a streaming response.
@@ -245,11 +246,13 @@ def http_post_stream(url: str, headers: Optional[Dict[str, str]] = None,
         if cffi_requests is not None:
             return cffi_requests.post(
                 url, headers=headers or {}, json=json_body,
+                cookies=cookies or None,
                 stream=True, impersonate='chrome120', timeout=eff,
                 **kwargs,
             )
         return std_requests.post(
-            url, headers=headers or {}, json=json_body, stream=True,
+            url, headers=headers or {}, json=json_body,
+            cookies=cookies or None, stream=True,
             timeout=eff, **kwargs,
         )
 

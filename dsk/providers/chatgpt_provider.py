@@ -5,10 +5,14 @@ private endpoints with browser credentials — no official API, no paid keys.
 
 How it works
 ------------
-1. Credentials: either a directly provided access token (``CHATGPT_ACCESS_TOKEN``
-   env var) or the ``__Secure-next-auth.session-token`` cookies of a logged-in
-   chatgpt.com session (bot-managed ``chatgpt_cookies.json`` file kept fresh by
-   ``dsk.refresher``, or ``CHATGPT_SESSION_COOKIES`` env JSON as fallback).
+1. Credentials, in preference order:
+   a. ``CHATGPT_ACCESS_TOKEN`` / ``CHATGPT_SESSION_TOKEN`` env bearer
+   b. the ``__Secure-next-auth.session-token`` cookie of a logged-in
+      chatgpt.com session (bot-managed ``chatgpt_cookies.json`` file kept
+      fresh by ``dsk.refresher``, or ``CHATGPT_SESSION_COOKIES`` env JSON) —
+      exchanged for a fresh bearer at /api/auth/session
+   c. an ``accessToken`` bearer stored in the jar (UI paste) or env —
+      used directly, validated at request time
 2. Access token: GET ``https://chatgpt.com/api/auth/session`` with the session
    cookies returns ``{"accessToken": ...}``; the token is cached and refreshed
    when it expires.
@@ -30,7 +34,6 @@ import re
 import threading
 import time
 import uuid
-from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
 from .base import (
@@ -45,6 +48,7 @@ from .base import (
     image_dimensions,
     parse_sse_data,
 )
+from .jar import load_jar, save_jar
 
 logger = logging.getLogger('dsk.providers.chatgpt')
 
@@ -56,8 +60,8 @@ CHATGPT_FILES_URL = f'{CHATGPT_BASE_URL}/backend-api/files'
 
 # Estimated capability metadata advertised on /v1/models for agent tooling
 # (upstream reports a per-model context size; this is the fallback).
-CHATGPT_CONTEXT_LENGTH = int(os.getenv('DSF_CHATGPT_CONTEXT_LENGTH', '128000'))
-CHATGPT_MAX_OUTPUT = int(os.getenv('DSF_CHATGPT_MAX_OUTPUT', '16384'))
+CHATGPT_CONTEXT_LENGTH = int(os.getenv('I4F_CHATGPT_CONTEXT_LENGTH', '128000'))
+CHATGPT_MAX_OUTPUT = int(os.getenv('I4F_CHATGPT_MAX_OUTPUT', '16384'))
 
 TOKEN_TTL = 3600.0  # re-fetch the accessToken from the session endpoint hourly
 
@@ -66,17 +70,102 @@ _USER_AGENT = (
     'Chrome/120.0.0.0 Safari/537.36'
 )
 
+# The one cookie that proves a chatgpt.com session: /api/auth/session accepts
+# exactly this and returns a fresh bearer for it. The accessToken the web
+# app stores in localStorage is NOT a cookie — when operators paste it (via
+# the providers UI or the jar) it is a usable BEARER, not a session cookie.
+SESSION_COOKIE = '__Secure-next-auth.session-token'
+TOKEN_KEY = 'accessToken'
+
+
+def _relay_enabled() -> bool:
+    """Browser-relay fallback switch (``I4F_CHATGPT_RELAY``, default on).
+
+    The anonymous chatgpt surface answers without any login, so generation
+    never depends on credentials. Import is lazy: the relay pulls in
+    DrissionPage/Xvfb, which must not load with every provider module import.
+    """
+    if os.getenv('I4F_CHATGPT_RELAY', '1').strip().lower() in \
+            ('0', 'false', 'no', 'off'):
+        return False
+    try:
+        from dsk.chatgpt_relay import get_relay
+        return get_relay().enabled()
+    except Exception as e:  # noqa: BLE001 — degraded, not fatal
+        logger.warning('chatgpt relay unavailable (%s); HTTP transport only', e)
+        return False
+
+
+
+def _relay_offered() -> List[str]:
+    """Normalized ids the anonymous picker actually serves (empty until the
+    relay's first dropdown open)."""
+    try:
+        from dsk.chatgpt_relay import get_relay, norm_model
+        titles = list(get_relay().offered())
+        default = get_relay().default_title()
+        if default and not titles:
+            titles = [default]
+        return sorted({norm_model(t) for t in titles})
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def get_relay_default_title() -> str:
+    """The relay's picker default title (empty until the relay has opened)."""
+    try:
+        from dsk.chatgpt_relay import get_relay
+        return str(get_relay().default_title() or '')
+    except Exception:  # noqa: BLE001
+        return ''
+
+
+# After a sentinel/403 failure on the HTTP conversation path, stop paying the
+# gate roundtrip tax and go straight to the relay for a while.
+_HTTP_COOLDOWN_S = float(os.getenv('I4F_CHATGPT_HTTP_COOLDOWN', '300'))
+_http_cooldown: Dict[str, float] = {'until': 0.0}
+
+
+def _http_skipped() -> bool:
+    return time.time() < _http_cooldown['until']
+
+
+def _skip_http_for(seconds: float) -> None:
+    _http_cooldown['until'] = time.time() + seconds
+
+
+def _has_credentials() -> bool:
+    """True when the HTTP conversation path has anything to authenticate
+    with (env bearer, jar bearer or a session cookie)."""
+    if _env_token():
+        return True
+    try:
+        if _jar_token():
+            return True
+        raw = (os.getenv('CHATGPT_SESSION_COOKIES', '') or '').strip()
+        if raw:
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                data = {}
+            if SESSION_COOKIE in ChatGPTProvider._normalize_cookies(data):
+                return True
+        return bool((load_jar('chatgpt') or {}).get(SESSION_COOKIE))
+    except OSError:
+        return False
+
 
 def _env_token() -> str:
     return (os.getenv('CHATGPT_ACCESS_TOKEN', '') or
             os.getenv('CHATGPT_SESSION_TOKEN', '') or '').strip()
 
 
-def _cookie_file() -> Path:
-    cookies_dir = os.getenv('COOKIES_DIR')
-    if cookies_dir and Path(cookies_dir).is_dir():
-        return Path(cookies_dir) / 'chatgpt_cookies.json'
-    return Path(__file__).resolve().parent.parent / 'chatgpt_cookies.json'
+def _jar_token() -> str:
+    """Bearer stored in the shared jar (UI/env paste), if any."""
+    try:
+        return (load_jar('chatgpt').get(TOKEN_KEY) or '').strip()
+    except Exception:  # noqa: BLE001 — jar read is best-effort
+        return ''
 
 
 def _is_thinking_model(entry: Dict[str, Any]) -> bool:
@@ -97,25 +186,39 @@ class ChatGPTProvider(Provider):
     name = 'chatgpt'
 
     def __init__(self) -> None:
-        # Stable per-process device id; ChatGPT rejects requests without one.
-        self._device_id = str(uuid.uuid4())
+        # Stable device id: ChatGPT rejects requests without one, and a fresh
+        # random id per process trips "Unusual activity has been detected"
+        # on the conversation endpoint. The web app persists its own id
+        # (oai-did) — prefer that, otherwise keep a bot-generated one.
+        self._device_id = self._stable_device_id()
         self._lock = threading.Lock()
         self._token: Optional[str] = None
         self._token_at = 0.0
         self._token_sig: str = ''   # detects cookie-jar rotations
 
+    @staticmethod
+    def _stable_device_id() -> str:
+        """The browser's own device id (``oai-did`` in the jar), or a
+        bot-generated one persisted in the same jar — stable across
+        restarts either way, so OpenAI sees one device, not a new one per
+        process (a new one every time reads as bot traffic)."""
+        did = (load_jar('chatgpt').get('oai-did') or '').strip()
+        if did:
+            return did
+        did = str(uuid.uuid4())
+        save_jar('chatgpt', {'oai-did': did})
+        return did
+
     # ------------------------------------------------------------- credentials
     def _session_cookies(self) -> Dict[str, str]:
-        """Session cookies: bot-managed jar first, then env JSON fallback."""
-        path = _cookie_file()
-        if path.is_file():
-            try:
-                cookies = self._normalize_cookies(json.loads(path.read_text()))
-            except (ValueError, OSError) as e:
-                logger.warning('chatgpt_cookies.json unreadable: %s', e)
-            else:
-                if cookies:
-                    return cookies
+        """Session cookies: bot-managed jar first, then env JSON fallback.
+
+        The stored ``accessToken`` (a bearer, not a cookie) is excluded —
+        sending it as a Cookie header is harmless but never authenticates,
+        and it must not masquerade as a session."""
+        cookies = load_jar('chatgpt')
+        if cookies:
+            return {k: v for k, v in cookies.items() if k != TOKEN_KEY}
         raw = (os.getenv('CHATGPT_SESSION_COOKIES', '') or '').strip()
         if raw:
             try:
@@ -125,7 +228,7 @@ class ChatGPTProvider(Provider):
             else:
                 cookies = self._normalize_cookies(data)
                 if cookies:
-                    return cookies
+                    return {k: v for k, v in cookies.items() if k != TOKEN_KEY}
         return {}
 
     @staticmethod
@@ -151,28 +254,39 @@ class ChatGPTProvider(Provider):
 
     def _get_access_token(self, refresh: bool = False,
                           no_proxy: bool = False) -> str:
-        """Access token: env-provided, or fetched from /api/auth/session with
-        the session cookies (cached for TOKEN_TTL)."""
+        """Access token, in order of preference:
+        1. env-provided bearer (CHATGPT_ACCESS_TOKEN / CHATGPT_SESSION_TOKEN)
+        2. /api/auth/session with the session cookies (fresh bearer, cached
+           for TOKEN_TTL) — preferred over a pasted bearer, which expires
+           and cannot be rotated
+        3. bearer stored in the shared jar / env (validated at request time)
+        """
         env_token = _env_token()
         if env_token:
             return env_token
         with self._lock:
             cookies = self._session_cookies()
-            sig = repr(sorted(cookies.items()))
+            jar_token = _jar_token()
+            sig = repr(sorted(cookies.items())) + '|' + jar_token
             if sig != self._token_sig:
-                self._token_sig = sig   # cookies rotated by the refresher
+                self._token_sig = sig   # credentials rotated by the refresher
                 self._token = None      # -> drop the cached access token
                 self._token_at = 0.0
             if not refresh and self._token and \
                     time.monotonic() - self._token_at < TOKEN_TTL:
                 return self._token
-            if not cookies:
+            if not cookies.get(SESSION_COOKIE) and not jar_token:
                 raise ProviderAuthError(
                     'No ChatGPT credentials. Set CHATGPT_ACCESS_TOKEN, or provide '
                     'the __Secure-next-auth.session-token cookies of a logged-in '
                     'chatgpt.com session via CHATGPT_SESSION_COOKIES or '
                     'chatgpt_cookies.json.'
                 )
+            if not cookies.get(SESSION_COOKIE):
+                # bearer only (pasted by the operator): use it as-is
+                self._token = jar_token
+                self._token_at = time.monotonic()
+                return jar_token
             response = http_get(CHATGPT_SESSION_URL,
                                 headers={'User-Agent': _USER_AGENT},
                                 cookies=cookies, no_proxy=no_proxy)
@@ -208,14 +322,51 @@ class ChatGPTProvider(Provider):
 
     # ---------------------------------------------------------------- provider
     def available(self, auth_key: Optional[str] = None) -> bool:
-        if _env_token():
-            return True
-        try:
-            return bool(self._session_cookies())
-        except OSError:
-            return False
+        # The anonymous browser relay needs no credentials: chatgpt models
+        # stay listed even without a session (streams go through the relay).
+        return _has_credentials() or _relay_enabled()
 
     def list_models(self, auth_key: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Discover the models the web session currently has access to.
+
+        HTTP discovery (``/backend-api/models``) needs a bearer. When it
+        fails — no credentials, expired token, geo-block — fall back to the
+        anonymous browser relay's picker: the relay serves the family default
+        without any login, so the provider must not report "no models" just
+        because the HTTP path is down. The relay's titles are normalized the
+        same way ``_select_model`` matches them, so a request for
+        ``openai/gpt-5-5`` resolves to the relay and the relay picks it.
+        """
+        try:
+            return self._list_models_http()
+        except (ProviderAuthError, ProviderError) as e:
+            if not _relay_enabled():
+                raise
+            logger.info('chatgpt HTTP discovery failed (%s); using relay picker', e)
+            titles = _relay_offered()
+            if not titles:
+                # Relay not warmed yet: advertise the family default so the
+                # first request can route to it (the relay serves its default
+                # without a picker). The picker titles appear after the first
+                # stream and populate the registry on the next refresh.
+                default = get_relay_default_title()
+                if default:
+                    titles = [default]
+                else:
+                    raise
+            return [{
+                'id': t,
+                'upstream_model': t,
+                'thinking_enabled': False,
+                'search_enabled': False,
+                'vision': False,
+                'image_gen': False,
+                'context_length': CHATGPT_CONTEXT_LENGTH,
+                'max_output_tokens': CHATGPT_MAX_OUTPUT,
+                'extra': {'title': t, 'relay': True},
+            } for t in titles]
+
+    def _list_models_http(self) -> List[Dict[str, Any]]:
         """Discover the models the web session currently has access to."""
         token = self._get_access_token()
         response = http_get(CHATGPT_MODELS_URL, headers=self._headers(token))
@@ -355,6 +506,43 @@ class ChatGPTProvider(Provider):
                image_generation: bool = False,
                no_proxy: bool = False,
                auth_key: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
+        relay = _relay_enabled()
+        has_creds = _has_credentials()
+        if relay and (not has_creds or _http_skipped()):
+            # No credentials, or HTTP in cooldown after a Sentinel block:
+            # the anonymous relay is the only reliable transport.
+            yield from self._relay_stream(prompt, model, thinking_enabled,
+                                          search_enabled)
+            return
+        if not relay:
+            yield from self._http_stream(prompt, model, thinking_enabled,
+                                         search_enabled, image_generation,
+                                         images, no_proxy)
+            return
+        emitted = False
+        try:
+            for chunk in self._http_stream(prompt, model, thinking_enabled,
+                                           search_enabled, image_generation,
+                                           images, no_proxy):
+                emitted = True
+                yield chunk
+            return
+        except ProviderError as e:
+            # Never hand a half-streamed response to the relay: only a
+            # failure before the first chunk may fall back.
+            if emitted:
+                raise
+            _skip_http_for(_HTTP_COOLDOWN_S)
+            logger.warning('chatgpt http transport failed (%s); falling back '
+                           'to the browser relay for %ss', e,
+                           _HTTP_COOLDOWN_S)
+        yield from self._relay_stream(prompt, model, thinking_enabled,
+                                      search_enabled)
+
+    def _http_stream(self, prompt: str, model: str, thinking_enabled: bool,
+                     search_enabled: bool, image_generation: bool,
+                     images: Optional[List[Dict[str, Any]]],
+                     no_proxy: bool) -> Generator[Dict[str, Any], None, None]:
         # Temperature/max_tokens are not honored by the web conversation API.
         token = self._get_access_token(no_proxy=no_proxy)
 
@@ -401,6 +589,21 @@ class ChatGPTProvider(Provider):
             raise classify_http_error(response.status_code, error_text,
                                       response.headers)
         return self._iter_chunks(response, no_proxy=no_proxy)
+
+    def _relay_stream(self, prompt: str, model: str, thinking_enabled: bool,
+                      search_enabled: bool) -> Generator[Dict[str, Any], None, None]:
+        """Drive the real chatgpt UI in the persistent browser
+        (dsk/chatgpt_relay.py), on the anonymous surface."""
+        from dsk.chatgpt_relay import RelayBlocked, get_relay
+        relay = get_relay()
+        try:
+            yield from relay.stream(prompt, model)
+        except RelayBlocked as e:
+            raise ProviderUnavailableError(
+                f'chatgpt browser relay blocked: {e}') from e
+        except RuntimeError as e:
+            # Relay-specific: model not offered on the anonymous surface, etc.
+            raise ProviderError(f'chatgpt browser relay: {e}') from e
 
     def _iter_chunks(self, response,
                      no_proxy: bool = False) -> Generator[Dict[str, Any], None, None]:

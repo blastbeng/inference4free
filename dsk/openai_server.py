@@ -1,5 +1,5 @@
 """
-OpenAI-compatible API server for DeepSeek4Free (multi-provider).
+OpenAI-compatible API server for Inference4Free (multi-provider).
 
 Exposes standard OpenAI endpoints so any OpenAI client / agent tooling
 (aider, aiderdesk, openai SDK, LiteLLM, ...) can use DeepSeek, Gemini and
@@ -12,14 +12,14 @@ ChatGPT for free, plus a built-in llama.cpp-style playground UI:
     GET  /health
     GET  /selfheal/status      self-maintenance (selfheal + refresher) status
     POST /selfheal/probe       force a probe cycle (heal/renew on failure;
-                               requires DSF_API_KEY when one is set)
+                               requires I4F_API_KEY when one is set)
     POST /selfheal/refresh     force a credential refresh cycle (same key rule)
 
 Configuration (env):
-    DSF_API_KEY       optional API key clients must send as Bearer token
+    I4F_API_KEY       optional API key clients must send as Bearer token
                       (default: none, all keys accepted)
-    DSF_HOST          bind host (default 0.0.0.0)
-    DSF_PORT          bind port (default 8000)
+    I4F_HOST          bind host (default 0.0.0.0)
+    I4F_PORT          bind port (default 8000)
     DEEPSEEK_AUTH_TOKEN  userToken from chat.deepseek.com localStorage
                          (or an existing dsk/cookies.json is reused)
     GEMINI_1PSID / GEMINI_1PSIDTS  __Secure-1PSID cookies of a logged-in
@@ -30,8 +30,8 @@ Configuration (env):
 
 Models are discovered dynamically from each provider's web session — nothing
 is hardcoded (see dsk/providers/router.py). Fallback chains:
-    DSF_FALLBACKS     JSON {model_id: [fallback_id, ...]} fallback chains
-    DSF_DEFAULT_FALLBACKS  comma list for routes without explicit fallbacks
+    I4F_FALLBACKS     JSON {model_id: [fallback_id, ...]} fallback chains
+    I4F_DEFAULT_FALLBACKS  comma list for routes without explicit fallbacks
 
 See dsk/providers/router.py for the full model-registry configuration.
 
@@ -68,10 +68,10 @@ from .providers.base import (
 )
 from .providers.router import Router
 
-HOST = os.getenv("DSF_HOST", "0.0.0.0")
-PORT = int(os.getenv("DSF_PORT", "8000"))
+HOST = os.getenv("I4F_HOST", "0.0.0.0")
+PORT = int(os.getenv("I4F_PORT", "8000"))
 
-API_KEY = os.getenv("DSF_API_KEY", "")
+API_KEY = os.getenv("I4F_API_KEY", "")
 
 # Static playground UI (llama.cpp-style chat) served from dsk/static.
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -126,12 +126,12 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="DeepSeek4Free OpenAI-compatible API", lifespan=lifespan)
+app = FastAPI(title="Inference4Free OpenAI-compatible API", lifespan=lifespan)
 logger = logging.getLogger('dsk.openai_server')
 
 
 def _check_api_key(request: Request) -> Optional[str]:
-    """Validate the OpenAI-style Bearer key if DSF_API_KEY is set.
+    """Validate the OpenAI-style Bearer key if I4F_API_KEY is set.
     Returns the client-provided key (may be the DeepSeek token itself)."""
     auth = request.headers.get("authorization", "")
     provided = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
@@ -744,8 +744,11 @@ async def selfheal_refresh(request: Request):
 
 # token -> (jar key, env-var name); cookie kv -> jar keys that are actually
 # read by the provider (so the UI offers the relevant field, not all 200
-# cookies from a pasted browser dump)
+# cookies from a pasted browser dump). These two tables are the SINGLE source
+# of truth for what the providers UI offers — they must name keys the
+# provider code really reads (chatgpt's session cookie, not its bearer).
 _TOKEN_FIELDS: Dict[str, Tuple[str, str]] = {
+    'chatgpt': ('accessToken', 'CHATGPT_ACCESS_TOKEN'),
     'claude': ('sessionKey', 'CLAUDE_SESSION_KEY'),
     'grok': ('sso', 'GROK_SSO'),
     'kimi': ('token', 'KIMI_TOKEN'),
@@ -755,7 +758,7 @@ _TOKEN_FIELDS: Dict[str, Tuple[str, str]] = {
 _COOKIE_FIELDS: Dict[str, List[str]] = {
     'deepseek': ['userToken', 'cf_clearance'],
     'gemini': ['__Secure-1PSID', '__Secure-1PSIDTS'],
-    'chatgpt': ['accessToken'],
+    'chatgpt': ['__Secure-next-auth.session-token', '__Secure-next-auth.csrf-token'],
     'claude': ['sessionKey', 'claude-statsig', 'claude-project-key'],
     'grok': ['sso', 'sso-rw', 'grok-csrf-token'],
     'kimi': ['token', 'jwt'],
@@ -818,7 +821,7 @@ async def list_providers(request: Request):
     out: List[Dict[str, Any]] = []
     for name in list(_refresher.REFRESH):
         if not provider_enabled(name):
-            continue  # only providers enabled via DSF_PROVIDERS are shown
+            continue  # only providers enabled via I4F_PROVIDERS are shown
         entry: Dict[str, Any] = {
             'name': name,
             'enabled': True,
@@ -875,6 +878,8 @@ async def provider_detail(name: str, request: Request):
         if canonical in _TOKEN_FIELDS else None,
         'cookie_fields': _COOKIE_FIELDS.get(canonical, []),
         'login_email': (_refresher._creds(canonical)[0] or ''),
+        'login_password_set': bool(
+            (_refresher._load_accounts().get(canonical) or {}).get('password')),
         'has_credentials': _refresher._has_creds(canonical),
         'token': {  # masked: show the tail only, so the user sees it is set
             'set': bool(jar.get(token_key)) if token_key else False,
@@ -937,9 +942,17 @@ async def provider_credentials_set(name: str, request: Request):
 
     token = (body.get('token') or '').strip()
     cookies = body.get('cookies') or {}
-    if isinstance(cookies, str):  # tolerate "k=v, k2=v2" paste
-        cookies = {p.split('=', 1)[0].strip(): p.split('=', 1)[1].strip()
-                   for p in cookies.split(',') if '=' in p}
+    if isinstance(cookies, str):
+        # Tolerate pasted browser exports: a full Cookie header
+        # ("k1=v1; k2=v2", possibly multi-line) or "k1=v1, k2=v2".
+        parts = re.split(r'[;,]\s*|\r?\n', cookies.strip())
+        cookies = {}
+        for part in parts:
+            if '=' in part:
+                k, v = part.split('=', 1)
+                k = k.strip()
+                if k:
+                    cookies[k] = v.strip()
     if not isinstance(cookies, dict):
         cookies = {}
     email = (body.get('email') or '').strip()
@@ -950,10 +963,9 @@ async def provider_credentials_set(name: str, request: Request):
 
     saved = False
     # token
-    if token and token != _CRED_MASK:
-        if token_key:
-            _refresher._save_jar(canonical, {token_key: token})
-            saved = True
+    if token and token != _CRED_MASK and token_key:
+        _refresher._save_jar(canonical, {token_key: token})
+        saved = True
     # cookies kv
     kv = {str(k): str(v) for k, v in (cookies or {}).items()
           if v not in (None, '') and str(v) != _CRED_MASK}
@@ -964,11 +976,16 @@ async def provider_credentials_set(name: str, request: Request):
         else:
             _refresher._save_jar(canonical, kv)
         saved = True
-    # login email/password (bot renewal source)
-    if email:
-        if password:
-            _refresher._save_account(canonical, email, password)
-        saved = True
+    # login email/password (bot renewal source). Merge with what is already
+    # stored so a password-only or email-only save never orphans the other
+    # half of the login pair (the renewal ladder needs both).
+    if email or password:
+        cur_email, cur_password = _refresher._creds(canonical)
+        merged_email = email or cur_email
+        merged_password = password or cur_password
+        if merged_email and merged_password:
+            _refresher._save_account(canonical, merged_email, merged_password)
+            saved = True
 
     result = {'saved': saved, 'name': canonical}
     if saved:
@@ -981,9 +998,26 @@ async def provider_credentials_set(name: str, request: Request):
         # qwen: also hit the real auths endpoint (static list_models lies here)
         if canonical == 'qwen':
             result['token_check'] = _qwen_auth_probe()
+        # chatgpt/gemini: same idea — a verdict the UI can display, not a
+        # silent save. list_models lies for chatgpt (models answer even when
+        # generation is Sentinel-blocked) and gemini needs REAL cookies.
+        if canonical in ('chatgpt', 'gemini'):
+            try:
+                from . import selfheal as _selfheal
+                st, detail = _selfheal._probe_once(canonical)
+                result['credential_check'] = {
+                    'status': st,          # ok | auth | network | rate | structural
+                    'detail': detail,
+                    'valid': st == 'ok',
+                }
+            except Exception as e:  # noqa: BLE001 — never block the save
+                result['credential_check'] = {
+                    'status': 'error', 'detail': f'{type(e).__name__}: {e}',
+                    'valid': False,
+                }
         # Re-run model discovery so a provider that just gained credentials
         # exposes its models immediately (the TTL cache would otherwise hide
-        # them for up to DSF_MODELS_TTL). Fire-and-forget, off the event loop.
+        # them for up to I4F_MODELS_TTL). Fire-and-forget, off the event loop.
         def _rediscover():
             try:
                 ROUTER.refresh_models(force=True)

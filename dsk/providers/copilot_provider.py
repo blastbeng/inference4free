@@ -41,8 +41,8 @@ COPILOT_BASE_URL = 'https://copilot.microsoft.com'
 COPILOT_START_URL = f'{COPILOT_BASE_URL}/c/api/start'
 COPILOT_WS_URL = 'wss://copilot.microsoft.com/c/api/chat?api-version=2'
 
-COPILOT_CONTEXT_LENGTH = int(os.getenv('DSF_COPILOT_CONTEXT_LENGTH', '32000'))
-COPILOT_MAX_OUTPUT = int(os.getenv('DSF_COPILOT_MAX_OUTPUT', '4096'))
+COPILOT_CONTEXT_LENGTH = int(os.getenv('I4F_COPILOT_CONTEXT_LENGTH', '32000'))
+COPILOT_MAX_OUTPUT = int(os.getenv('I4F_COPILOT_MAX_OUTPUT', '4096'))
 
 _USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -71,9 +71,9 @@ def _harvest_browser_cookies() -> Dict[str, str]:
 
     Synthetic cookies are rejected by ``/c/api/start`` (401); only cookies a
     real browser mints are accepted. Runs once per missing identity, guarded
-    by ``DSF_COPILOT_HARVEST`` (default on). Never raises.
+    by ``I4F_COPILOT_HARVEST`` (default on). Never raises.
     """
-    if os.getenv('DSF_COPILOT_HARVEST', 'true').strip().lower() in \
+    if os.getenv('I4F_COPILOT_HARVEST', 'true').strip().lower() in \
             ('0', 'false', 'no', 'off'):
         return {}
     try:

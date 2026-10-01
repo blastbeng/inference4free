@@ -8,7 +8,7 @@ messages get middle-out truncation. Trimming the payload BEFORE the proxy
 rotator keeps upstream tokens (and therefore time-to-first-byte and
 per-IP rate-limit pressure) minimal on every egress route.
 
-The stage is ALWAYS working by default; ``DSF_LLMTRIM=false`` disables it.
+The stage is ALWAYS working by default; ``I4F_LLMTRIM=false`` disables it.
 """
 
 import logging
@@ -24,7 +24,7 @@ _MARKER = '\n\u2026[llmtrim removed {n} chars]\u2026\n'
 
 
 def enabled() -> bool:
-    return os.getenv('DSF_LLMTRIM', 'true').strip().lower() \
+    return os.getenv('I4F_LLMTRIM', 'true').strip().lower() \
         not in ('0', 'false', 'no', 'off')
 
 

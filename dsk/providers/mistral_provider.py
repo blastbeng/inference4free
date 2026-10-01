@@ -9,9 +9,14 @@ How it works
 ------------
 1. Bootstrap: GET ``https://auth.mistral.ai/self-service/registration/api``
    warms the Kratos/Cloudflare cookies (non-fatal).
-2. Single call: POST ``/api/chat`` with ``mode: 'create'`` — the request both
-   starts the conversation and streams the answer (no separate newChat call;
-   ``agentId`` must be absent — ``null`` → HTTP 400). The body is NOT SSE —
+2. Single call: POST ``/api/chat`` with ``mode: 'create'`` +
+   ``productType: 'work'`` — the request both starts the conversation and
+   streams the answer (no separate newChat call; ``agentId`` must be absent —
+   ``null`` → HTTP 400). 2026-10: chat.mistral.ai merged Le Chat into the
+   "Work" UI and the endpoint now validates that schema — the old body
+   (top-level ``model`` + ``platform``) answers HTTP 400 with an empty body,
+   and the model is selected by ``modelConfig: {model_alias, reasoning_effort}``.
+   The body is NOT SSE —
    it is newline-delimited ``<type_num>:<json>`` frames (15=data patches,
    16=metadata, 6=error, 8=end). Assistant text arrives as JSON-patch ops on
    ``/contentChunks`` (replace = full snapshot, append = delta, including
@@ -27,7 +32,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Generator, List, Optional
 
 from .base import (
@@ -53,8 +58,38 @@ _AUTH_WALL_RE = re.compile(r'account is now required', re.IGNORECASE)
 MISTRAL_BASE_URL = 'https://chat.mistral.ai'
 MISTRAL_AUTH_URL = 'https://auth.mistral.ai'
 MISTRAL_CHAT_URL = f'{MISTRAL_BASE_URL}/api/chat'
-# Upstream default chat model id observed in the create-mode request.
-MISTRAL_MODEL = 'mistral-large-2411'
+MISTRAL_CHAT_MODE = os.getenv('MISTRAL_CHAT_MODE', 'create')
+MISTRAL_PRODUCT_TYPE = os.getenv('MISTRAL_PRODUCT_TYPE', 'work')
+
+# Model aliases harvested from the app's own JS bundles (schema:
+# ``modelConfig = {model_alias, temperature?: 0..1, reasoning_effort?}``),
+# the first verified live against /api/chat. ``efforts`` lists the
+# ``reasoning_effort`` values the alias accepts; an alias without them must
+# be sent WITHOUT the key.
+MISTRAL_MODELS: Dict[str, Dict[str, Any]] = {
+    'glm-5-latest-short': {'title': 'GLM-5 latest (Le Chat)',
+                           'efforts': ['none', 'high']},
+    'mistral-large-2411': {'title': 'Mistral Large 2411', 'efforts': []},
+    'mistral-small-2603': {'title': 'Mistral Small 2603', 'efforts': []},
+    'mistral-small-latest': {'title': 'Mistral Small latest', 'efforts': []},
+    'ministral-8b-latest': {'title': 'Ministral 8B', 'efforts': []},
+    'open-mistral-nemo': {'title': 'Open Mistral Nemo', 'efforts': []},
+}
+# Public ids kept alive from the pre-Work schema.
+MISTRAL_LEGACY_IDS = {'mistral-large': 'mistral-large-2411',
+                      'mistral-small': 'mistral-small-latest'}
+# Default alias for the provider's ``auto`` route and for any unknown id.
+MISTRAL_MODEL = os.getenv('MISTRAL_DEFAULT_MODEL', 'glm-5-latest-short')
+# Feature flags the live app sends on every Work chat request.
+MISTRAL_FEATURES = [f.strip() for f in os.getenv(
+    'MISTRAL_FEATURES',
+    'beta-code-interpreter,beta-imagegen,beta-trampoline,beta-websearch,'
+    'agentic-harness').split(',') if f.strip()]
+MISTRAL_TASK_CALLBACKS = ['ask_user_question', 'ask_user_confirmation',
+                          'ask_enable_skill', 'enable_connector',
+                          'ask_retry_or_continue_rate_limit',
+                          'collect_workflow_input',
+                          'delegate_workflow_execution']
 
 # 2026-09: the Android app UA (le-chat-mobile/2.8.0) makes the server replace
 # model output with an "This mode is no longer available — update your app"
@@ -64,8 +99,8 @@ MISTRAL_APP_UA = os.getenv('MISTRAL_UA', (
     '(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
 ))
 
-MISTRAL_CONTEXT_LENGTH = int(os.getenv('DSF_MISTRAL_CONTEXT_LENGTH', '131072'))
-MISTRAL_MAX_OUTPUT = int(os.getenv('DSF_MISTRAL_MAX_OUTPUT', '8192'))
+MISTRAL_CONTEXT_LENGTH = int(os.getenv('I4F_MISTRAL_CONTEXT_LENGTH', '131072'))
+MISTRAL_MAX_OUTPUT = int(os.getenv('I4F_MISTRAL_MAX_OUTPUT', '8192'))
 
 OTP_CODE_RE = re.compile(r'6200')
 
@@ -85,6 +120,56 @@ def _anon_id() -> str:
         stable = str(uuid.uuid4())
         save_jar('mistral', {'stable_anon_id': stable})
     return stable
+
+
+def _model_table() -> Dict[str, Dict[str, Any]]:
+    """Env-overridable alias table: ``MISTRAL_MODELS=a,b,c`` keeps the known
+    metadata for aliases it recognises and appends the rest verbatim."""
+    raw = (os.getenv('MISTRAL_MODELS', '') or '').strip()
+    if not raw:
+        return dict(MISTRAL_MODELS)
+    table: Dict[str, Dict[str, Any]] = {}
+    for alias in [a.strip() for a in raw.split(',') if a.strip()]:
+        table[alias] = dict(MISTRAL_MODELS.get(alias,
+                                               {'title': alias, 'efforts': []}))
+    return table
+
+
+def _alias_for(model: Optional[str]) -> str:
+    """Map a public/route id onto an upstream ``modelConfig.model_alias``."""
+    table = _model_table()
+    key = (model or '').strip().lower()
+    if key.startswith('mistral/'):
+        key = key.split('/', 1)[1]
+    if key in table:
+        return key
+    legacy = MISTRAL_LEGACY_IDS.get(key)
+    if legacy:
+        return legacy
+    for alias in table:
+        if key and (key in alias or alias in key):
+            return alias
+    return MISTRAL_MODEL if MISTRAL_MODEL in table else next(iter(table))
+
+
+def _effort_for(alias: str, thinking_enabled: bool) -> Optional[str]:
+    """``reasoning_effort`` is optional in the schema and only some aliases
+    accept it — returning None omits the key entirely."""
+    efforts = _model_table().get(alias, {}).get('efforts') or []
+    if not efforts:
+        return None
+    if thinking_enabled and 'high' in efforts:
+        return 'high'
+    return efforts[0]
+
+
+def _tz_label(now: datetime) -> str:
+    """``clientPromptData.userTimezone`` as the app sends it: 'T+00:00 (UTC)'."""
+    local = now.astimezone()
+    total = int((local.utcoffset() or timedelta(0)).total_seconds())
+    sign = '+' if total >= 0 else '-'
+    hours, minutes = divmod(abs(total) // 60, 60)
+    return f'T{sign}{hours:02d}:{minutes:02d} ({local.tzname()})'
 
 
 def _headers(auth: bool = False, accept: str = 'application/json') -> Dict[str, str]:
@@ -133,19 +218,37 @@ class MistralProvider(Provider):
         return bool(_session_token())
 
     def list_models(self, auth_key: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Le Chat mobile flow has no model discovery; the server picks the
-        current default chat model — exposed here as a single route."""
-        return [{
-            'id': 'mistral-large',
-            'upstream_model': MISTRAL_MODEL,
-            'thinking_enabled': False,
-            'search_enabled': False,
-            'vision': False,
-            'image_gen': False,
-            'context_length': MISTRAL_CONTEXT_LENGTH,
-            'max_output_tokens': MISTRAL_MAX_OUTPUT,
-            'extra': {'title': 'Mistral Le Chat (web/mobile)'},
-        }]
+        """The Work schema has no model-discovery endpoint; the alias table
+        (harvested from the app's bundles, env-overridable) is the list."""
+        entries: List[Dict[str, Any]] = []
+        for alias, meta in _model_table().items():
+            efforts = meta.get('efforts') or []
+            entries.append({
+                'id': alias,
+                'upstream_model': alias,
+                'thinking_enabled': bool(efforts),
+                'search_enabled': 'beta-websearch' in MISTRAL_FEATURES,
+                'vision': False,
+                'image_gen': 'beta-imagegen' in MISTRAL_FEATURES,
+                'context_length': MISTRAL_CONTEXT_LENGTH,
+                'max_output_tokens': MISTRAL_MAX_OUTPUT,
+                'extra': {'title': meta.get('title') or alias},
+            })
+        for legacy_id, alias in MISTRAL_LEGACY_IDS.items():
+            if legacy_id in _model_table():
+                continue
+            entries.append({
+                'id': legacy_id,
+                'upstream_model': alias,
+                'thinking_enabled': False,
+                'search_enabled': 'beta-websearch' in MISTRAL_FEATURES,
+                'vision': False,
+                'image_gen': False,
+                'context_length': MISTRAL_CONTEXT_LENGTH,
+                'max_output_tokens': MISTRAL_MAX_OUTPUT,
+                'extra': {'title': f'{legacy_id} (legacy id)'},
+            })
+        return entries
 
     def stream(self, prompt: str, *, model: str, thinking_enabled: bool = False,
                search_enabled: bool = False, temperature: Optional[float] = None,
@@ -156,6 +259,8 @@ class MistralProvider(Provider):
                auth_key: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
         if images:
             raise ProviderError('mistral file attachments are not supported yet')
+        alias = _alias_for(model)
+        effort = _effort_for(alias, thinking_enabled)
         self._bootstrap(no_proxy=no_proxy)
         anonymous = not _session_token()
         retry_id: Optional[str] = None
@@ -171,7 +276,9 @@ class MistralProvider(Provider):
             emitted = False
             try:
                 for piece in self._stream_once(prompt, no_proxy=no_proxy,
-                                               anon_id=retry_id):
+                                               anon_id=retry_id,
+                                               alias=alias, effort=effort,
+                                               search_enabled=search_enabled):
                     emitted = True
                     yield piece
                 return
@@ -203,27 +310,43 @@ class MistralProvider(Provider):
 
     def _stream_once(self, prompt: str,
                      no_proxy: bool = False,
-                     anon_id: Optional[str] = None
+                     anon_id: Optional[str] = None,
+                     alias: Optional[str] = None,
+                     effort: Optional[str] = None,
+                     search_enabled: bool = False
                      ) -> Generator[Dict[str, Any], None, None]:
-        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        model_alias = alias or _alias_for(None)
+        now = datetime.now(timezone.utc)
+        features = list(MISTRAL_FEATURES)
+        if search_enabled and 'beta-websearch' not in features:
+            features.append('beta-websearch')
+        if effort is None:
+            effort = _effort_for(model_alias, False)
+        model_config: Dict[str, Any] = {'model_alias': model_alias}
+        if effort:
+            model_config['reasoning_effort'] = effort
         body = {
+            'content': [{'type': 'text', 'text': prompt}],
+            'transcriptionsMetadata': [],
+            'incognito': False,
+            'files': [],
+            'features': features,
+            'integrations': [],
+            'libraries': [],
+            'modelConfig': model_config,
+            'reviewComments': [],
             # 'create' starts the conversation and streams the answer in one
             # call; no 'agentId' key (a null value → HTTP 400).
-            'mode': os.getenv('MISTRAL_CHAT_MODE', 'start'),
-            'content': [{'type': 'text', 'text': prompt}],
-            'files': [],
-            'model': MISTRAL_MODEL,
+            'mode': MISTRAL_CHAT_MODE,
+            # 2026-10: chat.mistral.ai merged Le Chat into the Work UI and
+            # /api/chat now validates that schema — the legacy body (top-level
+            # 'model' + 'platform') is rejected with HTTP 400, empty body.
+            'productType': MISTRAL_PRODUCT_TYPE,
+            'clientPromptData': {'currentDate': now.strftime('%Y-%m-%d'),
+                                 'userTimezone': _tz_label(now)},
+            'disabledFeatures': [],
             'stableAnonymousIdentifier': anon_id or _anon_id(),
-            # 2026-09: the mobile-platform chat flow is deprecated server-side
-            # ("This mode is no longer available"); the web platform with an
-            # authenticated session (Bearer + Ory cookie) still serves free chat.
-            'platform': os.getenv('MISTRAL_PLATFORM', 'web'),
-            'clientPromptData': {'currentDate': now},
-            'supportedTaskCallbacks': [],
-            'features': [],
-            'libraries': [],
-            'integrations': [],
-            'disabledFeatures': ['memory-inference'],
+            'supportedTaskCallbacks': MISTRAL_TASK_CALLBACKS,
         }
         response = http_post_stream(MISTRAL_CHAT_URL,
                                     headers=_headers(accept='text/event-stream'),

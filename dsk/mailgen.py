@@ -8,9 +8,9 @@ stays fully unmanned with zero mail configuration.
 Four backends, tried in order (first that is *configured* wins, then the
 first that *works*):
 
-1. IMAP catch-all (``DSF_MAIL_IMAP_HOST`` + ``DSF_MAIL_DOMAIN``):
+1. IMAP catch-all (``I4F_MAIL_IMAP_HOST`` + ``I4F_MAIL_DOMAIN``):
    a random local part is invented under your own domain
-   (``dsf-<hex8>@<domain>``); the OTP is read through the existing IMAP
+   (``i4f-<hex8>@<domain>``); the OTP is read through the existing IMAP
    poller. Most reliable — use this when you own a catch-all mailbox.
 
 2. emailnator.com (https://www.emailnator.com, free, no key): the only
@@ -32,8 +32,8 @@ first that *works*):
    — the caller treats failures as a normal renewal-ladder miss.
 
 Env switches:
-    DSF_MAIL_AUTOGEN   master switch for this module (default: true)
-    DSF_MAIL_DOMAIN    domain for the IMAP catch-all backend (optional)
+    I4F_MAIL_AUTOGEN   master switch for this module (default: true)
+    I4F_MAIL_DOMAIN    domain for the IMAP catch-all backend (optional)
 
 CLI smoke test:
     python -m dsk.mailgen
@@ -57,18 +57,18 @@ TEMPMAIL_API = 'https://api.tempmail.lol'
 _EMAILNATOR_BASE = 'https://www.emailnator.com'
 _EMAILNATOR_UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/131.0 Safari/537.36')
-_UA = 'deepseek4free-refresher/1.0 (+autonomous credential maintenance)'
+_UA = 'inference4free-refresher/1.0 (+autonomous credential maintenance)'
 
 
 def autogen_enabled() -> bool:
-    raw = os.getenv('DSF_MAIL_AUTOGEN', '').strip().lower()
+    raw = os.getenv('I4F_MAIL_AUTOGEN', '').strip().lower()
     if not raw:
         return True  # default ON
     return raw in ('1', 'true', 'yes', 'on')
 
 
 def _gen_local_part() -> str:
-    return f"dsf-{secrets.token_hex(4)}"
+    return f"i4f-{secrets.token_hex(4)}"
 
 
 def _gen_password() -> str:
@@ -293,7 +293,7 @@ class _Emailnator:
         if not self._jar:
             import tempfile
             self._jar = os.path.join(tempfile.gettempdir(),
-                                     f'dsf-emailnator-{os.getpid()}.jar')
+                                     f'i4f-emailnator-{os.getpid()}.jar')
         return self._jar
 
     def _curl(self, args: List[str], timeout: int = 40) -> Tuple[int, str]:
@@ -451,8 +451,8 @@ def _emailnator_fetch_otp(session: Dict[str, Any], sender_needle: str,
 
 # ------------------------------------------------------------- IMAP catch-all
 def _imap_catchall_create() -> Optional[Dict[str, Any]]:
-    domain = os.getenv('DSF_MAIL_DOMAIN', '').strip()
-    host = os.getenv('DSF_MAIL_IMAP_HOST', '').strip()
+    domain = os.getenv('I4F_MAIL_DOMAIN', '').strip()
+    host = os.getenv('I4F_MAIL_IMAP_HOST', '').strip()
     if not domain or not host:
         return None
     address = f"{_gen_local_part()}@{domain}"
@@ -474,8 +474,8 @@ def available() -> bool:
     """True when at least one backend is plausibly configured."""
     if not autogen_enabled():
         return False
-    if (os.getenv('DSF_MAIL_DOMAIN', '').strip()
-            and os.getenv('DSF_MAIL_IMAP_HOST', '').strip()):
+    if (os.getenv('I4F_MAIL_DOMAIN', '').strip()
+            and os.getenv('I4F_MAIL_IMAP_HOST', '').strip()):
         return True
     return True  # mail.tm needs no configuration
 
@@ -494,7 +494,7 @@ def create_email() -> Tuple[Optional[Dict[str, Any]], str]:
     (often blocklisted by big providers).
     """
     if not autogen_enabled():
-        return None, 'DSF_MAIL_AUTOGEN disabled'
+        return None, 'I4F_MAIL_AUTOGEN disabled'
     backends = (_imap_catchall_create, _emailnator_create,
                 _tempmail_create, _mailtm_create)
     errors: List[str] = []
@@ -537,9 +537,9 @@ def fetch_otp(session: Dict[str, Any], max_wait_s: int = 180,
     if not session:
         return None
     sender_needle = (sender_needle
-                     or os.getenv('DSF_MAIL_OTP_SENDER', 'deepseek')).strip().lower()
-    code_re = code_re or re.compile(os.getenv('DSF_MAIL_OTP_REGEX', r'\b(\d{6})\b'))
-    max_age_min = float(os.getenv('DSF_MAIL_OTP_MAX_AGE', str(max_age_min)) or max_age_min)
+                     or os.getenv('I4F_MAIL_OTP_SENDER', 'deepseek')).strip().lower()
+    code_re = code_re or re.compile(os.getenv('I4F_MAIL_OTP_REGEX', r'\b(\d{6})\b'))
+    max_age_min = float(os.getenv('I4F_MAIL_OTP_MAX_AGE', str(max_age_min)) or max_age_min)
     fetcher = {'imap-catchall': _imap_fetch_otp,
                'emailnator-gmail': _emailnator_fetch_otp,
                'tempmail.lol': _tempmail_fetch_otp}.get(session['backend']) \

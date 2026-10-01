@@ -25,7 +25,7 @@ the real qwen SPA in GUEST mode streams. So ``stream()`` tries the HTTP path
 first (it still works for ``/api/v2/chats/new`` + model discovery) and falls
 back to the browser relay in ``dsk/qwen_relay.py`` when completions is
 punished, the token is dead, or no token exists at all. Disable the relay
-with ``DSF_QWEN_RELAY=0``.
+with ``I4F_QWEN_RELAY=0``.
 """
 
 import json
@@ -56,8 +56,8 @@ QWEN_NEWCHAT_URL = f'{QWEN_BASE_URL}/api/v2/chats/new'
 QWEN_COMPLETIONS_URL = f'{QWEN_BASE_URL}/api/v2/chat/completions'
 QWEN_MODELS_URL = f'{QWEN_BASE_URL}/api/models'
 
-QWEN_CONTEXT_LENGTH = int(os.getenv('DSF_QWEN_CONTEXT_LENGTH', '131072'))
-QWEN_MAX_OUTPUT = int(os.getenv('DSF_QWEN_MAX_OUTPUT', '8192'))
+QWEN_CONTEXT_LENGTH = int(os.getenv('I4F_QWEN_CONTEXT_LENGTH', '131072'))
+QWEN_MAX_OUTPUT = int(os.getenv('I4F_QWEN_MAX_OUTPUT', '8192'))
 
 _USER_AGENT = (
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -86,7 +86,7 @@ QWEN_MODELS: List[Dict[str, Any]] = [
 # Live model discovery: chat.qwen.ai exposes its picker anonymously on
 # ``GET /api/models`` (OpenWebUI-style), so the route list tracks whatever
 # the web app currently offers instead of a frozen client-side list.
-_QWEN_MODELS_TTL = float(os.getenv('DSF_QWEN_MODELS_TTL', '1800'))
+_QWEN_MODELS_TTL = float(os.getenv('I4F_QWEN_MODELS_TTL', '1800'))
 _discover_cache: Dict[str, Any] = {'at': 0.0, 'models': []}
 
 
@@ -122,7 +122,7 @@ def _discover_models(force: bool = False, anon: bool = False) -> List[Dict[str, 
     session entitlement: signed-in sees the full catalog, anonymous sees
     exactly what the guest UI offers. ``anon=True`` skips the bearer so
     relay-only deployments list what the relay can actually serve. Results
-    are cached for ``DSF_QWEN_MODELS_TTL`` seconds. Raises on transport/HTTP
+    are cached for ``I4F_QWEN_MODELS_TTL`` seconds. Raises on transport/HTTP
     failure so the caller can fall back to the static list.
     """
     now = time.time()
@@ -187,12 +187,12 @@ def _token() -> str:
 
 
 def _relay_enabled() -> bool:
-    """Browser-relay fallback switch (``DSF_QWEN_RELAY``, default on).
+    """Browser-relay fallback switch (``I4F_QWEN_RELAY``, default on).
 
     Import is lazy: the relay pulls in DrissionPage/Xvfb, which must not load
     with every provider module import.
     """
-    if os.getenv('DSF_QWEN_RELAY', '1').strip().lower() in \
+    if os.getenv('I4F_QWEN_RELAY', '1').strip().lower() in \
             ('0', 'false', 'no', 'off'):
         return False
     try:
@@ -223,7 +223,7 @@ def _norm(model_id: str) -> str:
 
 # After a WAF punish/auth failure on the HTTP completions path, stop paying
 # the punish roundtrip tax and go straight to the relay for a while.
-_HTTP_COOLDOWN_S = float(os.getenv('DSF_QWEN_HTTP_COOLDOWN', '300'))
+_HTTP_COOLDOWN_S = float(os.getenv('I4F_QWEN_HTTP_COOLDOWN', '300'))
 _http_cooldown: Dict[str, float] = {'until': 0.0}
 
 

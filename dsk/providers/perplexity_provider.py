@@ -47,9 +47,9 @@ PERPLEXITY_BASE_URL = 'https://www.perplexity.ai'
 PERPLEXITY_ASK_URL = f'{PERPLEXITY_BASE_URL}/rest/sse/perplexity_ask'
 PERPLEXITY_AUTH_URL = f'{PERPLEXITY_BASE_URL}/api/auth/session'
 
-PERPLEXITY_CONTEXT_LENGTH = int(os.getenv('DSF_PERPLEXITY_CONTEXT_LENGTH',
+PERPLEXITY_CONTEXT_LENGTH = int(os.getenv('I4F_PERPLEXITY_CONTEXT_LENGTH',
                                           '128000'))
-PERPLEXITY_MAX_OUTPUT = int(os.getenv('DSF_PERPLEXITY_MAX_OUTPUT', '4096'))
+PERPLEXITY_MAX_OUTPUT = int(os.getenv('I4F_PERPLEXITY_MAX_OUTPUT', '4096'))
 
 _USER_AGENT = (
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) '

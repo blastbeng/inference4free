@@ -20,9 +20,9 @@ SearchMode = Literal['enabled', 'disabled']
 
 # Throttle for the legacy bypass.py subprocess (harvests a WAF token): it
 # blocks up to 180s INSIDE the request retry loop, so it must never fire more
-# than once per DSF_BYPASS_THROTTLE_S seconds per process.
+# than once per I4F_BYPASS_THROTTLE_S seconds per process.
 _LAST_BYPASS_TS = 0.0
-_BYPASS_THROTTLE_S = float(os.getenv('DSF_BYPASS_THROTTLE_S', '600') or 600)
+_BYPASS_THROTTLE_S = float(os.getenv('I4F_BYPASS_THROTTLE_S', '600') or 600)
 
 class DeepSeekError(Exception):
     """Base exception for all DeepSeek API errors"""
@@ -155,7 +155,7 @@ class DeepSeekAPI:
             # legacy path: standalone bypass server harvests a WAF token.
             # The subprocess blocks up to 180s inside the request retry loop,
             # serializing workers on every CF hit — throttle it to one run per
-            # DSF_BYPASS_THROTTLE_S; while throttled, signal the refresher
+            # I4F_BYPASS_THROTTLE_S; while throttled, signal the refresher
             # daemon's ladder (browser re-login / signup) instead, which
             # refreshes the jar without blocking any worker.
             global _LAST_BYPASS_TS

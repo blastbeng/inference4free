@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>deepseek4free · playground</title>
+<title>inference4free · playground</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%F0%9F%90%8B%3C/text%3E%3C/svg%3E">
 <style>
   :root {
@@ -119,6 +119,8 @@
   .badge { font-size: 10px; padding: 1px 6px; border-radius: 8px;
            border: 1px solid var(--border); color: var(--muted); }
   .badge.on { color: var(--ok); border-color: var(--ok); }
+  .badge.err { color: var(--err); border-color: var(--err); }
+  .kvrow .stored { font-size: 10px; color: var(--ok); }
   #health { cursor: default; max-width: 220px; overflow: hidden;
             text-overflow: ellipsis; white-space: nowrap; }
   #health.ok { color: var(--ok); border-color: var(--ok); }
@@ -237,7 +239,7 @@
 </head>
 <body>
 <header>
-  <h1>deepseek4free <span>· playground</span></h1>
+  <h1>inference4free <span>· playground</span></h1>
   <div id="modelcombo">
     <input id="modelfilter" type="text" autocomplete="off" spellcheck="false"
            placeholder="model — click to browse, type to filter" title="Model (from GET /v1/models) — click for the full list, type to filter, ↑↓ + Enter to pick">
@@ -274,7 +276,7 @@
       <div class="prov">loading providers…</div>
     </div>
     <div style="font-size:11px;color:var(--muted)">
-      Listing only the providers enabled in <code>.env</code> (<code>DSF_PROVIDERS</code>).<br>
+      Listing only the providers enabled in <code>.env</code> (<code>I4F_PROVIDERS</code>).<br>
       Token = session/jwt token · cookies = raw browser cookies · login = account email/password
       used by the auto-renew bot. Values saved here are the SAME stores the bot uses, so they
       take effect immediately and renew automatically on the next cycle. Use <b>Clear</b> to wipe
@@ -289,6 +291,12 @@
   <div id="chat"></div>
   <aside id="settings">
     <div class="shead"><h2>Settings</h2><button id="setclose" title="Close settings">✕</button></div>
+    <div class="field">
+      <label for="apikey">API key</label>
+      <input type="password" id="apikey" autocomplete="off" spellcheck="false"
+             placeholder="the server's I4F_API_KEY, if it has one set">
+      <div class="hint">sent as <code>Authorization: Bearer …</code> on every request from this page (leave blank if the server has no key)</div>
+    </div>
     <div class="field">
       <label for="system">System message</label>
       <textarea id="system" rows="4" placeholder="You are a helpful assistant."></textarea>
@@ -352,6 +360,32 @@ let statTimer = null, statT0 = 0, statChunks = 0, statChars = 0;
 let statThinkChars = 0, statT1 = 0, statUsage = null; // tok: reasoning chars, first-token t, server usage
 
 $('baseurl').textContent = location.origin;
+
+// Optional server API key (I4F_API_KEY). Kept in its own localStorage slot so
+// it is available before the first /v1/models fetch, independent of the
+// multi-chat store.
+const APIKEY_LS = 'i4f_api_key';
+function getApiKey() {
+  const el = $('apikey');
+  const v = el ? el.value.trim() : '';
+  if (v) return v;
+  try { return localStorage.getItem(APIKEY_LS) || ''; } catch (_) { return ''; }
+}
+function authHeaders() {
+  const k = getApiKey();
+  return k ? { Authorization: 'Bearer ' + k } : {};
+}
+(function initApiKey() {
+  const el = $('apikey');
+  if (!el) return;
+  try { el.value = localStorage.getItem(APIKEY_LS) || ''; } catch (_) {}
+  el.oninput = () => {
+    try {
+      const v = el.value.trim();
+      v ? localStorage.setItem(APIKEY_LS, v) : localStorage.removeItem(APIKEY_LS);
+    } catch (_) {}
+  };
+})();
 
 function esc(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -699,7 +733,7 @@ document.addEventListener('click', (e) => {
 
 async function fetchModels() {
   try {
-    const r = await fetch('/v1/models');
+    const r = await fetch('/v1/models', { headers: authHeaders() });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     const sig = modelSignature(data);
@@ -1096,7 +1130,7 @@ async function runCompletion() {
 
     const res = await fetch('/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
@@ -1316,7 +1350,7 @@ $('edit').onclick = () => {
 // ---------- export conversation as markdown ----------
 $('export').onclick = () => {
   if (!messages.length) return;
-  const lines = ['# deepseek4free conversation', '',
+  const lines = ['# inference4free conversation', '',
     '*model:* ' + (modelSel.value || '?') + ' · *exported:* ' +
     new Date().toISOString(), ''];
   for (const m of messages) {
@@ -1327,7 +1361,7 @@ $('export').onclick = () => {
   const blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'deepseek4free-' + new Date().toISOString().slice(0, 19)
+  a.download = 'inference4free-' + new Date().toISOString().slice(0, 19)
     .replace(/[:T]/g, '-') + '.md';
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
@@ -1373,11 +1407,37 @@ const provList = $('provlist');
 const provAllS = $('provallstatus');
 
 async function provFetch(url, opts) {
-  const r = await fetch(url, opts || {});
+  const o = Object.assign({}, opts || {});
+  o.headers = Object.assign({}, authHeaders(), o.headers || {});
+  const r = await fetch(url, o);
   const text = await r.text();
   let body;
   try { body = text ? JSON.parse(text) : {}; } catch { body = text || ''; }
   return { ok: r.ok, code: r.status, body };
+}
+// Friendly one-line-ish summary of the provider action responses (they carry
+// small status objects, not the raw JSON dumps the user used to get).
+function provFriendly(r) {
+  let b = r && r.body;
+  if (b && typeof b === 'object' && b.result && typeof b.result === 'object') b = b.result;
+  const body = b && typeof b === 'object' ? b : {};
+  const lines = [];
+  if (!r.ok) lines.push('HTTP ' + r.code);
+  if (b.renewed !== undefined) {
+    lines.push(b.renewed ? 'renewed via ' + (b.via || '?') : 'not renewed');
+    (b.steps || []).forEach(s => lines.push('  · ' + s));
+    if (b.hint) lines.push('hint: ' + b.hint);
+  } else if (b.saved !== undefined) {
+    lines.push(b.saved ? 'saved' : 'nothing saved — ' + (b.hint || 'all fields empty'));
+  } else if (b.status !== undefined) {
+    lines.push('status: ' + b.status);
+  }
+  if (b.verify !== undefined) lines.push('verify: ' + b.verify);
+  if (b.token_check !== undefined) lines.push('token check: ' + b.token_check);
+  if (b.cleared) lines.push('cleared ' + b.cleared);
+  if (b.refreshed) lines.push('refreshed ' + Object.keys(b.refreshed).length + ' provider(s)');
+  if (!lines.length) return provResultText(r.ok, r.code, r.body);
+  return lines.join('\n');
 }
 function provEl(tag, cls, text, title) {
   const e = document.createElement(tag);
@@ -1429,7 +1489,7 @@ async function renderProviders() {
     const el = provEl('div', 'prov');
     el.dataset.name = provider.name;
 
-    // head: name + credential kind badge (only DSF_PROVIDERS-enabled
+    // head: name + credential kind badge (only I4F_PROVIDERS-enabled
     // providers are returned by /providers, so no 'enabled' badge needed)
     const head = document.createElement('div'); head.className = 'phead';
     head.append(provEl('span', 'pname', provider.name));
@@ -1444,6 +1504,18 @@ async function renderProviders() {
       const mb = provEl('span', 'badge', provider.models.length + ' models');
       mb.title = provider.models.join('\n');
       head.append(mb);
+    }
+    // last renewal/probe event (live from the refresher daemon state)
+    if (provider.last) {
+      const ev = provider.last;
+      const hh = String(ev.ts || '').slice(11, 16);
+      const bad = /fail|error|breaker|issue|blocked/.test(String(ev.event));
+      const good = ev.event === 'renewed' || ev.event === 'refresh'
+        || ev.event === 'proactive-refresh';
+      const lb = provEl('span', 'badge' + (good ? ' on' : bad ? ' err' : ''),
+        String(ev.event) + (hh ? ' · ' + hh : ''),
+        String(ev.detail || ev.event));
+      head.append(lb);
     }
     el.append(head);
 
@@ -1484,20 +1556,21 @@ async function renderProviders() {
       setBusy(testBtn, false);
       const ok2 = r.ok && r.body && r.body.status === 'ok'
         && (!r.body.token_check || r.body.token_check === 'ok');
-      show(ok2 ? 'ok' : 'err', provResultText(r.ok, r.code, r.body));
+      show(ok2 ? 'ok' : 'err', provFriendly(r));
       await refreshKinds();
     };
 
-    const renewBtn = provEl('button', 'primary', '⟳ renew', 'Full ladder: HTTP refresh → browser login → auto-signup (30-120 s)');
+    const renewBtn = provEl('button', 'primary', '⟳ renew',
+      'Full ladder: HTTP refresh → browser login → auto-signup (can take a few minutes)');
     renewBtn.onclick = async () => {
-      setBusy(renewBtn, true); show('', 'renewing (up to ~2 min)…');
+      setBusy(renewBtn, true); show('', 'renewing… (may take a few minutes)');
       let r;
       try { r = await provFetch('/providers/' + provider.name + '/renew', { method: 'POST' }); }
       catch (e) { r = { ok: false, code: 0, body: String(e) }; }
       setBusy(renewBtn, false);
       const rr = (r.body && r.body.result) || r.body || {};
       const ok2 = r.ok && rr.renewed === true;
-      show(ok2 ? 'ok' : 'err', provResultText(r.ok, r.code, r.body));
+      show(ok2 ? 'ok' : 'err', provFriendly(r));
       await refreshKinds();
     };
 
@@ -1508,7 +1581,7 @@ async function renderProviders() {
       let r;
       try { r = await provFetch('/providers/' + provider.name + '/credentials/clear', { method: 'POST' }); }
       catch (e) { r = { ok: false, code: 0, body: String(e) }; }
-      show(r.ok ? 'ok' : 'err', provResultText(r.ok, r.code, r.body));
+      show(r.ok ? 'ok' : 'err', provFriendly(r));
       if (r.ok) { const pcr = el.querySelector('.pcreds'); if (pcr) pcr.remove(); }
       await refreshKinds();
     };
@@ -1517,53 +1590,109 @@ async function renderProviders() {
       const existing = el.querySelector('.pcreds');
       if (existing) { existing.remove(); return; }
       const det = await provFetch('/providers/' + provider.name);
+      if (!det.ok) {
+        show('err', 'detail fetch failed (HTTP ' + det.code + ')' +
+          (det.code === 401 ? ' — set the server API key in Settings' : ''));
+        return;
+      }
+      const d = det.body || {};
       const box = document.createElement('div'); box.className = 'pcreds';
       box.append(provEl('div', 'pcredshint',
-        'Leave fields blank to keep their current value; fill them to replace. After save, a quick verify runs.'));
+        'Blank = keep the current value; fill to replace. After save, a quick verify runs.'));
 
-      // token
-      if (provider.token_field && provider.token_field.key) {
-        const tk = (det.body && det.body.token) || {};
-        const ph = tk.masked ? '••• (stored, tail ' + tk.masked + ')' : (provider.token_field.env || '');
-        provider._tokenPlaceholder = ph;
-        provider._tokenHint = 'Stored ' + (tk.set ? '✓' : '·') + ' · env: ' + (provider.token_field.env || 'n/a');
-      }
       const kvHolder = document.createElement('div');
       kvHolder.style.cssText = 'display:flex;flex-direction:column;gap:6px';
-
       const rows = [];
+      const markStored = (rowEl) => {
+        rowEl.append(provEl('span', 'stored', '✓ stored'));
+      };
 
       // token row (if any)
       if (provider.token_field && provider.token_field.key) {
-        const r = provRow(provider.token_field.key, '', 'password', provider._tokenHint, true);
-        r.inp.placeholder = provider._tokenPlaceholder || '';
+        const tk = d.token || {};
+        const r = provRow(provider.token_field.key, '', 'password',
+          'Token · env: ' + (provider.token_field.env || 'n/a') +
+          (tk.set ? ' · stored (tail ' + tk.masked + ')' : ''));
+        r.inp.placeholder = tk.set
+          ? '••• (stored, tail ' + tk.masked + ')'
+          : (provider.token_field.env || '');
+        if (tk.set) markStored(r.row);
         kvHolder.append(r.row); rows.push({ kind: 'token', inp: r.inp });
       }
 
-      // kv holder for cookies
-      const addCookieRow = (name, initialValue) => {
+      // cookie rows (✓ stored = already present server-side)
+      const addCookieRow = (name, initialValue, stored) => {
         const r = provRow(name, initialValue || '', 'password');
+        if (stored) markStored(r.row);
         kvHolder.append(r.row);
         rows.push({ kind: 'cookie', name, inp: r.inp });
       };
       const cookieNames = (provider.cookie_fields || [])
         .filter(n => !(provider.token_field && provider.token_field.key === n));
-      for (const n of cookieNames) addCookieRow(n);
+      for (const n of cookieNames)
+        addCookieRow(n, '', !!(d.cookies && d.cookies[n]));
       const addBtn = provEl('button', 'addkv', '＋ add cookie');
       addBtn.onclick = () => {
         const name = prompt('cookie name:');
         if (!name) return;
-        const r = provRow(name, '', 'password');
-        kvHolder.append(r.row);
-        rows.push({ kind: 'cookie', name, inp: r.inp });
+        addCookieRow(name.trim(), '', false);
       };
-      kvHolder.append(addBtn);
+
+      // paste a whole Cookie header (DevTools → Network → request → Cookie)
+      const pasteBtn = provEl('button', 'addkv', '📋 paste cookie header…');
+      pasteBtn.onclick = () => {
+        const ta = document.createElement('textarea');
+        ta.rows = 3;
+        ta.spellcheck = false;
+        ta.placeholder = 'oai-did=…; __Secure-next-auth.session-token=…; __Secure-1PSID=…';
+        ta.style.cssText = 'width:100%;font-family:var(--mono);font-size:11px';
+        const fillBtn = provEl('button', 'addkv', 'fill fields from paste');
+        const cancelP = provEl('button', 'addkv', '✕ cancel');
+        const bar = document.createElement('div');
+        bar.style.cssText = 'display:flex;gap:6px';
+        bar.append(fillBtn, cancelP);
+        const pbox = document.createElement('div');
+        pbox.style.cssText = 'display:flex;flex-direction:column;gap:6px';
+        pbox.append(ta, bar);
+        cancelP.onclick = () => pbox.remove();
+        fillBtn.onclick = () => {
+          const dump = {};
+          for (const part of String(ta.value).split(/[;\n]/)) {
+            const i = part.indexOf('=');
+            if (i > 0) {
+              const k = part.slice(0, i).trim();
+              if (k) dump[k] = part.slice(i + 1).trim();
+            }
+          }
+          let n = 0;
+          for (const row of rows) {
+            const key = row.kind === 'token' ? provider.token_field.key : row.name;
+            if (dump[key] !== undefined) { row.inp.value = dump[key]; n++; }
+          }
+          for (const k of Object.keys(dump)) {
+            const known = rows.some(row => row.kind === 'token'
+              ? (provider.token_field && provider.token_field.key === k)
+              : (row.name === k));
+            if (!known) { addCookieRow(k, dump[k]); n++; }
+          }
+          pbox.remove();
+          show('', 'filled ' + n + ' field(s) from paste — review, then save');
+        };
+        kvHolder.append(pbox);
+      };
+
+      kvHolder.append(addBtn, pasteBtn);
       box.append(kvHolder);
 
-      // email/password
-      const emailRow = provRow('email', (det.body && det.body.login_email) || '', 'text',
-        'Login email (bot uses this to re-sign-in when the token expires)', true);
-      const passRow  = provRow('password', '', 'password', 'Login password (leave blank to keep stored)', true);
+      // login pair (the renewal ladder re-signs in with it)
+      const emailRow = provRow('email', d.login_email || '', 'text',
+        'Login email (used for browser re-login / signup)');
+      const passRow  = provRow('password', '', 'password',
+        'Login password (leave blank to keep the stored one)');
+      if (d.login_password_set) {
+        passRow.inp.placeholder = '••• (stored — leave blank to keep)';
+        markStored(passRow.row);
+      }
       box.append(emailRow.row); box.append(passRow.row);
       rows.push({ kind: 'email', inp: emailRow.inp });
       rows.push({ kind: 'password', inp: passRow.inp });
@@ -1581,13 +1710,13 @@ async function renderProviders() {
         const cookies = {};
         for (const r of rows) if (r.kind === 'cookie' && r.inp.value) cookies[r.name] = r.inp.value;
         if (Object.keys(cookies).length) payload.cookies = cookies;
-        const emailV = rows.find(r => r.kind === 'email').inp.value;
-        const passV = rows.find(r => r.kind === 'password').inp.value;
-        if (emailV) payload.email = emailV;
-        if (emailV && passV) payload.password = passV;
+        const emailInp = (rows.find(r => r.kind === 'email') || {}).inp;
+        const passInp = (rows.find(r => r.kind === 'password') || {}).inp;
+        if (emailInp && emailInp.value) payload.email = emailInp.value;
+        if (passInp && passInp.value) payload.password = passInp.value;   // server merges halves
 
         saveBtn.disabled = true;
-        show('', 'saving…');
+        show('', 'saving + verifying…');
         let r;
         try {
           r = await provFetch('/providers/' + provider.name + '/credentials', {
@@ -1596,10 +1725,9 @@ async function renderProviders() {
           });
         } catch (e) { r = { ok: false, code: 0, body: String(e) }; }
         saveBtn.disabled = false;
-        const body = r.body || {};
-        const ok2 = r.ok && body.saved !== false
-          && (!body.token_check || body.token_check === 'ok');
-        show(ok2 ? 'ok' : 'err', provResultText(r.ok, r.code, r.body));
+        const ok2 = r.ok && r.body && r.body.saved !== false
+          && (!r.body.token_check || r.body.token_check === 'ok');
+        show(ok2 ? 'ok' : 'err', provFriendly(r));
         if (r.ok) box.remove();
         await refreshKinds();
       };

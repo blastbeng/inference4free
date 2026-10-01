@@ -27,7 +27,7 @@ from .base import (
 
 def _bot_token_file() -> Path:
     """Bot-managed token written by dsk.refresher (login/signup renewal)."""
-    base = os.getenv('COOKIES_DIR') or os.getenv('DSF_SELFHEAL_DIR')
+    base = os.getenv('COOKIES_DIR') or os.getenv('I4F_SELFHEAL_DIR')
     directory = Path(base) if base else Path(__file__).resolve().parent.parent
     return directory / 'deepseek_token'
 
@@ -126,15 +126,15 @@ class DeepSeekProvider(Provider):
         The chat.deepseek.com web app has exactly three fixed modes (plain
         chat, thinking, search) — there is no model-list endpoint to scrape,
         so "dynamic" here means the exposed ids follow the operator's
-        DSF_MODEL_* configuration instead of being frozen in code. The web
+        I4F_MODEL_* configuration instead of being frozen in code. The web
         providers (Gemini, ChatGPT) discover their models live instead.
         """
-        thinking_id = os.getenv('DSF_MODEL_THINKER', 'deepseek-reasoner').strip()
-        fast_id = os.getenv('DSF_MODEL_FAST', 'deepseek-chat').strip()
-        search_id = os.getenv('DSF_MODEL_SEARCH', 'deepseek-search').strip()
-        context_length = int(os.getenv('DSF_CONTEXT_LENGTH', '131072'))
-        max_thinking = int(os.getenv('DSF_MAX_OUTPUT_THINKING', '65536'))
-        max_output = int(os.getenv('DSF_MAX_OUTPUT', '32768'))
+        thinking_id = os.getenv('I4F_MODEL_THINKER', 'deepseek-reasoner').strip()
+        fast_id = os.getenv('I4F_MODEL_FAST', 'deepseek-chat').strip()
+        search_id = os.getenv('I4F_MODEL_SEARCH', 'deepseek-search').strip()
+        context_length = int(os.getenv('I4F_CONTEXT_LENGTH', '131072'))
+        max_thinking = int(os.getenv('I4F_MAX_OUTPUT_THINKING', '65536'))
+        max_output = int(os.getenv('I4F_MAX_OUTPUT', '32768'))
 
         models: List[Dict[str, Any]] = []
         seen = set()

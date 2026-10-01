@@ -4,30 +4,30 @@ Builds a rotating proxy pool from three layers (all optional, all merged
 and deduplicated):
 
   1. Static env proxies
-       DSF_PROXY           single proxy URL, e.g. http://user:pass@host:8080
-       DSF_PROXIES         comma-separated list of proxy URLs
+       I4F_PROXY           single proxy URL, e.g. http://user:pass@host:8080
+       I4F_PROXIES         comma-separated list of proxy URLs
 
-  2. Automatic free-proxy sources (DSF_PROXY_AUTO=true)
+  2. Automatic free-proxy sources (I4F_PROXY_AUTO=true)
        Aggregates well-known public proxy lists over the web (TheSpeedX,
        monosans, proxifly, proxyscrape, roosterkid, geonode), refreshed
-       every DSF_PROXY_LIST_TTL seconds. DSF_PROXY_SOURCES overrides the
+       every I4F_PROXY_LIST_TTL seconds. I4F_PROXY_SOURCES overrides the
        built-in list (comma-separated; "socks5=<url>" or URLs whose path
        mentions socks5/socks4 get that scheme, otherwise http).
-       DSF_PROXY_MAX_POOL caps the pool (random sample, default 250) so
+       I4F_PROXY_MAX_POOL caps the pool (random sample, default 250) so
        health checking stays fast on small boards like a Raspberry Pi.
 
   3. Extra list URL(s)
-       DSF_PROXY_LIST_URL / DSF_PROXY_LIST_URLS  fetched with the same TTL.
+       I4F_PROXY_LIST_URL / I4F_PROXY_LIST_URLS  fetched with the same TTL.
 
-  DSF_PROXY_LIST_TTL   source refresh interval, seconds (default 1800)
-  DSF_PROXY_MODE       random (default) | round | single
-  DSF_PROXY_EXCLUDE    comma-separated providers that always go direct
-  DSF_PROXY_COOLDOWN   seconds a proxy is skipped after a runtime failure
-  DSF_PROXY_ROTATE_TTL seconds a provider keeps its assigned proxy before
+  I4F_PROXY_LIST_TTL   source refresh interval, seconds (default 1800)
+  I4F_PROXY_MODE       random (default) | round | single
+  I4F_PROXY_EXCLUDE    comma-separated providers that always go direct
+  I4F_PROXY_COOLDOWN   seconds a proxy is skipped after a runtime failure
+  I4F_PROXY_ROTATE_TTL seconds a provider keeps its assigned proxy before
                        it is re-randomized (default 300)
 
 NO-PROXY IS A FIRST-CLASS ROUTE: the direct (no-proxy) candidate is always
-part of the rotation set (DSF_PROXY_DIRECT, default true), so traffic keeps
+part of the rotation set (I4F_PROXY_DIRECT, default true), so traffic keeps
 flowing even when every pooled proxy is unhealthy or cooling down. When the
 health pass finds ZERO fast proxies the draw reduces to no-proxy alone.
 
@@ -35,14 +35,14 @@ Provider randomization: every provider (deepseek/gemini/chatgpt/...) gets
 its OWN proxy, picked randomly and preferably distinct from the proxies
 already assigned to other providers — concurrent providers are spread
 across different exit IPs instead of sharing one. Assignments are sticky
-for DSF_PROXY_ROTATE_TTL seconds, then rotate to a new random proxy, and
+for I4F_PROXY_ROTATE_TTL seconds, then rotate to a new random proxy, and
 are dropped immediately on runtime failure so the provider gets a fresh
 random proxy on the next request.
 
-Health checking (DSF_PROXY_CHECK=true): a background worker periodically
-probes every pooled proxy (concurrent, DSF_PROXY_CHECK_CONCURRENCY workers,
-DSF_PROXY_CHECK_TIMEOUT seconds each) against DSF_PROXY_CHECK_URL and only
-proxies that answer keep a "healthy" lease (DSF_PROXY_CHECK_TTL seconds).
+Health checking (I4F_PROXY_CHECK=true): a background worker periodically
+probes every pooled proxy (concurrent, I4F_PROXY_CHECK_CONCURRENCY workers,
+I4F_PROXY_CHECK_TIMEOUT seconds each) against I4F_PROXY_CHECK_URL and only
+proxies that answer keep a "healthy" lease (I4F_PROXY_CHECK_TTL seconds).
 get_proxy() prefers healthy proxies and never blocks: until the first pass
 completes (or if everything is cooling down) traffic simply goes direct.
 
@@ -56,7 +56,7 @@ when no proxy applies so traffic goes direct unchanged.
 
 SECURITY NOTE: free public proxies are untrusted. HTTPS targets are still
 end-to-end TLS (the proxy only sees the hostname), but treat the pool as
-opportunistic and keep DSF_PROXY_EXCLUDE for providers that misbehave.
+opportunistic and keep I4F_PROXY_EXCLUDE for providers that misbehave.
 """
 
 import json
@@ -176,8 +176,8 @@ def _fetch_direct(url: str, timeout: int = 15) -> str:
 
 
 def _custom_sources() -> List[Tuple[Optional[str], str]]:
-    """User-overridden sources: DSF_PROXY_SOURCES=scheme=url,url2,..."""
-    raw = os.getenv('DSF_PROXY_SOURCES', '').strip()
+    """User-overridden sources: I4F_PROXY_SOURCES=scheme=url,url2,..."""
+    raw = os.getenv('I4F_PROXY_SOURCES', '').strip()
     if not raw:
         return []
     sources: List[Tuple[Optional[str], str]] = []
@@ -198,8 +198,8 @@ def _custom_sources() -> List[Tuple[Optional[str], str]]:
 
 
 def _extra_list_urls() -> List[str]:
-    urls = [u.strip() for u in os.getenv('DSF_PROXY_LIST_URLS', '').split(',') if u.strip()]
-    single = os.getenv('DSF_PROXY_LIST_URL', '').strip()
+    urls = [u.strip() for u in os.getenv('I4F_PROXY_LIST_URLS', '').split(',') if u.strip()]
+    single = os.getenv('I4F_PROXY_LIST_URL', '').strip()
     if single:
         urls.append(single)
     return urls
@@ -225,30 +225,30 @@ _STATE = _State()
 
 
 def _list_ttl() -> float:
-    return max(60.0, float(os.getenv('DSF_PROXY_LIST_TTL', '1800') or 1800))
+    return max(60.0, float(os.getenv('I4F_PROXY_LIST_TTL', '1800') or 1800))
 
 
 def _check_ttl() -> float:
-    return max(60.0, float(os.getenv('DSF_PROXY_CHECK_TTL', '1800') or 1800))
+    return max(60.0, float(os.getenv('I4F_PROXY_CHECK_TTL', '1800') or 1800))
 
 
 def _check_enabled() -> bool:
-    return _env_bool('DSF_PROXY_CHECK')
+    return _env_bool('I4F_PROXY_CHECK')
 
 
 def _rotate_ttl() -> float:
     """How long a provider keeps its assigned proxy before re-randomizing."""
-    return max(1.0, float(os.getenv('DSF_PROXY_ROTATE_TTL', '300') or 300))
+    return max(1.0, float(os.getenv('I4F_PROXY_ROTATE_TTL', '300') or 300))
 
 
 def _static_proxies() -> List[str]:
     proxies: List[str] = []
-    single = os.getenv('DSF_PROXY', '').strip()
+    single = os.getenv('I4F_PROXY', '').strip()
     if single:
         p = _normalize(single)
         if p:
             proxies.append(p)
-    for entry in os.getenv('DSF_PROXIES', '').split(','):
+    for entry in os.getenv('I4F_PROXIES', '').split(','):
         p = _normalize(entry)
         if p:
             proxies.append(p)
@@ -257,7 +257,7 @@ def _static_proxies() -> List[str]:
 
 def _refresh_pool() -> None:
     """Aggregate every configured source into the (capped, shuffled) pool."""
-    if _env_bool('DSF_PROXY_AUTO'):
+    if _env_bool('I4F_PROXY_AUTO'):
         sources = _custom_sources() or BUILTIN_SOURCES
     else:
         sources = []
@@ -284,7 +284,7 @@ def _refresh_pool() -> None:
         seen.setdefault(key, p)
     pool = list(seen.values())
 
-    max_pool = int(os.getenv('DSF_PROXY_MAX_POOL', '250') or 250)
+    max_pool = int(os.getenv('I4F_PROXY_MAX_POOL', '250') or 250)
     if len(pool) > max_pool:
         pool = random.sample(pool, max_pool)
     random.shuffle(pool)
@@ -311,12 +311,12 @@ def _refresh_pool() -> None:
 
 def _max_latency_ms() -> float:
     """Fast-proxies-only budget: a proxy slower than this never gets traffic."""
-    return max(50.0, float(os.getenv('DSF_PROXY_MAX_LATENCY', '800') or 800))
+    return max(50.0, float(os.getenv('I4F_PROXY_MAX_LATENCY', '800') or 800))
 
 
 def _direct_rotation() -> bool:
     """Whether the no-proxy route is part of the rotation set (default on)."""
-    return _env_bool('DSF_PROXY_DIRECT', 'true')
+    return _env_bool('I4F_PROXY_DIRECT', 'true')
 
 
 def _probe(proxy: str, url: str, timeout: float) -> Tuple[str, bool, float]:
@@ -341,12 +341,12 @@ def _probe(proxy: str, url: str, timeout: float) -> Tuple[str, bool, float]:
 
 def _run_check_pass() -> None:
     """Validate the whole pool concurrently; only proxies that answer within
-    the latency budget (DSF_PROXY_MAX_LATENCY ms) get a healthy lease —
+    the latency budget (I4F_PROXY_MAX_LATENCY ms) get a healthy lease —
     fast proxies only, slow exits never receive traffic."""
-    url = os.getenv('DSF_PROXY_CHECK_URL',
+    url = os.getenv('I4F_PROXY_CHECK_URL',
                     'https://api.ipify.org?format=json').strip()
-    timeout = float(os.getenv('DSF_PROXY_CHECK_TIMEOUT', '4') or 4)
-    workers = max(1, int(os.getenv('DSF_PROXY_CHECK_CONCURRENCY', '24') or 24))
+    timeout = float(os.getenv('I4F_PROXY_CHECK_TIMEOUT', '4') or 4)
+    workers = max(1, int(os.getenv('I4F_PROXY_CHECK_CONCURRENCY', '24') or 24))
     with _STATE.lock:
         pool = list(_STATE.pool)
     if not pool:
@@ -392,7 +392,7 @@ def _controller_loop() -> None:
 
 
 def _ensure_controller() -> None:
-    dynamic = _env_bool('DSF_PROXY_AUTO') or _extra_list_urls()
+    dynamic = _env_bool('I4F_PROXY_AUTO') or _extra_list_urls()
     if dynamic and not _STATE.controller_started:
         _STATE.controller_started = True
         threading.Thread(target=_controller_loop, name="proxy-pool",
@@ -415,7 +415,7 @@ def all_proxies() -> List[str]:
 def _ensure_timeout() -> float:
     """Max seconds ensure_pool() waits for its warm-up health pass."""
     try:
-        return max(15.0, float(os.getenv('DSF_PROXY_ENSURE_TIMEOUT', '30')))
+        return max(15.0, float(os.getenv('I4F_PROXY_ENSURE_TIMEOUT', '30')))
     except ValueError:
         return 30.0
 
@@ -430,7 +430,7 @@ def ensure_pool() -> int:
     _ensure_controller()
     with _STATE.lock:
         empty = not _STATE.pool
-    if empty and (_env_bool('DSF_PROXY_AUTO') or _extra_list_urls()):
+    if empty and (_env_bool('I4F_PROXY_AUTO') or _extra_list_urls()):
         try:
             _refresh_pool()
         except Exception:  # noqa: BLE001 — direct remains the fallback
@@ -457,7 +457,7 @@ def get_proxy(provider: Optional[str] = None, direct_ok: bool = True) -> Optiona
 
     With a provider key the result is a per-provider sticky assignment:
     a randomly chosen route (distinct from other providers' when possible)
-    kept for DSF_PROXY_ROTATE_TTL seconds, so traffic is randomized across
+    kept for I4F_PROXY_ROTATE_TTL seconds, so traffic is randomized across
     different providers/exit IPs rather than one shared route.
 
     ``direct_ok=False`` (callers that REQUIRE a proxy, e.g. the signup
@@ -466,7 +466,7 @@ def get_proxy(provider: Optional[str] = None, direct_ok: bool = True) -> Optiona
     """
     _ensure_controller()
     key = provider.strip().lower() if provider and provider.strip() else None
-    exclude = {e.strip().lower() for e in os.getenv('DSF_PROXY_EXCLUDE', '').split(',') if e.strip()}
+    exclude = {e.strip().lower() for e in os.getenv('I4F_PROXY_EXCLUDE', '').split(',') if e.strip()}
     if key and key in exclude:
         return None
     pool = all_proxies()
@@ -492,7 +492,7 @@ def get_proxy(provider: Optional[str] = None, direct_ok: bool = True) -> Optiona
         # drop assignments that expired or whose route is no longer usable
         _STATE.assignments = {prov: pair for prov, pair in _STATE.assignments.items()
                               if pair[1] > now and pair[0] in alive}
-        mode = os.getenv('DSF_PROXY_MODE', 'random').strip().lower()
+        mode = os.getenv('I4F_PROXY_MODE', 'random').strip().lower()
         if key:
             assigned = _STATE.assignments.get(key)
             if assigned:
@@ -541,7 +541,7 @@ def mark_failure(proxy: Optional[str]) -> None:
     """Put a proxy on cooldown and release any provider assigned to it."""
     if not proxy or proxy == DIRECT:
         return
-    cooldown = float(os.getenv('DSF_PROXY_COOLDOWN', '120') or 120)
+    cooldown = float(os.getenv('I4F_PROXY_COOLDOWN', '120') or 120)
     now = time.time()
     with _STATE.lock:
         _STATE.cooldown[proxy] = now + cooldown
@@ -579,7 +579,7 @@ def _rank_fastest(candidates: List[str]) -> List[str]:
     """Rank `candidates` by observed latency and keep only the fastest ones.
 
     Orders by runtime EMA first, health-pass measurement second, and keeps
-    the top DSF_PROXY_TOP_K (default 5) so the fastest proxies get most of
+    the top I4F_PROXY_TOP_K (default 5) so the fastest proxies get most of
     the traffic without hammering a single exit.
     """
     if len(candidates) <= 1:
@@ -594,7 +594,7 @@ def _rank_fastest(candidates: List[str]) -> List[str]:
         return l if l is not None else cap
 
     try:
-        top_k = max(1, int(os.getenv('DSF_PROXY_TOP_K', '5') or 5))
+        top_k = max(1, int(os.getenv('I4F_PROXY_TOP_K', '5') or 5))
     except ValueError:
         top_k = 5
     return sorted(candidates, key=_eff)[:top_k]
@@ -651,9 +651,9 @@ def active_summary() -> str:
             parts.append('all-proxies-failed->direct')
     if _direct_rotation():
         parts.append("direct-rotation=on")
-    if _env_bool('DSF_PROXY_AUTO'):
+    if _env_bool('I4F_PROXY_AUTO'):
         parts.append("auto-sources=on")
-    mode = os.getenv('DSF_PROXY_MODE', 'random').strip().lower() or 'random'
+    mode = os.getenv('I4F_PROXY_MODE', 'random').strip().lower() or 'random'
     parts.append(f"mode={mode}")
     with _STATE.lock:
         assignments = {prov: pair[0] for prov, pair in _STATE.assignments.items()}
@@ -675,7 +675,7 @@ def _force_cycle() -> None:
 
 if __name__ == '__main__':  # quick manual check: python -m dsk.proxies
     import sys
-    if _env_bool('DSF_PROXY_AUTO') or _extra_list_urls():
+    if _env_bool('I4F_PROXY_AUTO') or _extra_list_urls():
         print(f"refreshing pool ({active_summary()}) ...")
         _force_cycle()
     print(f"config: {active_summary()}")

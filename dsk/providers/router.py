@@ -5,7 +5,7 @@ DYNAMICALLY discovered from each provider's web session — no model lists are
 hardcoded anywhere:
 
     deepseek  the web app has three fixed chat modes (plain/think/search); the
-              exposed ids follow the operator's DSF_MODEL_* configuration
+              exposed ids follow the operator's I4F_MODEL_* configuration
     gemini    discovered live from the gemini.google.com web app (batchexecute
               user-status RPC) using browser cookies
     chatgpt   discovered live from chatgpt.com/backend-api/models using the
@@ -19,15 +19,19 @@ and then falls back down the chain, so a single OpenAI request is always served
 by the best available backend.
 
 Configuration (env):
-    DSF_MODEL_THINKER      exposed id of the DeepSeek thinking mode
+    I4F_MODEL_THINKER      exposed id of the DeepSeek thinking mode
                            (default deepseek-reasoner)
-    DSF_MODEL_FAST         exposed id of the DeepSeek fast mode (default deepseek-chat)
-    DSF_MODEL_SEARCH       exposed id of the DeepSeek search mode (default deepseek-search)
-    DSF_MODELS_TTL         seconds between model re-discoveries (default 300)
-    DSF_MAX_RETRIES        retries per provider before falling back (default 2)
-    DSF_RETRY_BACKOFF      base backoff seconds, doubled each retry (default 2.0)
-    DSF_FALLBACKS          JSON object {model_id: [fallback_id, ...]}
-    DSF_DEFAULT_FALLBACKS  comma list applied to routes without explicit fallbacks
+    I4F_MODEL_FAST         exposed id of the DeepSeek fast mode (default deepseek-chat)
+    I4F_MODEL_SEARCH       exposed id of the DeepSeek search mode (default deepseek-search)
+    I4F_MODELS_TTL         seconds between model re-discoveries (default 300)
+    I4F_MAX_RETRIES        retries per provider before falling back (default 2)
+    I4F_RETRY_BACKOFF      base backoff seconds, doubled each retry (default 2.0)
+    I4F_FALLBACKS          JSON object {model_id: [fallback_id, ...]}
+    I4F_DEFAULT_FALLBACKS  comma list applied to routes without explicit fallbacks
+    I4F_AUTO_DEMOTE_S      seconds a provider stays out of the auto chain front
+                           after a real request failure (default 300, 0 disables)
+    I4F_AUTO_PROVE_S       seconds a provider that just served counts as healthy
+                           even when its credential probe disagrees (default 900)
 
 The synthetic ``auto`` model is the smart router: every request is classified
 (coding / general / translation / summarize / vision / image generation) and
@@ -45,7 +49,7 @@ import queue
 import re
 import threading
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Set
 
 from .base import (
     Route,
@@ -81,7 +85,7 @@ PROVIDER_MODULES = (
 )
 
 OWNED_BY = {
-    'deepseek': 'deepseek4free',
+    'deepseek': 'inference4free',
     'gemini': 'google',
     'chatgpt': 'openai',
     'claude': 'anthropic',
@@ -139,22 +143,38 @@ def provider_auto_id(provider_name: str) -> str:
     prefix = PUBLIC_PREFIX.get(provider_name)
     return f'{prefix}/auto' if prefix else f'{provider_name}/auto'
 
-MAX_RETRIES = int(os.getenv('DSF_MAX_RETRIES', '2'))
-RETRY_BACKOFF = float(os.getenv('DSF_RETRY_BACKOFF', '2.0'))
+MAX_RETRIES = int(os.getenv('I4F_MAX_RETRIES', '2'))
+RETRY_BACKOFF = float(os.getenv('I4F_RETRY_BACKOFF', '2.0'))
 # Cap for a single retry wait (honored Retry-After included): a request must
 # never stall tens of seconds on one backoff — better to fall back quickly.
-RETRY_CAP = max(1.0, float(os.getenv('DSF_RETRY_CAP', '10') or 10))
-MODELS_TTL = float(os.getenv('DSF_MODELS_TTL', '300'))
+RETRY_CAP = max(1.0, float(os.getenv('I4F_RETRY_CAP', '10') or 10))
+MODELS_TTL = float(os.getenv('I4F_MODELS_TTL', '300'))
 # Deadline for the FIRST stream chunk (seconds). A provider that connects but
 # yields nothing within this window (hung proxy, busy upstream, stuck session)
 # is treated as unavailable so the router retries/falls back instead of
 # blocking until the full stream timeout. 0 disables. Default covers the
 # cold-start of browser-backed providers (z.ai).
-FIRST_TOKEN_TIMEOUT = max(0.0, float(os.getenv('DSF_FIRST_TOKEN_TIMEOUT', '180') or 180))
+FIRST_TOKEN_TIMEOUT = max(0.0, float(os.getenv('I4F_FIRST_TOKEN_TIMEOUT', '180') or 180))
 # After a first-token stall the target is skipped for this many seconds so a
 # fallback chain never pays the full deadline once per stalled model.
 PROVIDER_STALL_COOLDOWN = max(0.0,
-                              float(os.getenv('DSF_PROVIDER_STALL_COOLDOWN', '120') or 120))
+                              float(os.getenv('I4F_PROVIDER_STALL_COOLDOWN', '120') or 120))
+# Runtime health for the auto routers.
+#
+# ``provider.available()`` only proves credentials EXIST — it cannot tell an
+# expired session, a geo-blocked anonymous identity or an auth-walled account
+# from a working one. A chain built from that signal alone therefore leads with
+# the same broken providers on every request, every request walks through them
+# and lands on the one provider that actually answers — which reads to the user
+# as "auto only uses z.ai GLM models". Real request outcomes are the missing
+# signal: a provider that just failed a request (bad credentials, wall, outage)
+# is demoted to the back of the auto chain for AUTO_DEMOTE_S seconds, and a
+# provider that just SERVED counts as available even when its credential probe
+# disagrees (some providers keep working from a token file their available()
+# does not see). Demoted targets stay at the very back, so they are still
+# probed and recover on their own once the renewal bot fixes them.
+AUTO_DEMOTE_S = max(0.0, float(os.getenv('I4F_AUTO_DEMOTE_S', '300') or 300))
+AUTO_PROVE_S = max(0.0, float(os.getenv('I4F_AUTO_PROVE_S', '900') or 900))
 
 
 def _first_chunk(gen, timeout: float) -> Optional[Dict[str, Any]]:
@@ -199,14 +219,14 @@ def _csv_env(name: str, default: str) -> List[str]:
 
 
 def _parse_fallbacks() -> Dict[str, List[str]]:
-    """Parse DSF_FALLBACKS JSON ({model_id: [fallback, ...]})."""
-    raw = (os.getenv('DSF_FALLBACKS', '') or '').strip()
+    """Parse I4F_FALLBACKS JSON ({model_id: [fallback, ...]})."""
+    raw = (os.getenv('I4F_FALLBACKS', '') or '').strip()
     if not raw:
         return {}
     try:
         data = json.loads(raw)
     except ValueError:
-        logger.warning('DSF_FALLBACKS is not valid JSON, ignoring: %.100s', raw)
+        logger.warning('I4F_FALLBACKS is not valid JSON, ignoring: %.100s', raw)
         return {}
     out: Dict[str, List[str]] = {}
     if isinstance(data, dict):
@@ -311,6 +331,14 @@ class Router:
         # of always serving the same first model (e.g. glm-4.7 on every call).
         self._rr: Dict[str, int] = {}
         self._rr_lock = threading.Lock()
+        # Runtime health for the auto chains (see AUTO_DEMOTE_S / AUTO_PROVE_S).
+        # provider -> epoch until which it is demoted out of the healthy front
+        # after a real request failure (auth wall, outage, stall).
+        self._rt_fail: Dict[str, float] = {}
+        # provider -> epoch of its last successful first token: a provider that
+        # just served is healthy even when its credential probe disagrees.
+        self._rt_ok: Dict[str, float] = {}
+        self._rt_lock = threading.Lock()
         self._lock = threading.Lock()
         # Serializes whole discovery runs; request paths must never wait on
         # a slow provider's list_models (HF cold discovery takes minutes),
@@ -388,21 +416,54 @@ class Router:
                          name='model-refresh', daemon=True).start()
         return True
 
+    def _reserved_ids(self) -> Set[str]:
+        """Model ids owned by the router itself.
+
+        The global ``auto`` smart router and every ``<prefix>/auto``
+        provider-scoped router are synthetic routes, not upstream models. An
+        upstream catalog that happens to expose a model literally named
+        ``auto`` (chatgpt's /backend-api/models does exactly that) must never
+        take one of these ids over: writing it into ``routes`` silently
+        replaces the smart router with that single upstream model, so every
+        ``model: "auto"`` request stops being routed at all.
+        """
+        reserved = {AUTO_MODEL_ID}
+        reserved.update(provider_auto_id(name) for name in self.providers)
+        return reserved
+
     def _apply_provider_models(self, name: str,
                                models: List[Dict[str, Any]]) -> bool:
         """Replace one provider's routes with its discovered models."""
         changed = False
         wanted = set()
         aliases: Dict[str, str] = {}
+        reserved = self._reserved_ids()
         for entry in models:
             model_id = str(entry.get('id') or '').strip()
             if not model_id:
                 continue
+            upstream = str(entry.get('upstream_model') or model_id)
+            # Never let a discovered model take a router-owned id. Keep it
+            # reachable under a namespaced id instead of dropping it (the
+            # provider is still asked for the ORIGINAL upstream model).
+            if model_id in reserved or public_model_id(name, model_id) in reserved:
+                namespaced = f'{name}-{model_id}'
+                owner = self.routes.get(namespaced)
+                if namespaced in reserved or (owner is not None
+                                              and owner.provider_name != name):
+                    logger.info('%s: discovered model %r skipped — its id '
+                                'belongs to the smart router', name, model_id)
+                    continue
+                if owner is None:
+                    logger.info('%s: discovered model %r registered as %r — the '
+                                'bare id belongs to the smart router',
+                                name, model_id, namespaced)
+                model_id = namespaced
             wanted.add(model_id)
             route = Route(
                 model_id=model_id,
                 provider_name=name,
-                upstream_model=str(entry.get('upstream_model') or model_id),
+                upstream_model=upstream,
                 thinking_enabled=bool(entry.get('thinking_enabled')),
                 search_enabled=bool(entry.get('search_enabled')),
                 vision=bool(entry.get('vision')),
@@ -435,7 +496,7 @@ class Router:
         yet.
         """
         explicit = _parse_fallbacks()
-        default_chain = _csv_env('DSF_DEFAULT_FALLBACKS', '')
+        default_chain = _csv_env('I4F_DEFAULT_FALLBACKS', '')
         for model_id, route in self.routes.items():
             if route.provider_name == 'router':
                 continue  # auto routers: dynamic chain, rebuilt per request
@@ -447,9 +508,15 @@ class Router:
 
     # ----------------------------------------------------------- auto routing
     def _auto_route(self) -> Route:
-        """Return (registering on first use) the synthetic 'auto' route."""
+        """Return (registering on first use) the synthetic 'auto' route.
+
+        Ownership is re-asserted, not just checked for absence: if a provider
+        ever leaves a route of its own under the reserved id (an older registry,
+        a hand-written ``register()`` call), the smart router takes it back
+        instead of silently deferring to it forever.
+        """
         route = self.routes.get(AUTO_MODEL_ID)
-        if route is None:
+        if route is None or route.provider_name != 'router':
             route = Route(
                 model_id=AUTO_MODEL_ID,
                 provider_name='router',
@@ -498,9 +565,13 @@ class Router:
         loop still probes every target and falls back on auth/rate/offline
         errors. Vision/image-gen requests are restricted to capable targets;
         explicit thinking/search requests to routes supporting the mode.
-        The healthy front of the chain is round-robin rotated per request:
-        successive calls cycle through every healthy target instead of
-        always starting at the same one.
+        The healthy front is round-robin rotated per request, at the
+        PROVIDER level: the group order is cycled so every provider gets its
+        turn at the head of the chain (a many-model provider such as z.ai GLM
+        must not lead every call), and within each provider its own models are
+        rotated too so consecutive calls from the same provider land on
+        different models. Unhealthy (credential-less) targets stay at the very
+        back so the stream loop still probes them.
         """
         ordered: List[str] = []
 
@@ -533,11 +604,29 @@ class Router:
         # renewal bot runs continuously).
         healthy = [mid for mid, ok in flags if ok]
         unhealthy = [mid for mid, ok in flags if not ok]
-        # Round-robin the healthy front: every request starts at the next
-        # healthy target, spreading load across providers instead of
-        # pinning each call to the first one.
-        offset = self._rr_next(f'auto:{category}', len(healthy))
-        chain = healthy[offset:] + healthy[:offset] + unhealthy
+        # Round-robin the healthy front by PROVIDER, not by individual model.
+        #
+        # A single provider often exposes far more models than the others
+        # (e.g. z.ai GLM lists a dozen models and sits early in every category
+        # preference), so rotating the flat model list just cycled through one
+        # provider's models in a row — the first ~N calls always led with GLM,
+        # which was reported as "auto only uses z.ai GLM models". Grouping the
+        # healthy targets by provider and rotating the group order gives every
+        # provider its turn at the head of the chain; each provider's own model
+        # list is still rotated so successive calls from the same provider land
+        # on different models of that provider.
+        prov_order = list(dict.fromkeys(self.routes[mid].provider_name
+                                        for mid in healthy))
+        prov_off = self._rr_next(f'auto:{category}', len(prov_order))
+        prov_order = prov_order[prov_off:] + prov_order[:prov_off]
+        chain: List[str] = []
+        for provider in prov_order:
+            p_models = [mid for mid in healthy
+                        if self.routes[mid].provider_name == provider]
+            m_off = self._rr_next(f'auto:{category}:{provider}',
+                                  len(p_models))
+            chain.extend(p_models[m_off:] + p_models[:m_off])
+        chain.extend(unhealthy)
         if category in ('vision', 'image_gen'):
             cap = 'image_gen' if category == 'image_gen' else 'vision'
             capable = [mid for mid in chain if getattr(self.routes[mid], cap)]
@@ -548,15 +637,75 @@ class Router:
                 and self.routes[mid].provider_name != 'router']
 
     def _healthy_model(self, model_id: str) -> bool:
-        """Live credential/health probe for one route target."""
+        """Live health for one route target: credential state PLUS outcomes.
+
+        ``available()`` only proves credentials EXIST — it cannot tell an
+        expired session, a geo-blocked anonymous identity or an auth-walled
+        account from a working one. A chain built from that signal alone leads
+        with the same broken providers on every request, every request walks
+        through them and lands on the one provider that actually answers, which
+        is exactly what "auto only uses z.ai GLM models" looked like. So the
+        signal is completed with real request outcomes: a provider that just
+        failed is demoted out of the healthy front, and one that just served
+        counts as healthy even when its credential probe disagrees.
+        """
         route = self.routes.get(model_id)
         provider = self.providers.get(route.provider_name) if route else None
         if provider is None:
             return False
-        try:
-            return bool(provider.available())
-        except Exception:  # noqa: BLE001 — a broken probe means unproven
+        name = route.provider_name
+        if self._demoted(name):
             return False
+        try:
+            ok = bool(provider.available())
+        except Exception:  # noqa: BLE001 — a broken probe means unproven
+            ok = False
+        return ok or self._proven(name)
+
+    def _mark_served(self, provider_name: str) -> None:
+        """A provider produced a first token: it is proven working."""
+        if AUTO_PROVE_S <= 0:
+            return
+        with self._rt_lock:
+            self._rt_ok[provider_name] = time.time()
+
+    def _mark_failed(self, provider_name: str, reason: str = '') -> None:
+        """A provider failed a request: demote it out of the healthy front.
+
+        Only the auto chains are affected, and only for AUTO_DEMOTE_S seconds:
+        the demoted targets stay at the very back of the chain, so they are
+        still probed and climb back on their own as soon as the renewal bot
+        fixes their credentials (or the demotion simply expires).
+        """
+        if AUTO_DEMOTE_S <= 0:
+            return
+        fresh = False
+        with self._rt_lock:
+            if self._rt_fail.get(provider_name, 0.0) <= time.time():
+                fresh = True
+            self._rt_fail[provider_name] = time.time() + AUTO_DEMOTE_S
+        if fresh:
+            logger.info('%s demoted out of the auto chain front for %.0fs (%s)',
+                        provider_name, AUTO_DEMOTE_S, reason or 'request failure')
+
+    def _demoted(self, provider_name: str) -> bool:
+        """True while a recent failure keeps this provider out of the front."""
+        now = time.time()
+        with self._rt_lock:
+            until = self._rt_fail.get(provider_name, 0.0)
+            if until > now:
+                return True
+            if until:
+                del self._rt_fail[provider_name]  # expired: forget it
+            return False
+
+    def _proven(self, provider_name: str) -> bool:
+        """True when this provider served a request very recently."""
+        if AUTO_PROVE_S <= 0:
+            return False
+        with self._rt_lock:
+            since = self._rt_ok.get(provider_name, 0.0)
+        return bool(since) and (time.time() - since) < AUTO_PROVE_S
 
     def _provider_chain(self, provider_name: str,
                         thinking_override: Optional[bool] = None,
@@ -664,7 +813,7 @@ class Router:
         route = self.routes.get(model_id) or self._resolve_alias(model_id)
         if route is not None:
             return route
-        fast_id = os.getenv('DSF_MODEL_FAST', 'deepseek-chat').strip()
+        fast_id = os.getenv('I4F_MODEL_FAST', 'deepseek-chat').strip()
         return self.routes.get(fast_id) or next(iter(self.routes.values()))
 
     def _resolve_alias(self, model_id: str) -> Optional[Route]:
@@ -704,7 +853,7 @@ class Router:
                 'id': auto.model_id,
                 'object': 'model',
                 'created': 1700000000,
-                'owned_by': 'deepseek4free',
+                'owned_by': 'inference4free',
                 'context_length': 131072,
                 'max_model_len': 131072,
                 'max_completion_tokens': 32768,
@@ -839,7 +988,7 @@ class Router:
         for position, model_id in enumerate(chain):
             target = self.routes.get(model_id)
             # Router-owned synthetic targets can only enter a chain via a
-            # hand-written DSF_FALLBACKS entry — they must never be served
+            # hand-written I4F_FALLBACKS entry — they must never be served
             # directly (their provider is the router itself).
             if target is None or target.provider_name == 'router':
                 continue
@@ -879,6 +1028,7 @@ class Router:
                                 self._stall_until.pop(stall_key, None)
                             except Exception:  # noqa: BLE001 — bookkeeping
                                 pass
+                            self._mark_served(target.provider_name)
                             if isinstance(first, dict):
                                 first.setdefault('served_by', served_by)
                             yield first
@@ -889,6 +1039,7 @@ class Router:
                                 self._stall_until.pop(stall_key, None)
                             except Exception:  # noqa: BLE001 — bookkeeping
                                 pass
+                            self._mark_served(target.provider_name)
                         if isinstance(chunk, dict):
                             chunk.setdefault('served_by', served_by)
                         yield chunk
@@ -897,6 +1048,10 @@ class Router:
                     last_error = e
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
+                    # Deliberately NOT demoted: a quota hit means "busy now", not
+                    # "broken", and the retry ladder plus the round-robin chain
+                    # already spread the load. Demoting here would starve the
+                    # providers that are actually healthy.
                     if attempt <= MAX_RETRIES:
                         wait = min(e.retry_after if e.retry_after
                                    else RETRY_BACKOFF * (2 ** (attempt - 1)), RETRY_CAP)
@@ -920,6 +1075,7 @@ class Router:
                                                         + PROVIDER_STALL_COOLDOWN)
                     except Exception:  # noqa: BLE001 — bookkeeping only
                         pass
+                    self._mark_failed(target.provider_name, 'first-token stall')
                     logger.warning('%s stalled without first token, skipping '
                                    'to fallback: %s', served_by, e)
                     break
@@ -935,6 +1091,7 @@ class Router:
                         continue
                     logger.warning('%s unavailable after %d attempts: %s',
                                    served_by, attempt - 1, e)
+                    self._mark_failed(target.provider_name, 'unreachable')
                     break
                 except ProviderAuthError as e:
                     # Credentials rejected/missing: retrying cannot help.
@@ -942,6 +1099,11 @@ class Router:
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
                     logger.warning('%s auth failed, skipping to fallback: %s', served_by, e)
+                    # Credentials are provider-wide, so the whole provider is
+                    # demoted: without this every auto request re-probes the
+                    # same auth-walled provider from the front of the chain and
+                    # ends up served by whichever provider happens to work.
+                    self._mark_failed(target.provider_name, 'auth wall')
                     # Request-path remediation: fire a background renewal
                     # ladder so the NEXT request can use fresh credentials.
                     try:
@@ -955,6 +1117,7 @@ class Router:
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
                     logger.warning('%s failed, skipping to fallback: %s', served_by, e)
+                    self._mark_failed(target.provider_name, str(e)[:80])
                     break
                 except Exception as e:  # noqa: BLE001 — unclassified provider
                     # crash (upstream format change, provider bug): keep the
@@ -965,6 +1128,8 @@ class Router:
                     last_error = ProviderError(f'{type(e).__name__}: {e}')
                     logger.warning('%s crashed, skipping to fallback: %s',
                                    served_by, e)
+                    self._mark_failed(target.provider_name,
+                                      f'{type(e).__name__}')
                     break
 
             if position < len(chain) - 1:

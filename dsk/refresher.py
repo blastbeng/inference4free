@@ -12,7 +12,7 @@ strategies is, from cheapest to most invasive:
        deepseek  nothing to rotate over HTTP (the userToken only changes on
                  login) — verified with a live probe instead
 
-  2. Headless-browser re-login (default ON: DSF_REFRESHER_LOGIN=true, set
+  2. Headless-browser re-login (default ON: I4F_REFRESHER_LOGIN=true, set
      false to disable). Uses the same DrissionPage/Chromium stack as
      the Cloudflare bypass; exports the fresh cookies/token automatically.
        DEEPSEEK_LOGIN_EMAIL / DEEPSEEK_LOGIN_PASSWORD
@@ -20,17 +20,17 @@ strategies is, from cheapest to most invasive:
        GEMINI_LOGIN_EMAIL   / GEMINI_LOGIN_PASSWORD   (Google anti-bot: best
                                                         effort only)
      Email verification codes (OTP) during login are fetched from an IMAP
-     mailbox (see DSF_MAIL_* below), so the loop stays unmanned.
+     mailbox (see I4F_MAIL_* below), so the loop stays unmanned.
 
   3. Account auto-signup (default ON for ALL providers:
-     DSF_REFRESHER_AUTOSIGNUP). Creates a fresh free account when even the
+     I4F_REFRESHER_AUTOSIGNUP). Creates a fresh free account when even the
      login session is dead — and BOOTSTRAPS providers that have no
      credentials at all (the refresher daemon signs every missing provider
      up on its first cycle, so a fresh install comes up unattended). The
      e-mail address is AUTO-GENERATED (dsk/mailgen.py): a catch-all IMAP
-     domain (DSF_MAIL_DOMAIN) when available, else a mail.tm throwaway
+     domain (I4F_MAIL_DOMAIN) when available, else a mail.tm throwaway
      account — the verification code is read from that mailbox
-     automatically. Disable the auto-generation with DSF_MAIL_AUTOGEN=false.
+     automatically. Disable the auto-generation with I4F_MAIL_AUTOGEN=false.
      Created accounts are persisted to data/accounts.json so later renewal
      cycles can re-login with them. Google/OpenAI may still throw captcha
      or phone walls at automation — those rungs are best effort and their
@@ -38,22 +38,22 @@ strategies is, from cheapest to most invasive:
 
 Renewals are triggered two ways: the self-healing daemon calls ``renew``
 whenever a provider probe classifies as ``auth``, and the refresher daemon
-proactively rotates cookies every DSF_REFRESHER_TTL seconds. Every action is
+proactively rotates cookies every I4F_REFRESHER_TTL seconds. Every action is
 logged to data/refresher/history.jsonl; all ladders respect per-provider
-cooldowns and daily attempt caps, and DSF_REFRESHER=false disables everything.
+cooldowns and daily attempt caps, and I4F_REFRESHER=false disables everything.
 
 Bot-managed credential files take precedence over env vars (documented in
 README): data/deepseek_token, data/gemini_cookies.json, data/chatgpt_cookies.json.
 Delete the file to hand control back to the environment.
 
 Mail config (for OTP during browser flows):
-    DSF_MAIL_AUTOGEN       auto-create throwaway mailboxes (default true)
-    DSF_MAIL_DOMAIN        catch-all domain for autogen (optional; without
+    I4F_MAIL_AUTOGEN       auto-create throwaway mailboxes (default true)
+    I4F_MAIL_DOMAIN        catch-all domain for autogen (optional; without
                            it mail.tm public temp-mail is used)
-    DSF_MAIL_IMAP_HOST / _PORT (993) / _USER / _PASS
-    DSF_MAIL_OTP_SENDER    substring matched against the sender (default deepseek)
-    DSF_MAIL_OTP_REGEX     code regex (default \\\\b(\\\\d{6})\\\\b)
-    DSF_MAIL_OTP_MAX_AGE   ignore older mail, minutes (default 30)
+    I4F_MAIL_IMAP_HOST / _PORT (993) / _USER / _PASS
+    I4F_MAIL_OTP_SENDER    substring matched against the sender (default deepseek)
+    I4F_MAIL_OTP_REGEX     code regex (default \\\\b(\\\\d{6})\\\\b)
+    I4F_MAIL_OTP_MAX_AGE   ignore older mail, minutes (default 30)
 
 CLI:
     python -m dsk.refresher status
@@ -92,7 +92,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _data_dir() -> Path:
-    base = (os.getenv('COOKIES_DIR') or os.getenv('DSF_SELFHEAL_DIR')
+    base = (os.getenv('COOKIES_DIR') or os.getenv('I4F_SELFHEAL_DIR')
             or str(_BASE.parent / 'data'))
     path = Path(base)
     path.mkdir(parents=True, exist_ok=True)
@@ -100,15 +100,15 @@ def _data_dir() -> Path:
 
 
 def _ttl() -> float:
-    return max(300.0, float(os.getenv('DSF_REFRESHER_TTL', '21600') or 21600))
+    return max(300.0, float(os.getenv('I4F_REFRESHER_TTL', '21600') or 21600))
 
 
 def _cooldown() -> float:
-    return max(60.0, float(os.getenv('DSF_REFRESHER_COOLDOWN', '1800') or 1800))
+    return max(60.0, float(os.getenv('I4F_REFRESHER_COOLDOWN', '1800') or 1800))
 
 
 def _max_renews() -> int:
-    return max(1, int(os.getenv('DSF_REFRESHER_MAX_RENEWS', '6') or 6))
+    return max(1, int(os.getenv('I4F_REFRESHER_MAX_RENEWS', '6') or 6))
 
 
 def _jar_path(name: str) -> Path:
@@ -233,6 +233,27 @@ def _load_jar(name: str) -> Dict[str, str]:
         jar.setdefault('__Secure-1PSIDTS',
                        (os.getenv('GEMINI_1PSIDTS', '') or
                         os.getenv('GEMINI_COOKIES_1PSIDTS', '')).strip())
+    elif name == 'chatgpt':
+        # Merge env credentials so the refresh rung, _has_creds and the
+        # live verifiers all read ONE source (jar + env). The env bearer
+        # is surfaced under the same key the provider reads from the jar.
+        jar.setdefault('accessToken', (os.getenv('CHATGPT_ACCESS_TOKEN', '')
+                                      or os.getenv('CHATGPT_SESSION_TOKEN', ''))
+                       .strip())
+        raw = (os.getenv('CHATGPT_SESSION_COOKIES', '') or '').strip()
+        if raw:
+            try:
+                data = json.loads(raw)
+                entries = data if isinstance(data, list) else \
+                    list(data.items()) if isinstance(data, dict) else []
+                for e in entries:
+                    if isinstance(e, dict) and e.get('name'):
+                        jar.setdefault(str(e.get('name')),
+                                       str(e.get('value')))
+                    elif isinstance(e, (list, tuple)) and len(e) == 2:
+                        jar.setdefault(str(e[0]), str(e[1]))
+            except (ValueError, AttributeError, TypeError):
+                pass  # env JSON malformed — the provider reports it
     else:
         # Token providers keep their primary credential in one env var; merge
         # it so _has_creds and the live verifiers below agree on one source.
@@ -244,6 +265,35 @@ def _load_jar(name: str) -> Dict[str, str]:
         if primary:
             jar.setdefault(primary[0], (os.getenv(primary[1], '') or '').strip())
     return {k: v for k, v in jar.items() if k and v and k != 'cookies'}
+
+
+def _chatgpt_restore_token(jar: Dict[str, str], pre_token: str) -> None:
+    """An incomplete login must not strand a working bearer.
+
+    The login-in-progress page of chatgpt.com also sets a FRESH
+    ``accessToken`` — a login-stage bearer that authenticates the model
+    list but 403s on conversation endpoints. When the login did not
+    complete, restore the previous token (or drop the login-stage one if
+    there was none) so the next rung starts from known state."""
+    new_token = jar.get('accessToken', '')
+    if pre_token and new_token != pre_token:
+        _save_jar('chatgpt', {'accessToken': pre_token})
+    elif not pre_token and new_token:
+        _remove_jar_key('chatgpt', 'accessToken')
+
+
+def _remove_jar_key(name: str, key: str) -> None:
+    """Drop one key from the jar file (same lock/atomicity as _save_jar)."""
+    path = _jar_path(name)
+    with _file_lock(path):
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return
+        if isinstance(data, dict) and data.pop(key, None) is not None:
+            tmp = path.with_suffix('.new')
+            tmp.write_text(json.dumps(data, indent=2), encoding='utf-8')
+            os.replace(tmp, path)
 
 
 def _save_jar(name: str, updates: Dict[str, str]) -> None:
@@ -326,7 +376,11 @@ def _has_creds(name: str) -> bool:
             return True
         if os.getenv('CHATGPT_SESSION_COOKIES', '').strip():
             return True
-        return bool(_load_jar('chatgpt'))
+        # a jar full of CloudFront/oai-did cookies is NOT a session: the
+        # provider needs the next-auth session cookie or a usable bearer
+        jar = _load_jar('chatgpt')
+        return bool(jar.get('__Secure-next-auth.session-token')
+                   or jar.get('accessToken'))
     if name in ('claude', 'grok', 'qwen', 'kimi'):
         env_key = {'claude': 'CLAUDE_SESSION_KEY', 'grok': 'GROK_SSO',
                    'qwen': 'QWEN_TOKEN', 'kimi': 'KIMI_TOKEN'}[name]
@@ -346,7 +400,10 @@ def _has_creds(name: str) -> bool:
         if os.getenv('MISTRAL_SESSION_TOKEN', '').strip():
             return True
         return bool((_load_jar('mistral') or {}).get('session_token'))
-    return bool(_load_jar('gemini'))          # jar already merges env 1PSID
+    # gemini: a real session means a __Secure-1PSID cookie (env already
+    # merged into the jar by _load_jar). Other google.com cookies alone
+    # are not a usable session.
+    return bool(_load_jar('gemini').get('__Secure-1PSID'))
 
 
 _ACCOUNTS_FILE = 'accounts.json'
@@ -416,10 +473,14 @@ _UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
 
 
 # ------------------------------------------------------- HTTP refresh layer
-def _http_get(url: str, cookies: Dict[str, str], timeout: int = 30):
+def _http_get(url: str, cookies: Dict[str, str], timeout: int = 30,
+              headers: Optional[Dict[str, str]] = None):
     import requests
+    all_headers = {'User-Agent': _UA}
+    if headers:
+        all_headers.update(headers)
     return requests.get(url, cookies=cookies,
-                        headers={'User-Agent': _UA}, timeout=timeout,
+                        headers=all_headers, timeout=timeout,
                         allow_redirects=True, **_proxies_kwargs(url))
 
 
@@ -429,8 +490,16 @@ def refresh_gemini() -> Tuple[bool, str]:
         return False, 'no gemini credentials (jar/env)'
     resp = _http_get('https://gemini.google.com/app', jar)
     if resp.status_code in (401, 403) or 'accounts.google.com' in str(resp.url):
-        _save_jar('gemini', dict(resp.cookies))
         return False, 'session rejected (cookies expired) - re-login needed'
+    if resp.status_code != 200:
+        return False, f'HTTP {resp.status_code}'
+    # The /app shell is served even to logged-out visitors — only the
+    # presence of the XSRF token (SNlM0e) proves the cookies authenticate.
+    # Without this check an expired session reads as "valid" forever and
+    # the ladder never escalates past this rung.
+    if '"SNlM0e"' not in resp.text:
+        return False, ('no SNlM0e token on /app (cookies expired) '
+                       '- re-login needed')
     rotated = {k: v for k, v in dict(resp.cookies).items()
                if k in ('__Secure-1PSID', '__Secure-1PSIDTS') and v}
     if rotated:
@@ -441,22 +510,50 @@ def refresh_gemini() -> Tuple[bool, str]:
 
 def refresh_chatgpt() -> Tuple[bool, str]:
     jar = _load_jar('chatgpt')
-    if not jar:
+    session_cookie = (jar.get('__Secure-next-auth.session-token') or '').strip()
+    token = (jar.get('accessToken') or '').strip()
+    if not session_cookie and not token:
         return False, 'no chatgpt credentials (jar/env)'
+    if not session_cookie:
+        # A pasted bearer cannot be rotated over HTTP — the session endpoint
+        # only issues tokens FOR session cookies. Validate it live instead:
+        # reporting "ok" on an unchecked bearer made the ladder declare the
+        # provider renewed while every generation 403'd downstream.
+        check_cookies = {k: v for k, v in jar.items() if k != 'accessToken'}
+        try:
+            resp = _http_get('https://chatgpt.com/backend-api/me',
+                             check_cookies,
+                             headers={'Authorization': f'Bearer {token}'})
+        except Exception as e:  # noqa: BLE001 — network issue is not auth
+            return False, f'bearer check unreachable: {type(e).__name__}'
+        if resp.status_code == 200:
+            return True, 'bearer valid (backend-api/me 200)'
+        return False, (f'bearer rejected (HTTP {resp.status_code}) and no '
+                       'session cookie to rotate — re-login required')
     resp = _http_get('https://chatgpt.com/api/auth/session', jar)
-    new_cookies = {k: v for k, v in dict(resp.cookies).items() if v}
-    if new_cookies:
-        _save_jar('chatgpt', new_cookies)
     if resp.status_code in (401, 403):
         return False, 'session cookies rejected - re-login needed'
-    if resp.status_code == 200:
-        try:
-            has_token = bool((resp.json() or {}).get('accessToken'))
-        except ValueError:
-            has_token = False
-        return True, ('session valid, token issued' if has_token
-                      else 'session reachable but no accessToken (expired?)')
-    return False, f'HTTP {resp.status_code}'
+    if resp.status_code != 200:
+        return False, f'HTTP {resp.status_code}'
+    data = {}
+    try:
+        data = resp.json() or {}
+    except ValueError:
+        pass
+    fresh_token = str(data.get('accessToken') or '').strip()
+    if not fresh_token:
+        # 200 without a token means the session cookies are expired —
+        # the endpoint still answers, so this must NOT read as "valid"
+        # (it made the ladder believe credentials were fine).
+        return False, ('session reachable but no accessToken '
+                       '(cookies expired) - re-login needed')
+    new_cookies = {k: v for k, v in dict(resp.cookies).items() if v}
+    # the endpoint's JSON also carries the fresh bearer — persist it too,
+    # so the provider has a valid token even if the session cookies later
+    # go stale before the next renewal rung runs.
+    new_cookies['accessToken'] = fresh_token
+    _save_jar('chatgpt', new_cookies)
+    return True, 'session valid, token issued'
 
 
 def refresh_deepseek() -> Tuple[bool, str]:
@@ -769,15 +866,15 @@ def imap_otp(max_wait_s: int = 120, to_needle: Optional[str] = None) -> Optional
     ``to_needle`` restricts matches to mails addressed to that recipient —
     used by the catch-all autogen backend so unrelated codes are ignored.
     """
-    host = os.getenv('DSF_MAIL_IMAP_HOST', '').strip()
+    host = os.getenv('I4F_MAIL_IMAP_HOST', '').strip()
     if not host:
         return None
-    user = os.getenv('DSF_MAIL_IMAP_USER', '').strip()
-    password = os.getenv('DSF_MAIL_IMAP_PASS', '').strip()
-    port = int(os.getenv('DSF_MAIL_IMAP_PORT', '993') or 993)
-    sender_needle = os.getenv('DSF_MAIL_OTP_SENDER', 'deepseek').strip().lower()
-    code_re = re.compile(os.getenv('DSF_MAIL_OTP_REGEX', r'\b(\d{6})\b'))
-    max_age_min = float(os.getenv('DSF_MAIL_OTP_MAX_AGE', '30') or 30)
+    user = os.getenv('I4F_MAIL_IMAP_USER', '').strip()
+    password = os.getenv('I4F_MAIL_IMAP_PASS', '').strip()
+    port = int(os.getenv('I4F_MAIL_IMAP_PORT', '993') or 993)
+    sender_needle = os.getenv('I4F_MAIL_OTP_SENDER', 'deepseek').strip().lower()
+    code_re = re.compile(os.getenv('I4F_MAIL_OTP_REGEX', r'\b(\d{6})\b'))
+    max_age_min = float(os.getenv('I4F_MAIL_OTP_MAX_AGE', '30') or 30)
     deadline = time.time() + max_wait_s
     while time.time() < deadline:
         try:
@@ -854,11 +951,11 @@ def _signup_proxy() -> Optional[str]:
     """Egress for signup browsers.
 
     DeepSeek (CloudFront) blocks some datacenter/host IPs outright, so
-    signups prefer an explicit ``DSF_SIGNUP_PROXY``; otherwise the ladder
+    signups prefer an explicit ``I4F_SIGNUP_PROXY``; otherwise the ladder
     falls through to the dynamic pool and finally direct. Tor is never
     used. Returns None = direct connection.
     """
-    explicit = os.getenv('DSF_SIGNUP_PROXY', '').strip()
+    explicit = os.getenv('I4F_SIGNUP_PROXY', '').strip()
     if explicit:
         return explicit
     return None
@@ -867,17 +964,56 @@ def _signup_proxy() -> Optional[str]:
 _DISPLAY = None  # pyvirtualdisplay handle kept alive for non-headless runs
 
 
+def _x_display_alive(number: int) -> bool:
+    """True when an X server is actually listening on display ``:number``.
+
+    A dead Xvfb leaves its /tmp/.X11-unix socket behind; trusting the
+    socket file made windowed Chromium fail with BrowserConnectError on
+    every renewal rung."""
+    import socket
+    import glob as _glob
+    for sock in _glob.glob(f'/tmp/.X11-unix/X{number}'):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(1.0)
+        try:
+            probe.connect(sock)
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+    return False
+
+
 def _ensure_display() -> bool:
     """Best-effort X server for non-headless runs. Returns True when a
-    DISPLAY is available (existing socket, pyvirtualdisplay, or env)."""
+    LIVE display is available (env, an existing server, or one we start)."""
     global _DISPLAY
-    if os.environ.get('DISPLAY'):
+    if _DISPLAY is not None:
+        # ours: trust it unless its display died
+        try:
+            num = str(_DISPLAY.display).lstrip(':').split('.')[0]
+            if not (num.isdigit() and _x_display_alive(int(num))):
+                _DISPLAY = None  # dead — start a fresh one below
+                return False
+        except Exception:  # noqa: BLE001
+            return True  # cannot verify — trust it
         return True
+    disp = os.environ.get('DISPLAY', '')
+    if disp:
+        num = disp.lstrip(':').split('.')[0]
+        if num.isdigit() and _x_display_alive(int(num)):
+            return True
+        os.environ.pop('DISPLAY', None)  # dead socket — don't trust it
     import glob as _glob
-    sockets = sorted(_glob.glob('/tmp/.X11-unix/X[0-9]*'))
-    if sockets:
-        os.environ['DISPLAY'] = f':{sockets[0].rsplit("X", 1)[1]}'
-        return True
+    for sock in sorted(_glob.glob('/tmp/.X11-unix/X[0-9]*')):
+        try:
+            num = int(sock.rsplit('X', 1)[-1])
+        except ValueError:
+            continue
+        if _x_display_alive(num):
+            os.environ['DISPLAY'] = f':{num}'
+            return True
     try:
         from pyvirtualdisplay import Display
         _DISPLAY = Display(visible=False, size=(1440, 900))
@@ -888,11 +1024,43 @@ def _ensure_display() -> bool:
         return False
 
 
-def _browser(proxy: Optional[str] = None, headed: bool = False):
+def _reap_dead_children() -> None:
+    """Reap exited child processes (zombie chromium after failed launches).
+
+    DrissionPage spawns chromium through short-lived intermediates; when
+    the browser dies the zombie is reparented to PID 1 (this process),
+    which never wait()s — without reaping the container accumulates one
+    zombie pair per failed browser attempt."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return
+        if pid <= 0:
+            return
+
+
+def _browser(proxy: Optional[str] = None, headed: bool = False,
+             user_data_path: Optional[str] = None,
+             local_port: Optional[int] = None):
+    """Spawn a DrissionPage Chromium.
+
+    ``user_data_path`` keeps one persistent profile (Cloudflare/Google score
+    returning browsers far higher, and logins/cookies must survive between
+    attempts); without it every spawn is an ephemeral profile as before.
+    """
     from DrissionPage import ChromiumPage, ChromiumOptions
-    options = ChromiumOptions().auto_port()
+    options = (ChromiumOptions().set_local_port(int(local_port))
+               if local_port else ChromiumOptions().auto_port())
+    if user_data_path:
+        Path(user_data_path).mkdir(parents=True, exist_ok=True)
+        options.set_user_data_path(user_data_path)
     options.set_argument('--no-sandbox')
     options.set_argument('--disable-gpu')
+    # Docker's default /dev/shm is 64MB: Chrome dies mid-navigation there
+    # (observed as "email field not found" style ladder misses — the page
+    # never renders because the renderer process is killed).
+    options.set_argument('--disable-dev-shm-usage')
     # Aliyun's slider scores the client: hide automation and run windowed
     # (real Chrome under Xvfb) whenever the rung asks for non-headless.
     options.set_argument('--disable-blink-features=AutomationControlled')
@@ -914,14 +1082,29 @@ def _browser(proxy: Optional[str] = None, headed: bool = False):
     # headed=True forces a windowed real Chrome (anti-bot services score
     # headless clients far lower — Aliyun slider, Cloudflare, Google) and
     # degrades to headless only when no X server can be obtained.
+    headless = False
     if headed:
         if not _ensure_display():
-            options.headless(True)  # no X server obtainable -> degrade quietly
-    elif _env_bool('DSF_REFRESHER_HEADLESS', True):
+            options.headless(True)
+            headless = True
+    elif _env_bool('I4F_REFRESHER_HEADLESS', True):
         options.headless(True)
+        headless = True
     elif not _ensure_display():
-        options.headless(True)  # no X server obtainable -> degrade quietly
-    return ChromiumPage(addr_or_opts=options)
+        options.headless(True)
+        headless = True
+    _reap_dead_children()
+    try:
+        return ChromiumPage(addr_or_opts=options)
+    except Exception:
+        _reap_dead_children()
+        if headed and not headless:
+            # windowed spawn failed (e.g. the X server died between the
+            # liveness check and the spawn) — degrade to headless instead
+            # of killing the whole renewal rung
+            options.headless(True)
+            return ChromiumPage(addr_or_opts=options)
+        raise
 
 
 def _fill_first(page, selectors: List[str], value: str,
@@ -947,14 +1130,14 @@ def _body_head(page) -> str:
 
 
 _NET_LOG_JS = r"""
-window.__dsf_log = window.__dsf_log || [];
-if (!window.__dsf_hooked) {
-  window.__dsf_hooked = true;
+window.__i4f_log = window.__i4f_log || [];
+if (!window.__i4f_hooked) {
+  window.__i4f_hooked = true;
   const of = window.fetch;
   window.fetch = function(...a){
     return of.apply(this, a).then(r => {
       try { const c = r.clone();
-        c.text().then(t => window.__dsf_log.push(
+        c.text().then(t => window.__i4f_log.push(
           [String((a[0]&&a[0].url)||a[0]), r.status, String(t).slice(0,500)])); }
       catch(e){}
       return r;
@@ -965,7 +1148,7 @@ if (!window.__dsf_hooked) {
   XMLHttpRequest.prototype.open = function(m,u){ this.__u=u; return oo.apply(this,arguments); };
   XMLHttpRequest.prototype.send = function(b){
     this.addEventListener('load', () => {
-      try { window.__dsf_log.push(
+      try { window.__i4f_log.push(
         [String(this.__u), this.status, String(this.responseText).slice(0,500)]); }
       catch(e){}
     });
@@ -986,7 +1169,7 @@ def _net_log_install(page) -> None:
 def _net_log_read(page, needle: str = '', limit: int = 6) -> str:
     """Last few recorded request/response pairs, filtered by URL ``needle``."""
     try:
-        log = page.run_js('return window.__dsf_log || [];') or []
+        log = page.run_js('return window.__i4f_log || [];') or []
     except Exception:  # noqa: BLE001 — diagnostics only
         return ''
     out = []
@@ -1011,6 +1194,33 @@ def _click_any(page, targets: List[str]) -> bool:
         except Exception:  # noqa: BLE001
             continue
     return False
+
+
+def _js_click_text(page, texts: List[str]) -> bool:
+    """Click the first visible element whose text matches, through JS.
+
+    Native DrissionPage clicks have killed the container's Chrome (shared
+    memory exhaustion); a JS click runs the page's own handlers without the
+    CDP input path, so it is preferred for menu navigation in renewal flows.
+    """
+    script = '''
+const wanted = (arguments[0] || []).map(t => String(t).trim().toLowerCase());
+const nodes = [...document.querySelectorAll(
+  'a,button,div[role=button],div[role=menuitem],li,span,input')]
+  .filter(e => {
+    const t = (e.innerText || e.value || '').trim().toLowerCase();
+    return wanted.some(w => t === w || (t.includes(w) && t.length < w.length + 25));
+  });
+for (const e of nodes) {
+  const r = e.getBoundingClientRect();
+  if (r.width > 0 && r.height > 0) { e.click(); return true; }
+}
+return false;
+'''
+    try:
+        return bool(page.run_js(script, list(texts)))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _select_first(page, selectors: List[str], value: str) -> bool:
@@ -1042,10 +1252,23 @@ def _wait_token(page, timeout_s: int = 150) -> Optional[str]:
 
 
 def _export_cookies(page, name: str, domains: Tuple[str, ...]) -> int:
+    """Export browser cookies into the provider jar.
+
+    ``page.cookies()`` hides httpOnly cookies (DrissionPage strips them), and
+    the cookies that matter most — ``__Secure-next-auth.session-token`` for
+    chatgpt, ``__Secure-1PSID`` for Google — ARE httpOnly. CDP
+    ``Network.getAllCookies`` returns the full store including httpOnly ones;
+    the JS-visible fallback is kept for engines that refuse the CDP call.
+    """
+    cookies: List[Any] = []
     try:
-        cookies = page.cookies(all_domains=True) or []
-    except TypeError:
-        cookies = page.cookies() or []
+        raw = page.run_cdp('Network.getAllCookies')
+        cookies = (raw or {}).get('cookies') or []
+    except Exception:  # noqa: BLE001 — CDP refused; degrade to visible cookies
+        try:
+            cookies = page.cookies(all_domains=True) or []
+        except TypeError:
+            cookies = page.cookies() or []
     updates = {str(c.get('name')): str(c.get('value')) for c in cookies
                if isinstance(c, dict) and c.get('name') and c.get('value')
                and any(d in str(c.get('domain', '')) for d in domains)}
@@ -1067,6 +1290,25 @@ def _creds(name: str) -> Tuple[str, str]:
         return email, password
     stored = _load_accounts().get(name) or {}
     return (stored.get('email') or email, stored.get('password') or password)
+
+
+def _mail_session_for(name: str, email: str) -> Optional[Dict[str, Any]]:
+    """Mailgen session for a stored account (generic _qwen_mail_session).
+
+    Lets the login rungs of any provider feed an emailed OTP to
+    ``mailgen.fetch_otp`` when the account was bot-created. Returns None
+    when the login email is not the bot's mailbox (e.g. a manually
+    stored account) — callers fall back to the configured IMAP mailbox."""
+    stored = _load_accounts().get(name) or {}
+    if stored.get('email') \
+            and _norm_email(stored.get('email')) != _norm_email(email):
+        return None
+    ms = stored.get('mail_session')
+    if isinstance(ms, dict) and ms.get('backend') and ms.get('address'):
+        return dict(ms)
+    if (stored.get('backend') or '').strip() and email:
+        return {'backend': stored['backend'], 'address': email}
+    return None
 
 
 _DEEPSEEK_EMAIL_SELECTORS = ['@placeholder:email', '@placeholder:Email',
@@ -1105,10 +1347,19 @@ def browser_login(name: str) -> Tuple[bool, str]:
             return True, f're-logged in via HTTP Kratos ({detail})'
         return False, f'kratos re-login: {detail}'
     proxy = _deepseek_egress() if name == 'deepseek' else None
+    profile = ''
+    if name in ('chatgpt', 'gemini'):
+        # Persistent profile for the bot-walled hosts: Cloudflare/Google
+        # score returning browsers far higher, and a one-time operator
+        # login must survive across renewal attempts. The same profile is
+        # reused by the chatgpt relay, so a login here upgrades it.
+        profile = (os.getenv(f'I4F_BROWSER_PROFILE_{name.upper()}', '').strip()
+                   or str(_data_dir() / 'browser' / name))
     try:
         # headed: CloudFront's WAF hard-403s headless clients but serves the
         # SPA (JS challenge -> aws-waf-token) to a windowed real Chrome
-        page = _browser(proxy=proxy, headed=True)
+        page = _browser(proxy=proxy, headed=True,
+                        user_data_path=profile or None)
     except Exception as e:  # noqa: BLE001
         return False, f'browser unavailable: {e}'
     try:
@@ -1123,7 +1374,7 @@ def browser_login(name: str) -> Tuple[bool, str]:
                     or '403 error' in root_head):
                 return False, (
                     f'CloudFront 403 via {proxy or "direct"} — DeepSeek '
-                    f'blocks datacenter/host IPs; set DSF_SIGNUP_PROXY to '
+                    f'blocks datacenter/host IPs; set I4F_SIGNUP_PROXY to '
                     f'a RESIDENTIAL proxy to unblock signup')
             if not _click_any(page, ['Log in', 'Login', '登录']):
                 page.get('https://chat.deepseek.com/sign_in')
@@ -1158,9 +1409,44 @@ def browser_login(name: str) -> Tuple[bool, str]:
             time.sleep(3)
             _fill_first(page, _PASSWORD_SELECTORS, password)
             _click_any(page, ['Continue', 'Log in'])
+            # OpenAI demands an emailed verification code for sign-ins from
+            # unrecognized devices — feed it from the account's mailbox
+            # (or the configured IMAP) exactly like the deepseek flow.
+            # strong selectors only for the WAIT (a stray text input on the
+            # landed page must not fake a code step); the generic one is a
+            # last resort when actually filling the code
+            strong_code_sels = ['css:input[name=code]',
+                                'css:input[inputmode=numeric]',
+                                'css:input[autocomplete=one-time-code]',
+                                '@placeholder:code', '@placeholder:Code']
+            code_sels = strong_code_sels + ['css:input[type=text]']
+            if _fill_first(page, strong_code_sels, ' ', timeout=20):
+                ms = _mail_session_for('chatgpt', email)
+                code = (mailgen.fetch_otp(ms, max_wait_s=180,
+                                          sender_needle='openai')
+                        if ms else imap_otp())
+                if not code:
+                    return False, (
+                        'login needs an emailed code for '
+                        f'{email} but no OTP is reachable — the account '
+                        'mailbox is not the bot\'s (configure '
+                        'I4F_MAIL_IMAP_* or CHATGPT_LOGIN_EMAIL/PASSWORD to '
+                        'a bot mailbox) or log in once in the persistent '
+                        'profile browser')
+                _fill_first(page, code_sels, code)
+                _click_any(page, ['Continue', 'Verify'])
+                time.sleep(12)
             time.sleep(12)
+            pre_token = _load_jar('chatgpt').get('accessToken', '')
             n = _export_cookies(page, 'chatgpt', ('chatgpt.com', 'openai.com'))
-            return (n > 0), f'{n} session cookies exported'
+            # A login that exported only CloudFront/oai-did cookies is NOT
+            # a login — require the actual session cookie.
+            jar = _load_jar('chatgpt')
+            if jar.get('__Secure-next-auth.session-token'):
+                return True, f'{n} cookies exported (session token captured)'
+            _chatgpt_restore_token(jar, pre_token)
+            return False, (f'{n} cookies exported but no session token '
+                           '(login incomplete or bot wall)')
         if name == 'gemini':
             # gemini (Google) — best effort, heavy anti-bot
             page.get('https://accounts.google.com/ServiceLogin')
@@ -1175,7 +1461,12 @@ def browser_login(name: str) -> Tuple[bool, str]:
             page.get('https://gemini.google.com/app')
             time.sleep(6)
             n = _export_cookies(page, 'gemini', ('google.com',))
-            return (n > 0), f'{n} google cookies exported (2FA/anti-bot may block)'
+            # non-1PSID google cookies are not a session — require the real
+            # credential or the ladder will celebrate a failed login
+            if _load_jar('gemini').get('__Secure-1PSID'):
+                return True, f'{n} cookies exported (1PSID captured)'
+            return False, (f'{n} cookies exported but no __Secure-1PSID '
+                           '(2FA/anti-bot may block)')
         # claude / grok / kimi: their credentials are HTTP-only tokens
         # (sessionKey / sso / JWT) that no login form re-issues — nothing
         # to rotate in a browser here.
@@ -1291,7 +1582,7 @@ def signup_deepseek() -> Tuple[bool, str]:
     Credentials ladder:
       1. DEEPSEEK_LOGIN_EMAIL / DEEPSEEK_LOGIN_PASSWORD if configured;
       2. otherwise an auto-generated throwaway mailbox (dsk/mailgen.py):
-         catch-all IMAP domain when DSF_MAIL_DOMAIN is set, else a mail.tm
+         catch-all IMAP domain when I4F_MAIL_DOMAIN is set, else a mail.tm
          temp account. The verification code is read from that mailbox, so
          no human and no pre-existing account are needed.
     """
@@ -1310,7 +1601,7 @@ def signup_deepseek() -> Tuple[bool, str]:
         # password independent of the mailbox credentials.
         password = session.get('password') or mailgen.gen_password()
         generated = True
-    # egress ladder: explicit DSF_SIGNUP_PROXY first, then up to 3 distinct
+    # egress ladder: explicit I4F_SIGNUP_PROXY first, then up to 3 distinct
     # dynamic-pool exits that PASS the root-page reachability probe, then
     # direct (duplicates dropped). Tor is never used. Blocked exits are
     # cooled down so the next rung samples a fresh, hopefully-working IP
@@ -1319,7 +1610,7 @@ def signup_deepseek() -> Tuple[bool, str]:
     seen: set = set()
     # direct first when the host IP passes the (cheap) reachability probe —
     # the free-proxy pool is unreliable and each dead rung costs a browser
-    # startup; explicit DSF_SIGNUP_PROXY and pool exits follow, direct last
+    # startup; explicit I4F_SIGNUP_PROXY and pool exits follow, direct last
     # as the always-present fallback.
     ordered: List[Optional[str]] = []
     if _ds_egress_ok(None):
@@ -1354,7 +1645,7 @@ def signup_deepseek() -> Tuple[bool, str]:
                     or '403 error' in root_head):
                 last_error = (
                     f'CloudFront 403 via {proxy or "direct"} — DeepSeek '
-                    f'blocks datacenter/host IPs; set DSF_SIGNUP_PROXY to '
+                    f'blocks datacenter/host IPs; set I4F_SIGNUP_PROXY to '
                     f'a RESIDENTIAL proxy to unblock signup')
                 _log_history('deepseek', 'signup-blocked', last_error)
                 _cool(proxy)  # blocked exit: cooldown + force a fresh one
@@ -1367,7 +1658,7 @@ def signup_deepseek() -> Tuple[bool, str]:
                     or '403 error' in body_head):
                 last_error = (
                     f'CloudFront 403 via {proxy or "direct"} — DeepSeek '
-                    f'blocks datacenter/host IPs; set DSF_SIGNUP_PROXY to '
+                    f'blocks datacenter/host IPs; set I4F_SIGNUP_PROXY to '
                     f'a RESIDENTIAL proxy to unblock signup')
                 _log_history('deepseek', 'signup-blocked', last_error)
                 _cool(proxy)  # blocked exit: cooldown + force a fresh one
@@ -1418,8 +1709,8 @@ def signup_deepseek() -> Tuple[bool, str]:
             if not code:
                 return False, ('signup code email not found in mailbox — '
                                'no OTP arrived (gmail + disposable backends '
-                               'tried); configure DSF_MAIL_DOMAIN + '
-                               'DSF_MAIL_IMAP_HOST with a catch-all inbox '
+                               'tried); configure I4F_MAIL_DOMAIN + '
+                               'I4F_MAIL_IMAP_HOST with a catch-all inbox '
                                'for guaranteed delivery'
                                + send_note)
             if not _fill_first(page, ['@placeholder:code', '@placeholder:Code',
@@ -1467,7 +1758,7 @@ def signup_chatgpt() -> Tuple[bool, str]:
     clear detail string and the ladder records a normal miss. Created
     account credentials are persisted so later renewals can re-login."""
     if not mailgen.autogen_enabled():
-        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
     session, err = mailgen.create_email()
     if not session:
         return False, f'autogen mailbox unavailable: {err}'
@@ -1509,11 +1800,16 @@ def signup_chatgpt() -> Tuple[bool, str]:
         time.sleep(12)
         _save_account('chatgpt', email, password,
                       session.get('backend', ''))
+        pre_token = _load_jar('chatgpt').get('accessToken', '')
         n = _export_cookies(page, 'chatgpt', ('chatgpt.com', 'openai.com'))
         via = f'account created ({session["backend"]}: {email})'
-        if n > 0:
-            return True, f'{via}, {n} session cookies exported'
-        return False, f'{via} but no session cookies captured'
+        # require the actual session cookie — CF cookies alone are not a
+        # logged-in account (the old n>0 check celebrated failed signups)
+        jar = _load_jar('chatgpt')
+        if jar.get('__Secure-next-auth.session-token'):
+            return True, f'{via}, {n} cookies exported (session token captured)'
+        _chatgpt_restore_token(jar, pre_token)
+        return False, f'{via} but no session token captured'
     except Exception as e:  # noqa: BLE001
         return False, f'chatgpt signup failed: {type(e).__name__}: {e}'
     finally:
@@ -1531,7 +1827,7 @@ def signup_gemini() -> Tuple[bool, str]:
     ladder miss. Uses an auto-generated mailbox for the verification
     code; the account is persisted for later re-login attempts."""
     if not mailgen.autogen_enabled():
-        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
     session, err = mailgen.create_email()
     if not session:
         return False, f'autogen mailbox unavailable: {err}'
@@ -1544,9 +1840,18 @@ def signup_gemini() -> Tuple[bool, str]:
     except Exception as e:  # noqa: BLE001
         return False, f'browser unavailable: {e}'
     try:
-        page.get('https://accounts.google.com/signup/v2/createaccount'
-                 '?flowName=GlifWebSignIn&flowEntry=AccountSignUp')
+        # 2026-10: the /signup/v2/createaccount deep link redirects to the
+        # sign-in identifier page, which has no firstName field — the rung
+        # used to report that as a bot wall. /SignUp lands on the real form
+        # (/lifecycle/steps/signup/name); the sign-in page's "Create account"
+        # → "For my personal use" menu is the fallback entry.
+        page.get('https://accounts.google.com/SignUp')
         time.sleep(6)
+        if not page.ele('css:input#firstName', timeout=5):
+            _js_click_text(page, ['Create account'])
+            time.sleep(3)
+            _js_click_text(page, ['For my personal use'])
+            time.sleep(5)
         if not _fill_first(page, ['css:input#firstName',
                                   'css:input[name=firstName]'], 'Alex'):
             return False, 'google first-name field not found (bot wall?)'
@@ -1593,9 +1898,11 @@ def signup_gemini() -> Tuple[bool, str]:
         time.sleep(6)
         n = _export_cookies(page, 'gemini', ('google.com',))
         via = f'account created ({session["backend"]}: {email})'
-        if n > 0:
-            return True, f'{via}, {n} google cookies exported'
-        return False, f'{via} but no cookies captured (2FA/anti-bot?)'
+        # require the real session credential (n>0 counted any google.com
+        # cookie and celebrated failed signups)
+        if _load_jar('gemini').get('__Secure-1PSID'):
+            return True, f'{via}, {n} cookies exported (1PSID captured)'
+        return False, f'{via} but no __Secure-1PSID captured (2FA/anti-bot?)'
     except Exception as e:  # noqa: BLE001
         return False, f'gemini signup failed: {type(e).__name__}: {e}'
     finally:
@@ -1619,7 +1926,7 @@ def signup_claude() -> Tuple[bool, str]:
     credentials are persisted for later re-login.
     """
     if not mailgen.autogen_enabled():
-        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
     session, err = mailgen.create_email()
     if not session:
         return False, f'autogen mailbox unavailable: {err}'
@@ -1675,25 +1982,35 @@ def signup_claude() -> Tuple[bool, str]:
 
 
 def signup_grok() -> Tuple[bool, str]:
-    """Create a grok.com account (X SSO-less email signup) and export sso."""
+    """Create a grok.com account and export sso.
+
+    2026-10 probe: accounts.x.ai/sign-up is the SpaceXAI *API* portal —
+    OAuth-only buttons (X / email / Apple / Google / GitHub), no plain email
+    field, and grok.com web needs the X OAuth ``sso`` cookie. The rung
+    therefore checks the wall before spending a disposable mailbox, and
+    tells the operator to paste GROK_SSO / grok_cookies.json manually.
+    """
     if not mailgen.autogen_enabled():
-        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
-    session, err = mailgen.create_email()
-    if not session:
-        return False, f'autogen mailbox unavailable: {err}'
-    email = session['address']
-    password = session.get('password') or mailgen.gen_password()
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
     page = None
     try:
         page = _browser(headed=True)
         page.get('https://accounts.x.ai/sign-up')
         time.sleep(6)
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
-            if not _click_any(page, ['Sign up', 'Create account', 'Sign in']):
-                return False, 'grok signup entry not found (bot wall?)'
+        probe_email = 'probe@example.invalid'
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, probe_email):
+            _click_any(page, ['Sign up', 'Create account', 'Sign in'])
             time.sleep(4)
-            if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
-                return False, 'email field not found'
+            if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, probe_email):
+                return False, ('grok signup is OAuth-only (X account required) — '
+                               'set GROK_SSO or grok_cookies.json manually')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        password = session.get('password') or mailgen.gen_password()
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
         _click_any(page, ['Continue', 'Next'])
         time.sleep(3)
         _fill_first(page, _PASSWORD_SELECTORS, password)
@@ -1739,14 +2056,15 @@ def signup_grok() -> Tuple[bool, str]:
 
 
 def signup_kimi() -> Tuple[bool, str]:
-    """Create a kimi.com account (phone-free email signup) and save the JWT."""
+    """Create a kimi.com account and save the JWT.
+
+    2026-10 probe: www.kimi.com/login offers WeChat QR, a phone number
+    (+86 only) and enterprise SSO — no email/password signup at all, so
+    this rung can only work for an operator-supplied account. Probe the
+    wall before spending a disposable mailbox.
+    """
     if not mailgen.autogen_enabled():
-        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
-    session, err = mailgen.create_email()
-    if not session:
-        return False, f'autogen mailbox unavailable: {err}'
-    email = session['address']
-    password = session.get('password') or mailgen.gen_password()
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
     page = None
     try:
         page = _browser(headed=True)
@@ -1758,6 +2076,15 @@ def signup_kimi() -> Tuple[bool, str]:
         # prefer email/password over phone (no phone wall for email)
         _click_any(page, ['Email', '邮箱', 'Password login', '密码登录'])
         time.sleep(2)
+        probe_email = 'probe@example.invalid'
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, probe_email):
+            return False, ('kimi signup is phone(+86)/WeChat/SSO-only — '
+                           'set KIMI_TOKEN or kimi_cookies.json manually')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        password = session.get('password') or mailgen.gen_password()
         if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
             return False, 'email field not found'
         _fill_first(page, _PASSWORD_SELECTORS, password)
@@ -2100,7 +2427,7 @@ def signup_mistral() -> Tuple[bool, str]:
     no browser, no bot wall), browser flow as the fallback. Exports the
     session under the ``session_token`` key the provider reads."""
     if not mailgen.autogen_enabled():
-        return False, 'mail autogen disabled (DSF_MAIL_AUTOGEN=false)'
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
     session, err = mailgen.create_email()
     if not session:
         return False, f'autogen mailbox unavailable: {err}'
@@ -2537,7 +2864,7 @@ def signup_qwen() -> Tuple[bool, str]:
             return False, f'autogen mailbox unavailable: {err}'
         email = session['address']
         password = mailgen.gen_password()
-    name = f'DSF {email.split("@")[0][:8]}'.strip()
+    name = f'I4F {email.split("@")[0][:8]}'.strip()
     last_error = ''
     typed_pw: Dict[str, str] = {}  # password value actually in the form
     ladder: List[Optional[str]] = [None]
@@ -2846,20 +3173,24 @@ def _seed_counts() -> None:
 
 def renew(name: str, reason: str = '') -> Dict[str, Any]:
     """Run the full renewal ladder for one provider. Returns a status dict."""
-    if not _env_bool('DSF_REFRESHER', True):
+    if not _env_bool('I4F_REFRESHER', True):
         return {'renewed': False, 'skipped': 'refresher disabled'}
     if not provider_enabled(name):
-        return {'renewed': False, 'skipped': 'provider disabled (DSF_PROVIDERS)'}
+        return {'renewed': False, 'skipped': 'provider disabled (I4F_PROVIDERS)'}
     excl = {e.strip().lower() for e in
-            os.getenv('DSF_REFRESHER_EXCLUDE', '').split(',') if e.strip()}
+            os.getenv('I4F_REFRESHER_EXCLUDE', '').split(',') if e.strip()}
     if name in excl:
         return {'renewed': False, 'skipped': f'{name} excluded'}
     with _STATE.lock:
         if _STATE.renewing.get(name):
             return {'renewed': False, 'skipped': 'renewal already running'}
         last = _STATE.results.get(name, {})
+        # 'escalate' = refresh_cycle handing a failed cheap-refresh to the
+        # ladder. The failure was logged seconds ago, so the plain cooldown
+        # check would skip the ladder with its own fresh timestamp — the
+        # escalation would never run. Budget + rung breakers still apply.
         if last.get('ts') and time.time() - _entry_ts(last) < _cooldown() \
-                and not reason.startswith('manual'):
+                and not (reason.startswith('manual') or reason == 'escalate'):
             return {'renewed': False, 'skipped': 'cooldown'}
         today = time.strftime('%Y-%m-%d')
         _seed_counts()
@@ -2886,11 +3217,11 @@ def _entry_ts(entry: Dict[str, Any]) -> float:
 
 
 def _breaker_n() -> int:
-    return max(1, int(os.getenv('DSF_BREAKER_N', '3') or 3))
+    return max(1, int(os.getenv('I4F_BREAKER_N', '3') or 3))
 
 
 def _breaker_cooldown() -> float:
-    return max(60.0, float(os.getenv('DSF_BREAKER_COOLDOWN_S', '1800') or 1800))
+    return max(60.0, float(os.getenv('I4F_BREAKER_COOLDOWN_S', '1800') or 1800))
 
 
 def _rung_open(name: str, rung: str) -> bool:
@@ -2930,33 +3261,52 @@ def _renew_locked(name: str, reason: str) -> Dict[str, Any]:
         ok, detail = REFRESH[name]()
         steps.append(f'refresh: {detail}')
         _log_history(name, 'refresh', detail)
-        status = _verify(name)
-        _rung_result(name, 'refresh', status == 'ok')
-    if status == 'ok':
-        _log_history(name, 'renewed', '; '.join(steps))
-        return {'renewed': True, 'via': 'http-refresh', 'steps': steps}
+        # The probe checks the *anonymous* surface (e.g. chatgpt's browser
+        # relay), so it reports 'ok' even when the credential is dead —
+        # gating on it here short-circuited the ladder and the provider
+        # never re-logged in. The refresh rung's own success is the
+        # credential verdict; only escalate to login/signup when it fails.
+        _rung_result(name, 'refresh', ok)
+        if ok:
+            status = _verify(name)
+            if status == 'ok':
+                _log_history(name, 'renewed', '; '.join(steps))
+                return {'renewed': True, 'via': 'http-refresh', 'steps': steps}
+        else:
+            status = 'fail'
 
-    if _env_bool('DSF_REFRESHER_LOGIN', True) and not _rung_open(name, 'login'):
+    if _env_bool('I4F_REFRESHER_LOGIN', True) and not _rung_open(name, 'login'):
         ok, detail = browser_login(name)
         steps.append(f'login: {detail}')
         _log_history(name, 'browser-login', detail)
-        status = _verify(name)
-        _rung_result(name, 'login', status == 'ok')
-        if status == 'ok':
-            _log_history(name, 'renewed', '; '.join(steps))
-            return {'renewed': True, 'via': 'browser-login', 'steps': steps}
+        # Same as the refresh rung: the probe reports the anonymous surface
+        # healthy, so it must not gate the ladder. The rung's own success is
+        # the credential verdict; a failed login escalates to signup.
+        _rung_result(name, 'login', ok)
+        if ok:
+            status = _verify(name)
+            if status == 'ok':
+                _log_history(name, 'renewed', '; '.join(steps))
+                return {'renewed': True, 'via': 'browser-login', 'steps': steps}
+        else:
+            status = 'fail'
 
-    if _env_bool('DSF_REFRESHER_AUTOSIGNUP', True) \
+    if _env_bool('I4F_REFRESHER_AUTOSIGNUP', True) \
             and not _rung_open(name, 'signup'):
         with _file_lock(_SIGNUP_LOCK_PATH):
             ok, detail = SIGNUP[name]()   # all providers: create what is missing
         steps.append(f'signup: {detail}')
         _log_history(name, 'autosignup', detail)
-        status = _verify(name)
-        _rung_result(name, 'signup', status == 'ok')
-        if status == 'ok':
-            _log_history(name, 'renewed', '; '.join(steps))
-            return {'renewed': True, 'via': 'autosignup', 'steps': steps}
+        # Same as the rungs above: a failed signup must not be masked by the
+        # anonymous-surface probe.
+        _rung_result(name, 'signup', ok)
+        if ok:
+            status = _verify(name)
+            if status == 'ok':
+                _log_history(name, 'renewed', '; '.join(steps))
+                return {'renewed': True, 'via': 'autosignup', 'steps': steps}
+        else:
+            status = 'fail'
 
     _log_history(name, 'renew-failed', '; '.join(steps))
     return {'renewed': False, 'steps': steps,
@@ -2979,15 +3329,15 @@ def renew_inline(name: str, detail: str = '') -> Dict[str, Any]:
     ``ProviderAuthError`` — the ladder (refresh -> browser re-login ->
     auto-signup) runs in a background thread so the failing request is
     not blocked; the NEXT request picks up the fresh credential.
-    Guarded by an hourly per-provider attempt cap (DSF_REFRESHER_INLINE_HOURLY,
+    Guarded by an hourly per-provider attempt cap (I4F_REFRESHER_INLINE_HOURLY,
     default 2) and a 60s silence window after a completed attempt so a
     burst of failing requests cannot spin the ladder.
     """
-    if not _env_bool('DSF_REFRESHER', True):
+    if not _env_bool('I4F_REFRESHER', True):
         return {'triggered': False, 'skipped': 'refresher disabled'}
     if not provider_enabled(name):
         return {'triggered': False, 'skipped': 'provider disabled'}
-    hourly = max(1, int(os.getenv('DSF_REFRESHER_INLINE_HOURLY', '2') or 2))
+    hourly = max(1, int(os.getenv('I4F_REFRESHER_INLINE_HOURLY', '2') or 2))
     now = time.time()
     hour = time.strftime('%Y%m%d%H')
     with _STATE.lock:
@@ -3027,12 +3377,12 @@ def refresh_cycle() -> Dict[str, Any]:
     """Proactive daemon cycle: rotate refreshable cookies (gemini/chatgpt)
     and BOOTSTRAP any provider that has no credentials at all — the signup
     rung creates fresh ones unattended."""
-    if not _env_bool('DSF_REFRESHER', True):
+    if not _env_bool('I4F_REFRESHER', True):
         return {'refresher': 'disabled'}
     out: Dict[str, Any] = {}
     for name in tuple(REFRESH):
         if not provider_enabled(name):
-            continue  # disabled via DSF_PROVIDERS: no routes, no probes, no bot
+            continue  # disabled via I4F_PROVIDERS: no routes, no probes, no bot
         with _STATE.lock:
             if _STATE.renewing.get(name):
                 # an inline/ladder renewal is running for this provider —
@@ -3041,7 +3391,7 @@ def refresh_cycle() -> Dict[str, Any]:
                 out[name] = 'skipped (renewal already running)'
                 continue
         if not _has_creds(name):
-            if not _env_bool('DSF_REFRESHER_AUTOSIGNUP', True):
+            if not _env_bool('I4F_REFRESHER_AUTOSIGNUP', True):
                 out[name] = 'skipped (no credentials, autosignup off)'
                 continue
             try:
@@ -3053,8 +3403,19 @@ def refresh_cycle() -> Dict[str, Any]:
             continue  # token is verified live by the self-heal probe
         try:
             ok, detail = REFRESH[name]()
-            out[name] = detail
-            _log_history(name, 'proactive-refresh' if ok else 'refresh-issue', detail)
+            _log_history(name, 'proactive-refresh' if ok else 'refresh-issue',
+                         detail)
+            if ok:
+                out[name] = detail
+                continue
+            # The cheap refresh rung failed while credentials exist: hand the
+            # provider to the full ladder (re-login -> signup). Logging the
+            # issue and moving on left such providers stuck for weeks — this
+            # is the "has credentials but never renews them" gap.
+            try:
+                out[name] = renew(name, reason='escalate')
+            except Exception as e:  # noqa: BLE001
+                out[name] = f'{detail}; ladder error: {type(e).__name__}: {e}'
         except Exception as e:  # noqa: BLE001
             out[name] = f'error: {e}'
     return out
@@ -3066,7 +3427,7 @@ def bootstrap_all() -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for name in REFRESH:
         if not provider_enabled(name):
-            out[name] = {'renewed': False, 'skipped': 'provider disabled (DSF_PROVIDERS)'}
+            out[name] = {'renewed': False, 'skipped': 'provider disabled (I4F_PROVIDERS)'}
             continue
         if _has_creds(name):
             out[name] = {'renewed': False, 'skipped': 'credentials present'}
@@ -3101,19 +3462,19 @@ def status() -> Dict[str, Any]:
         results = dict(_STATE.results)
         started = _STATE.started
     enabled = [p for p in REFRESH if provider_enabled(p)]
-    return {'enabled': _env_bool('DSF_REFRESHER', True),
+    return {'enabled': _env_bool('I4F_REFRESHER', True),
             'daemon': started,
             'ttl': _ttl(),
-            'browser_login': _env_bool('DSF_REFRESHER_LOGIN', True),
-            'autosignup': _env_bool('DSF_REFRESHER_AUTOSIGNUP', True),
+            'browser_login': _env_bool('I4F_REFRESHER_LOGIN', True),
+            'autosignup': _env_bool('I4F_REFRESHER_AUTOSIGNUP', True),
             'autosignup_providers': sorted(SIGNUP),
             'mail_autogen': mailgen.autogen_enabled(),
-            'mail_configured': bool(os.getenv('DSF_MAIL_IMAP_HOST', '').strip()),
+            'mail_configured': bool(os.getenv('I4F_MAIL_IMAP_HOST', '').strip()),
             'providers': {'enabled': enabled,
                           'disabled': [p for p in REFRESH if p not in enabled]},
             'credentials': {p: bool(all(_creds(p))) for p in REFRESH},
             'has_credentials': {p: _has_creds(p) for p in REFRESH},
-            'bootstrap': {'enabled': _env_bool('DSF_REFRESHER_AUTOSIGNUP', True),
+            'bootstrap': {'enabled': _env_bool('I4F_REFRESHER_AUTOSIGNUP', True),
                           'missing': [p for p in enabled if not _has_creds(p)]},
             'last_results': results}
 

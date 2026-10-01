@@ -16,14 +16,14 @@ This module closes the loop autonomously:
                structural  404 / unexpected payload shape / parse errors —
                            the upstream probably changed -> heal candidate
 
-  2. HEAL    after DSF_SELFHEAL_TRIGGER consecutive structural failures:
+  2. HEAL    after I4F_SELFHEAL_TRIGGER consecutive structural failures:
                a. collect evidence: the provider module source, recent error
                   messages and LIVE excerpts fetched from the upstream site
                   (its JS bundles are grepped for API paths, header names,
                   etc.)
                b. ask a free LLM to rewrite the module. Fixer chain (first
                   configured wins):
-                    DSF_SELFHEAL_FIXER_*   any OpenAI-compatible endpoint
+                    I4F_SELFHEAL_FIXER_*   any OpenAI-compatible endpoint
                     local-self             this very server via 127.0.0.1,
                                            routed to a *working* provider
                c. validate the proposed file in a throwaway subprocess (real
@@ -34,22 +34,22 @@ This module closes the loop autonomously:
 
 Guardrails: whitelisted files only, attempt/incident caps and per-provider
 cooldowns, JSONL audit trail in data/selfheal/history.jsonl, everything can
-turned off with DSF_SELFHEAL=false. The LLM never sees or touches credentials.
+turned off with I4F_SELFHEAL=false. The LLM never sees or touches credentials.
 
 Configuration (env):
-    DSF_SELFHEAL                  false disables everything (default on)
-    DSF_SELFHEAL_PROBE_TTL        seconds between probe cycles (default 600)
-    DSF_SELFHEAL_TRIGGER          consecutive structural failures before a
+    I4F_SELFHEAL                  false disables everything (default on)
+    I4F_SELFHEAL_PROBE_TTL        seconds between probe cycles (default 600)
+    I4F_SELFHEAL_TRIGGER          consecutive structural failures before a
                                   heal is attempted (default 3)
-    DSF_SELFHEAL_COOLDOWN         seconds between heal incidents per provider
+    I4F_SELFHEAL_COOLDOWN         seconds between heal incidents per provider
                                   (default 3600)
-    DSF_SELFHEAL_MAX_ATTEMPTS     LLM patch attempts per incident (default 3)
-    DSF_SELFHEAL_MAX_INCIDENTS    heal incidents per provider per day
+    I4F_SELFHEAL_MAX_ATTEMPTS     LLM patch attempts per incident (default 3)
+    I4F_SELFHEAL_MAX_INCIDENTS    heal incidents per provider per day
                                   (default 4)
-    DSF_SELFHEAL_EXCLUDE          providers never probed/healed
-    DSF_SELFHEAL_FIXER_BASE_URL / _API_KEY / _MODELS
+    I4F_SELFHEAL_EXCLUDE          providers never probed/healed
+    I4F_SELFHEAL_FIXER_BASE_URL / _API_KEY / _MODELS
                                   generic OpenAI-compatible fixer endpoint
-    DSF_SELFHEAL_LOCAL            allow using this server's own routes as the
+    I4F_SELFHEAL_LOCAL            allow using this server's own routes as the
                                   fixer (default true)
 
 CLI:
@@ -169,27 +169,27 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _probe_ttl() -> float:
-    return max(60.0, float(os.getenv('DSF_SELFHEAL_PROBE_TTL', '600') or 600))
+    return max(60.0, float(os.getenv('I4F_SELFHEAL_PROBE_TTL', '600') or 600))
 
 
 def _trigger() -> int:
-    return max(1, int(os.getenv('DSF_SELFHEAL_TRIGGER', '3') or 3))
+    return max(1, int(os.getenv('I4F_SELFHEAL_TRIGGER', '3') or 3))
 
 
 def _cooldown() -> float:
-    return max(60.0, float(os.getenv('DSF_SELFHEAL_COOLDOWN', '3600') or 3600))
+    return max(60.0, float(os.getenv('I4F_SELFHEAL_COOLDOWN', '3600') or 3600))
 
 
 def _max_attempts() -> int:
-    return max(1, int(os.getenv('DSF_SELFHEAL_MAX_ATTEMPTS', '3') or 3))
+    return max(1, int(os.getenv('I4F_SELFHEAL_MAX_ATTEMPTS', '3') or 3))
 
 
 def _max_incidents() -> int:
-    return max(1, int(os.getenv('DSF_SELFHEAL_MAX_INCIDENTS', '4') or 4))
+    return max(1, int(os.getenv('I4F_SELFHEAL_MAX_INCIDENTS', '4') or 4))
 
 
 def _heal_dir() -> Path:
-    base = (os.getenv('DSF_SELFHEAL_DIR') or os.getenv('COOKIES_DIR')
+    base = (os.getenv('I4F_SELFHEAL_DIR') or os.getenv('COOKIES_DIR')
             or str(_BASE.parent / 'data'))
     path = Path(base) / 'selfheal'
     (path / 'backups').mkdir(parents=True, exist_ok=True)
@@ -266,6 +266,61 @@ def _probe_once(name: str) -> Tuple[str, str]:
             if verdict.startswith('unreachable'):
                 return 'network', verdict
             return 'structural', verdict
+        if name == 'chatgpt':
+            # list_models proves nothing: /backend-api/models answers even
+            # when generation is blocked by Sentinel. Probe the transport
+            # instead: the anonymous relay (no creds needed) and the HTTP
+            # gate when credentials exist.
+            from .providers import chatgpt_provider as cp
+            from .providers.base import http_post_stream
+            if cp._relay_enabled():
+                try:
+                    from dsk.chatgpt_relay import get_relay
+                    relay = get_relay()
+                    if relay._alive():
+                        return 'ok', 'browser relay ready (anonymous surface)'
+                    return 'ok', 'browser relay enabled (starts on first stream)'
+                except Exception as e:  # noqa: BLE001
+                    logger.warning('chatgpt relay probe failed: %s', e)
+                    if not cp._has_credentials():
+                        return 'network', f'relay unavailable: {e}'
+            if not cp._has_credentials():
+                return 'auth', 'no credentials and relay disabled'
+            from .providers.jar import load_jar as _load_jar
+            jar = _load_jar('chatgpt') or {}
+            token = (jar.get('accessToken') or '').strip()
+            headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) '
+                                     'AppleWebKit/537.36 Chrome/126 Safari/537.36'}
+            if token:
+                headers['Authorization'] = f'Bearer {token}'
+            resp = http_post_stream(
+                'https://chatgpt.com/backend-api/sentinel/chat-requirements',
+                headers=headers, json_body={}, cookies=jar or None)
+            if resp.status_code == 200:
+                return 'ok', 'sentinel gate reachable (HTTP path up)'
+            if resp.status_code in (401, 403):
+                return 'auth', f'sentinel rejected credentials (HTTP {resp.status_code})'
+            return 'network', f'sentinel gate HTTP {resp.status_code}'
+        if name == 'gemini':
+            # Honest credential check: the jar must hold REAL Google cookies,
+            # not placeholder values pasted during tests. Listing models
+            # without them proves nothing.
+            from .providers.jar import load_jar as _load_jar
+            jar = _load_jar('gemini') or {}
+            psid = (jar.get('__Secure-1PSID') or jar.get('SID') or '').strip()
+            real = bool(psid) and 'paste' not in psid.lower() \
+                and not psid.startswith('__Secure-1PSID')
+            if not real:
+                return 'auth', ('no Google session cookies configured — paste '
+                                '__Secure-1PSID cookies of a logged-in '
+                                'gemini.google.com session in the providers UI')
+            module = importlib.import_module(_PROVIDER_MODULES[name])
+            provider = getattr(module, _PROVIDER_CLASSES[name])()
+            models = provider.list_models()
+            if not models:
+                return 'structural', ('cookies present but 0 models discovered '
+                                      '(session may be expired)')
+            return 'ok', f'{len(models)} models'
         module = importlib.import_module(_PROVIDER_MODULES[name])
         provider = getattr(module, _PROVIDER_CLASSES[name])()
         if not provider.available():
@@ -390,15 +445,15 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
 # --------------------------------------------------------------- fixer chain
 def _fixer_candidates() -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
-    base = os.getenv('DSF_SELFHEAL_FIXER_BASE_URL', '').strip().rstrip('/')
+    base = os.getenv('I4F_SELFHEAL_FIXER_BASE_URL', '').strip().rstrip('/')
     if base:
-        key = os.getenv('DSF_SELFHEAL_FIXER_API_KEY', '').strip()
-        for m in [x.strip() for x in os.getenv('DSF_SELFHEAL_FIXER_MODELS', '').split(',')
+        key = os.getenv('I4F_SELFHEAL_FIXER_API_KEY', '').strip()
+        for m in [x.strip() for x in os.getenv('I4F_SELFHEAL_FIXER_MODELS', '').split(',')
                   if x.strip()]:
             out.append({'base': base, 'key': key, 'model': m, 'label': f'fixer:{m}'})
-    if _env_bool('DSF_SELFHEAL_LOCAL', True):
-        out.append({'base': f"http://127.0.0.1:{os.getenv('DSF_PORT', '8000')}",
-                    'key': os.getenv('DSF_API_KEY', '').strip(),
+    if _env_bool('I4F_SELFHEAL_LOCAL', True):
+        out.append({'base': f"http://127.0.0.1:{os.getenv('I4F_PORT', '8000')}",
+                    'key': os.getenv('I4F_API_KEY', '').strip(),
                     'model': '__auto__', 'label': 'local-self'})
     return out
 
@@ -563,12 +618,12 @@ def heal(name: str, reason: str = '',
 
     `fixer`/`validate` are injectable for tests.
     """
-    if not _env_bool('DSF_SELFHEAL', True):
+    if not _env_bool('I4F_SELFHEAL', True):
         return {'healed': False, 'skipped': 'selfheal disabled'}
     if name not in HEALABLE:
         return {'healed': False, 'skipped': f'{name} is not healable'}
     excl = {e.strip().lower() for e in
-            os.getenv('DSF_SELFHEAL_EXCLUDE', '').split(',') if e.strip()}
+            os.getenv('I4F_SELFHEAL_EXCLUDE', '').split(',') if e.strip()}
     if name in excl:
         return {'healed': False, 'skipped': f'{name} excluded'}
     with _STATE.lock:
@@ -687,7 +742,7 @@ def probe_cycle() -> Dict[str, Dict[str, Any]]:
     """Probe every configured provider once; maybe trigger heal / refresh."""
     results: Dict[str, Dict[str, Any]] = {}
     excl = {e.strip().lower() for e in
-            os.getenv('DSF_SELFHEAL_EXCLUDE', '').split(',') if e.strip()}
+            os.getenv('I4F_SELFHEAL_EXCLUDE', '').split(',') if e.strip()}
     for name in HEALABLE:
         if name in excl or not provider_enabled(name) \
                 or not _provider_configured(name):
@@ -744,7 +799,7 @@ def status() -> Dict[str, Any]:
         last_heal = dict(_STATE.last_heal)
         started = _STATE.started
     incidents = {k: v[1] for k, v in _STATE.incidents.items()}
-    return {'enabled': _env_bool('DSF_SELFHEAL', True),
+    return {'enabled': _env_bool('I4F_SELFHEAL', True),
             'daemon': started,
             'probe_ttl': _probe_ttl(),
             'trigger': _trigger(),

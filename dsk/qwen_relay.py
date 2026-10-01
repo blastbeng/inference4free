@@ -185,7 +185,7 @@ class QwenRelay:
 
     # ------------------------------------------------------------- lifecycle
     def enabled(self) -> bool:
-        return os.getenv('DSF_QWEN_RELAY', '1').strip().lower() not in \
+        return os.getenv('I4F_QWEN_RELAY', '1').strip().lower() not in \
             ('0', 'false', 'no', 'off')
 
     def offered(self) -> List[str]:
@@ -325,8 +325,8 @@ class QwenRelay:
             self._page = None
         refresher._ensure_display()
         # When the host egress is WAF-punished (completions silently held),
-        # DSF_QWEN_PROXY routes the relay browser through a proxy instead.
-        relay_proxy = (os.getenv('DSF_QWEN_PROXY', '') or '').strip() or None
+        # I4F_QWEN_PROXY routes the relay browser through a proxy instead.
+        relay_proxy = (os.getenv('I4F_QWEN_PROXY', '') or '').strip() or None
         last: Optional[Exception] = None
         for attempt in range(3):
             try:

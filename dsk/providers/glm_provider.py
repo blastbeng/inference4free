@@ -56,35 +56,35 @@ GLM_STREAM_URL = f'{GLM_BASE_URL}/backend-api/assistant/stream'
 GLM_ASSISTANT_ID = '65940acff94777010aa6b796'
 GLM_SIGN_SECRET = '8a1317a7468aa3ad86e997d08f3f31cb'
 
-GLM_CONTEXT_LENGTH = int(os.getenv('DSF_GLM_CONTEXT_LENGTH', '128000'))
+GLM_CONTEXT_LENGTH = int(os.getenv('I4F_GLM_CONTEXT_LENGTH', '128000'))
 # The z.ai WEB transport (chat.z.ai in a browser) silently stops answering
 # somewhere between 40k and 100k prompt characters — declare a realistic
 # context so llmtrim trims the conversation BEFORE it reaches the page.
-ZAI_WEB_CONTEXT = int(os.getenv('DSF_ZAI_CONTEXT_LENGTH', '10000'))
-GLM_MAX_OUTPUT = int(os.getenv('DSF_GLM_MAX_OUTPUT', '8192'))
+ZAI_WEB_CONTEXT = int(os.getenv('I4F_ZAI_CONTEXT_LENGTH', '10000'))
+GLM_MAX_OUTPUT = int(os.getenv('I4F_GLM_MAX_OUTPUT', '8192'))
 # The z.ai WEB transport generates freely (no upstream output cap is
 # enforced), so reserving GLM_MAX_OUTPUT from the small 10k-token context
 # would leave almost no room for the conversation. Reserve a modest
 # completion window instead.
-ZAI_WEB_MAX_OUTPUT = int(os.getenv('DSF_ZAI_MAX_OUTPUT', '2048'))
+ZAI_WEB_MAX_OUTPUT = int(os.getenv('I4F_ZAI_MAX_OUTPUT', '2048'))
 
 # Browser transport tuning (see _ZaiBrowser).
-ZAI_HEADLESS = os.getenv('DSF_ZAI_HEADLESS', '').strip().lower() in ('1', 'true', 'yes')
-ZAI_START_TIMEOUT = int(os.getenv('DSF_ZAI_START_TIMEOUT', '90'))
+ZAI_HEADLESS = os.getenv('I4F_ZAI_HEADLESS', '').strip().lower() in ('1', 'true', 'yes')
+ZAI_START_TIMEOUT = int(os.getenv('I4F_ZAI_START_TIMEOUT', '90'))
 # Idle/total bounds also cap how long a wedged browser request holds the
 # singleton session lock after a client has already timed out (defaults
 # tuned so the lock frees before typical client timeouts cascade).
-ZAI_IDLE_TIMEOUT = int(os.getenv('DSF_ZAI_IDLE_TIMEOUT', '60'))
-ZAI_TOTAL_TIMEOUT = int(os.getenv('DSF_ZAI_TOTAL_TIMEOUT', '300'))
+ZAI_IDLE_TIMEOUT = int(os.getenv('I4F_ZAI_IDLE_TIMEOUT', '60'))
+ZAI_TOTAL_TIMEOUT = int(os.getenv('I4F_ZAI_TOTAL_TIMEOUT', '300'))
 # Bounded page-load: DrissionPage's page.get() waits FOREVER for the 'normal'
 # load event otherwise — a hung z.ai page stalled every GLM request.
-ZAI_LOAD_TIMEOUT = int(os.getenv('DSF_ZAI_LOAD_TIMEOUT', '30'))
+ZAI_LOAD_TIMEOUT = int(os.getenv('I4F_ZAI_LOAD_TIMEOUT', '30'))
 # Max time a queued request waits for the browser session slot (FIFO). With
 # concurrency, parallel glm requests queue here instead of failing fast.
-ZAI_BUSY_TIMEOUT = int(os.getenv('DSF_ZAI_BUSY_TIMEOUT', '180'))
+ZAI_BUSY_TIMEOUT = int(os.getenv('I4F_ZAI_BUSY_TIMEOUT', '180'))
 
 # Dynamic z.ai model discovery cache.
-_ZAI_MODELS_TTL = int(os.getenv('DSF_ZAI_MODELS_TTL', '900'))
+_ZAI_MODELS_TTL = int(os.getenv('I4F_ZAI_MODELS_TTL', '900'))
 _ZAI_DYNAMIC: List[Dict[str, Any]] = []
 _ZAI_DYNAMIC_AT = 0.0
 _ZAI_DYNAMIC_LOCK = threading.Lock()
@@ -227,7 +227,7 @@ def _zai_dynamic_models(no_proxy: bool = False) -> List[Dict[str, Any]]:
 
 
 def _browser_enabled() -> bool:
-    raw = os.getenv('DSF_ZAI_BROWSER', 'true').strip().lower()
+    raw = os.getenv('I4F_ZAI_BROWSER', 'true').strip().lower()
     return raw not in ('0', 'false', 'no', 'off')
 
 
@@ -592,7 +592,7 @@ class _ZaiBrowser:
             ) -> Generator[Dict[str, Any], None, None]:
         # Anonymous z.ai sessions expire server-side after some idle time;
         # a stale page fails with 'no content' and costs a full retry.
-        # Proactively recycle pages idle beyond DSF_ZAI_STALE_AFTER.
+        # Proactively recycle pages idle beyond I4F_ZAI_STALE_AFTER.
         if (self._page is not None and self._last_used > 0
                 and time.time() - self._last_used > _ZAI_STALE_AFTER):
             logger.debug('z.ai session idle %.0fs — recycling',
@@ -741,7 +741,7 @@ class _ZaiBrowser:
 # next ask (their session expires server-side and would fail with 'no
 # content', costing a full retry cycle).
 _ZAI_STALE_AFTER = max(60.0, float(
-    os.getenv('DSF_ZAI_STALE_AFTER', '600') or 600))
+    os.getenv('I4F_ZAI_STALE_AFTER', '600') or 600))
 
 
 def _zai_parallel() -> int:
@@ -751,7 +751,7 @@ def _zai_parallel() -> int:
     simultaneously; each extra session costs one Chromium (~400 MB), and
     pages are only spawned when requests actually overlap."""
     try:
-        return max(1, min(4, int(os.getenv('DSF_ZAI_PARALLEL', '1'))))
+        return max(1, min(4, int(os.getenv('I4F_ZAI_PARALLEL', '1'))))
     except ValueError:
         return 1
 
@@ -948,7 +948,7 @@ class GlmProvider(Provider):
             return self._stream_chatglm(prompt, thinking, no_proxy=no_proxy)
         if not _browser_enabled():
             raise ProviderUnavailableError(
-                'z.ai browser transport is disabled (DSF_ZAI_BROWSER=false)')
+                'z.ai browser transport is disabled (I4F_ZAI_BROWSER=false)')
         return _zai_ask(prompt, upstream, thinking, no_proxy=no_proxy)
 
     # ------------------------------------------------------------- chatglm.cn

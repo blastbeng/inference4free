@@ -39,8 +39,8 @@ KIMI_BASE_URL = 'https://www.kimi.com'
 KIMI_CHAT_URL = (f'{KIMI_BASE_URL}/apiv2/kimi.gateway.chat.v1.ChatService'
                  '/Chat')
 
-KIMI_CONTEXT_LENGTH = int(os.getenv('DSF_KIMI_CONTEXT_LENGTH', '256000'))
-KIMI_MAX_OUTPUT = int(os.getenv('DSF_KIMI_MAX_OUTPUT', '8192'))
+KIMI_CONTEXT_LENGTH = int(os.getenv('I4F_KIMI_CONTEXT_LENGTH', '256000'))
+KIMI_MAX_OUTPUT = int(os.getenv('I4F_KIMI_MAX_OUTPUT', '8192'))
 
 STAGE_NAME_THINKING = 'STAGE_NAME_THINKING'
 

@@ -38,8 +38,8 @@ GROK_BASE_URL = 'https://grok.com'
 GROK_NEW_URL = f'{GROK_BASE_URL}/rest/app-chat/conversations/new'
 GROK_ASSETS_URL = 'https://assets.grok.com'
 
-GROK_CONTEXT_LENGTH = int(os.getenv('DSF_GROK_CONTEXT_LENGTH', '131072'))
-GROK_MAX_OUTPUT = int(os.getenv('DSF_GROK_MAX_OUTPUT', '8192'))
+GROK_CONTEXT_LENGTH = int(os.getenv('I4F_GROK_CONTEXT_LENGTH', '131072'))
+GROK_MAX_OUTPUT = int(os.getenv('I4F_GROK_MAX_OUTPUT', '8192'))
 
 _USER_AGENT = (
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) '

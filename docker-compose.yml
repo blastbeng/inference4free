@@ -1,10 +1,10 @@
 services:
-  deepseek4free:
+  inference4free:
     build: .
-    image: blastbeng/deepseek4free:latest
+    image: blastbeng/inference4free:latest
     # Always build locally; never pull the image from a registry
     pull_policy: build
-    container_name: deepseek4free
+    container_name: inference4free
     # Lifecycle managed by systemd (docker-compose@.service)
     restart: no
     # Container-level health state (visible in `docker ps`); hung processes
@@ -22,7 +22,7 @@ services:
         max-size: "20m"
         max-file: "3"
     ports:
-      - "${DSF_PORT:-8000}:8000"
+      - "${I4F_PORT:-8000}:8000"
     # Every documented knob in .env reaches the container automatically —
     # no per-var passthrough maintenance. The environment: block below
     # takes precedence and pins the container-internal bind points.
@@ -31,18 +31,18 @@ services:
         required: false
     environment:
       # The container ALWAYS binds 0.0.0.0:8000; the host port comes from
-      # the ports: mapping (${DSF_PORT}). Never let .env leak these.
-      - DSF_PORT=8000
-      - DSF_HOST=0.0.0.0
+      # the ports: mapping (${I4F_PORT}). Never let .env leak these.
+      - I4F_PORT=8000
+      - I4F_HOST=0.0.0.0
       # Optional manual override only — the credential bot creates and renews
       # accounts automatically; leave empty for fully autonomous operation.
       - DEEPSEEK_AUTH_TOKEN=${DEEPSEEK_AUTH_TOKEN:-}
       # Optional: require clients to send this as their API key
-      - DSF_API_KEY=${DSF_API_KEY:-}
+      - I4F_API_KEY=${I4F_API_KEY:-}
       # Optional: override model names exposed on /v1/models
-      - DSF_MODEL_THINKER=${DSF_MODEL_THINKER:-deepseek-reasoner}
-      - DSF_MODEL_FAST=${DSF_MODEL_FAST:-deepseek-chat}
-      - DSF_MODEL_SEARCH=${DSF_MODEL_SEARCH:-deepseek-search}
+      - I4F_MODEL_THINKER=${I4F_MODEL_THINKER:-deepseek-reasoner}
+      - I4F_MODEL_FAST=${I4F_MODEL_FAST:-deepseek-chat}
+      - I4F_MODEL_SEARCH=${I4F_MODEL_SEARCH:-deepseek-search}
       # Gemini web-chat session cookies (reverse-engineered, no official API key)
       - GEMINI_1PSID=${GEMINI_1PSID:-}
       - GEMINI_1PSIDTS=${GEMINI_1PSIDTS:-}
@@ -71,87 +71,87 @@ services:
       - PERPLEXITY_COOKIES=${PERPLEXITY_COOKIES:-}
       - GLM_REFRESH_TOKEN=${GLM_REFRESH_TOKEN:-}
       - GLM_COOKIES=${GLM_COOKIES:-}
-      - DSF_PROVIDERS=${DSF_PROVIDERS:-}
-      - DSF_ZAI_BROWSER=${DSF_ZAI_BROWSER:-true}
-      - DSF_ZAI_HEADLESS=${DSF_ZAI_HEADLESS:-false}
-      - DSF_ZAI_START_TIMEOUT=${DSF_ZAI_START_TIMEOUT:-90}
-      - DSF_ZAI_IDLE_TIMEOUT=${DSF_ZAI_IDLE_TIMEOUT:-60}
-      - DSF_ZAI_TOTAL_TIMEOUT=${DSF_ZAI_TOTAL_TIMEOUT:-300}
-      - DSF_ZAI_BUSY_TIMEOUT=${DSF_ZAI_BUSY_TIMEOUT:-180}
-      - DSF_ZAI_CONTEXT_LENGTH=${DSF_ZAI_CONTEXT_LENGTH:-10000}
-      - DSF_ZAI_PARALLEL=${DSF_ZAI_PARALLEL:-1}
-      - DSF_ZAI_STALE_AFTER=${DSF_ZAI_STALE_AFTER:-600}
-      - DSF_ZAI_MAX_OUTPUT=${DSF_ZAI_MAX_OUTPUT:-2048}
-      - DSF_CONTEXT_LENGTH=${DSF_CONTEXT_LENGTH:-131072}
-      - DSF_MAX_OUTPUT=${DSF_MAX_OUTPUT:-32768}
-      - DSF_MAX_OUTPUT_THINKING=${DSF_MAX_OUTPUT_THINKING:-65536}
-      - DSF_ZAI_MODELS_TTL=${DSF_ZAI_MODELS_TTL:-900}
-      - DSF_HTTP_CONNECT_TIMEOUT=${DSF_HTTP_CONNECT_TIMEOUT:-6}
-      - DSF_COPILOT_HARVEST=${DSF_COPILOT_HARVEST:-true}
+      - I4F_PROVIDERS=${I4F_PROVIDERS:-}
+      - I4F_ZAI_BROWSER=${I4F_ZAI_BROWSER:-true}
+      - I4F_ZAI_HEADLESS=${I4F_ZAI_HEADLESS:-false}
+      - I4F_ZAI_START_TIMEOUT=${I4F_ZAI_START_TIMEOUT:-90}
+      - I4F_ZAI_IDLE_TIMEOUT=${I4F_ZAI_IDLE_TIMEOUT:-60}
+      - I4F_ZAI_TOTAL_TIMEOUT=${I4F_ZAI_TOTAL_TIMEOUT:-300}
+      - I4F_ZAI_BUSY_TIMEOUT=${I4F_ZAI_BUSY_TIMEOUT:-180}
+      - I4F_ZAI_CONTEXT_LENGTH=${I4F_ZAI_CONTEXT_LENGTH:-10000}
+      - I4F_ZAI_PARALLEL=${I4F_ZAI_PARALLEL:-1}
+      - I4F_ZAI_STALE_AFTER=${I4F_ZAI_STALE_AFTER:-600}
+      - I4F_ZAI_MAX_OUTPUT=${I4F_ZAI_MAX_OUTPUT:-2048}
+      - I4F_CONTEXT_LENGTH=${I4F_CONTEXT_LENGTH:-131072}
+      - I4F_MAX_OUTPUT=${I4F_MAX_OUTPUT:-32768}
+      - I4F_MAX_OUTPUT_THINKING=${I4F_MAX_OUTPUT_THINKING:-65536}
+      - I4F_ZAI_MODELS_TTL=${I4F_ZAI_MODELS_TTL:-900}
+      - I4F_HTTP_CONNECT_TIMEOUT=${I4F_HTTP_CONNECT_TIMEOUT:-6}
+      - I4F_COPILOT_HARVEST=${I4F_COPILOT_HARVEST:-true}
       # Dynamic model discovery TTL + fallback chains
-      - DSF_MODELS_TTL=${DSF_MODELS_TTL:-300}
-      - DSF_FALLBACKS=${DSF_FALLBACKS:-}
-      - DSF_DEFAULT_FALLBACKS=${DSF_DEFAULT_FALLBACKS:-}
+      - I4F_MODELS_TTL=${I4F_MODELS_TTL:-300}
+      - I4F_FALLBACKS=${I4F_FALLBACKS:-}
+      - I4F_DEFAULT_FALLBACKS=${I4F_DEFAULT_FALLBACKS:-}
       # Outbound proxy rotation (dsk/proxies.py): fast-only free proxies + direct
-      - DSF_PROXY=${DSF_PROXY:-}
-      - DSF_PROXIES=${DSF_PROXIES:-}
-      - DSF_PROXY_MAX_LATENCY=${DSF_PROXY_MAX_LATENCY:-800}
-      - DSF_PROXY_DIRECT=${DSF_PROXY_DIRECT:-true}
-      - DSF_LLMTRIM=${DSF_LLMTRIM:-true}
-      - DSF_PROXY_AUTO=${DSF_PROXY_AUTO:-false}
-      - DSF_PROXY_SOURCES=${DSF_PROXY_SOURCES:-}
-      - DSF_PROXY_MAX_POOL=${DSF_PROXY_MAX_POOL:-400}
-      - DSF_PROXY_LIST_URL=${DSF_PROXY_LIST_URL:-}
-      - DSF_PROXY_LIST_URLS=${DSF_PROXY_LIST_URLS:-}
-      - DSF_PROXY_LIST_TTL=${DSF_PROXY_LIST_TTL:-1800}
-      - DSF_PROXY_CHECK=${DSF_PROXY_CHECK:-false}
-      - DSF_PROXY_CHECK_URL=${DSF_PROXY_CHECK_URL:-https://api.ipify.org?format=json}
-      - DSF_PROXY_CHECK_TTL=${DSF_PROXY_CHECK_TTL:-1800}
-      - DSF_PROXY_CHECK_TIMEOUT=${DSF_PROXY_CHECK_TIMEOUT:-4}
-      - DSF_PROXY_CHECK_CONCURRENCY=${DSF_PROXY_CHECK_CONCURRENCY:-24}
-      - DSF_PROXY_ENSURE_TIMEOUT=${DSF_PROXY_ENSURE_TIMEOUT:-30}
-      - DSF_PROXY_MODE=${DSF_PROXY_MODE:-random}
-      - DSF_PROXY_EXCLUDE=${DSF_PROXY_EXCLUDE:-}
-      - DSF_PROXY_COOLDOWN=${DSF_PROXY_COOLDOWN:-120}
-      - DSF_PROXY_ROTATE_TTL=${DSF_PROXY_ROTATE_TTL:-300}
+      - I4F_PROXY=${I4F_PROXY:-}
+      - I4F_PROXIES=${I4F_PROXIES:-}
+      - I4F_PROXY_MAX_LATENCY=${I4F_PROXY_MAX_LATENCY:-800}
+      - I4F_PROXY_DIRECT=${I4F_PROXY_DIRECT:-true}
+      - I4F_LLMTRIM=${I4F_LLMTRIM:-true}
+      - I4F_PROXY_AUTO=${I4F_PROXY_AUTO:-false}
+      - I4F_PROXY_SOURCES=${I4F_PROXY_SOURCES:-}
+      - I4F_PROXY_MAX_POOL=${I4F_PROXY_MAX_POOL:-400}
+      - I4F_PROXY_LIST_URL=${I4F_PROXY_LIST_URL:-}
+      - I4F_PROXY_LIST_URLS=${I4F_PROXY_LIST_URLS:-}
+      - I4F_PROXY_LIST_TTL=${I4F_PROXY_LIST_TTL:-1800}
+      - I4F_PROXY_CHECK=${I4F_PROXY_CHECK:-false}
+      - I4F_PROXY_CHECK_URL=${I4F_PROXY_CHECK_URL:-https://api.ipify.org?format=json}
+      - I4F_PROXY_CHECK_TTL=${I4F_PROXY_CHECK_TTL:-1800}
+      - I4F_PROXY_CHECK_TIMEOUT=${I4F_PROXY_CHECK_TIMEOUT:-4}
+      - I4F_PROXY_CHECK_CONCURRENCY=${I4F_PROXY_CHECK_CONCURRENCY:-24}
+      - I4F_PROXY_ENSURE_TIMEOUT=${I4F_PROXY_ENSURE_TIMEOUT:-30}
+      - I4F_PROXY_MODE=${I4F_PROXY_MODE:-random}
+      - I4F_PROXY_EXCLUDE=${I4F_PROXY_EXCLUDE:-}
+      - I4F_PROXY_COOLDOWN=${I4F_PROXY_COOLDOWN:-120}
+      - I4F_PROXY_ROTATE_TTL=${I4F_PROXY_ROTATE_TTL:-300}
       # Self-maintenance: upstream-breakage detection + LLM auto-patch
       # (dsk/selfheal.py); audit trail under /data/selfheal
-      - DSF_SELFHEAL=${DSF_SELFHEAL:-true}
-      - DSF_SELFHEAL_PROBE_TTL=${DSF_SELFHEAL_PROBE_TTL:-600}
-      - DSF_SELFHEAL_TRIGGER=${DSF_SELFHEAL_TRIGGER:-3}
-      - DSF_SELFHEAL_COOLDOWN=${DSF_SELFHEAL_COOLDOWN:-3600}
-      - DSF_SELFHEAL_MAX_ATTEMPTS=${DSF_SELFHEAL_MAX_ATTEMPTS:-3}
-      - DSF_SELFHEAL_MAX_INCIDENTS=${DSF_SELFHEAL_MAX_INCIDENTS:-4}
-      - DSF_SELFHEAL_EXCLUDE=${DSF_SELFHEAL_EXCLUDE:-}
-      - DSF_SELFHEAL_FIXER_BASE_URL=${DSF_SELFHEAL_FIXER_BASE_URL:-}
-      - DSF_SELFHEAL_FIXER_API_KEY=${DSF_SELFHEAL_FIXER_API_KEY:-}
-      - DSF_SELFHEAL_FIXER_MODELS=${DSF_SELFHEAL_FIXER_MODELS:-}
-      - DSF_SELFHEAL_LOCAL=${DSF_SELFHEAL_LOCAL:-true}
+      - I4F_SELFHEAL=${I4F_SELFHEAL:-true}
+      - I4F_SELFHEAL_PROBE_TTL=${I4F_SELFHEAL_PROBE_TTL:-600}
+      - I4F_SELFHEAL_TRIGGER=${I4F_SELFHEAL_TRIGGER:-3}
+      - I4F_SELFHEAL_COOLDOWN=${I4F_SELFHEAL_COOLDOWN:-3600}
+      - I4F_SELFHEAL_MAX_ATTEMPTS=${I4F_SELFHEAL_MAX_ATTEMPTS:-3}
+      - I4F_SELFHEAL_MAX_INCIDENTS=${I4F_SELFHEAL_MAX_INCIDENTS:-4}
+      - I4F_SELFHEAL_EXCLUDE=${I4F_SELFHEAL_EXCLUDE:-}
+      - I4F_SELFHEAL_FIXER_BASE_URL=${I4F_SELFHEAL_FIXER_BASE_URL:-}
+      - I4F_SELFHEAL_FIXER_API_KEY=${I4F_SELFHEAL_FIXER_API_KEY:-}
+      - I4F_SELFHEAL_FIXER_MODELS=${I4F_SELFHEAL_FIXER_MODELS:-}
+      - I4F_SELFHEAL_LOCAL=${I4F_SELFHEAL_LOCAL:-true}
       # Credential renewal bot (dsk/refresher.py): keeps jars/tokens fresh
-      - DSF_REFRESHER=${DSF_REFRESHER:-true}
-      - DSF_REFRESHER_TTL=${DSF_REFRESHER_TTL:-21600}
-      - DSF_REFRESHER_COOLDOWN=${DSF_REFRESHER_COOLDOWN:-1800}
-      - DSF_REFRESHER_MAX_RENEWS=${DSF_REFRESHER_MAX_RENEWS:-6}
-      - DSF_REFRESHER_EXCLUDE=${DSF_REFRESHER_EXCLUDE:-}
-      - DSF_REFRESHER_LOGIN=${DSF_REFRESHER_LOGIN:-true}
-      - DSF_REFRESHER_HEADLESS=${DSF_REFRESHER_HEADLESS:-true}
-      - DSF_REFRESHER_AUTOSIGNUP=${DSF_REFRESHER_AUTOSIGNUP:-true}
-      - DSF_SIGNUP_PROXY=${DSF_SIGNUP_PROXY:-}
+      - I4F_REFRESHER=${I4F_REFRESHER:-true}
+      - I4F_REFRESHER_TTL=${I4F_REFRESHER_TTL:-21600}
+      - I4F_REFRESHER_COOLDOWN=${I4F_REFRESHER_COOLDOWN:-1800}
+      - I4F_REFRESHER_MAX_RENEWS=${I4F_REFRESHER_MAX_RENEWS:-6}
+      - I4F_REFRESHER_EXCLUDE=${I4F_REFRESHER_EXCLUDE:-}
+      - I4F_REFRESHER_LOGIN=${I4F_REFRESHER_LOGIN:-true}
+      - I4F_REFRESHER_HEADLESS=${I4F_REFRESHER_HEADLESS:-true}
+      - I4F_REFRESHER_AUTOSIGNUP=${I4F_REFRESHER_AUTOSIGNUP:-true}
+      - I4F_SIGNUP_PROXY=${I4F_SIGNUP_PROXY:-}
       - DEEPSEEK_LOGIN_EMAIL=${DEEPSEEK_LOGIN_EMAIL:-}
       - DEEPSEEK_LOGIN_PASSWORD=${DEEPSEEK_LOGIN_PASSWORD:-}
       - GEMINI_LOGIN_EMAIL=${GEMINI_LOGIN_EMAIL:-}
       - GEMINI_LOGIN_PASSWORD=${GEMINI_LOGIN_PASSWORD:-}
       - CHATGPT_LOGIN_EMAIL=${CHATGPT_LOGIN_EMAIL:-}
       - CHATGPT_LOGIN_PASSWORD=${CHATGPT_LOGIN_PASSWORD:-}
-      - DSF_MAIL_AUTOGEN=${DSF_MAIL_AUTOGEN:-true}
-      - DSF_MAIL_DOMAIN=${DSF_MAIL_DOMAIN:-}
-      - DSF_MAIL_IMAP_HOST=${DSF_MAIL_IMAP_HOST:-}
-      - DSF_MAIL_IMAP_PORT=${DSF_MAIL_IMAP_PORT:-993}
-      - DSF_MAIL_IMAP_USER=${DSF_MAIL_IMAP_USER:-}
-      - DSF_MAIL_IMAP_PASS=${DSF_MAIL_IMAP_PASS:-}
-      - DSF_MAIL_OTP_SENDER=${DSF_MAIL_OTP_SENDER:-deepseek}
-      - DSF_MAIL_OTP_MAX_AGE=${DSF_MAIL_OTP_MAX_AGE:-30}
-      - DSF_MAIL_OTP_REGEX=${DSF_MAIL_OTP_REGEX:-}
+      - I4F_MAIL_AUTOGEN=${I4F_MAIL_AUTOGEN:-true}
+      - I4F_MAIL_DOMAIN=${I4F_MAIL_DOMAIN:-}
+      - I4F_MAIL_IMAP_HOST=${I4F_MAIL_IMAP_HOST:-}
+      - I4F_MAIL_IMAP_PORT=${I4F_MAIL_IMAP_PORT:-993}
+      - I4F_MAIL_IMAP_USER=${I4F_MAIL_IMAP_USER:-}
+      - I4F_MAIL_IMAP_PASS=${I4F_MAIL_IMAP_PASS:-}
+      - I4F_MAIL_OTP_SENDER=${I4F_MAIL_OTP_SENDER:-deepseek}
+      - I4F_MAIL_OTP_MAX_AGE=${I4F_MAIL_OTP_MAX_AGE:-30}
+      - I4F_MAIL_OTP_REGEX=${I4F_MAIL_OTP_REGEX:-}
       - DOCKERMODE=true
     extra_hosts:
       # host-gateway access for host-published operator services

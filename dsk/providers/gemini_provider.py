@@ -61,7 +61,7 @@ GENERATE_URL = (f'{BASE_URL}/_/BardChatUi/data/assistant.lamda.'
 BATCH_EXECUTE_URL = f'{BASE_URL}/_/BardChatUi/data/batchexecute'
 UPLOAD_URL = 'https://content-push.googleapis.com/upload'
 # Stable per-account push id; the web app sends it with every file upload.
-DEFAULT_PUSH_ID = os.getenv('DSF_GEMINI_PUSH_ID', 'feeds/mcudyrk2a4khkz')
+DEFAULT_PUSH_ID = os.getenv('I4F_GEMINI_PUSH_ID', 'feeds/mcudyrk2a4khkz')
 
 GET_USER_STATUS_RPC = 'otAQ7b'
 
@@ -79,8 +79,8 @@ _BASE_HEADERS = {
 
 # Estimated capability metadata advertised on /v1/models for agent tooling
 # (the web app does not expose per-model context windows).
-GEMINI_CONTEXT_LENGTH = int(os.getenv('DSF_GEMINI_CONTEXT_LENGTH', '1048576'))
-GEMINI_MAX_OUTPUT = int(os.getenv('DSF_GEMINI_MAX_OUTPUT', '65536'))
+GEMINI_CONTEXT_LENGTH = int(os.getenv('I4F_GEMINI_CONTEXT_LENGTH', '1048576'))
+GEMINI_MAX_OUTPUT = int(os.getenv('I4F_GEMINI_MAX_OUTPUT', '65536'))
 
 SESSION_TTL = 900.0  # re-scrape SNlM0e/build label every 15 minutes
 

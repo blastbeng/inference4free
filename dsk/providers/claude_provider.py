@@ -48,8 +48,8 @@ CLAUDE_ORGS_URL = f'{CLAUDE_BASE_URL}/api/organizations'
 CLAUDE_CONV_URL = (f'{CLAUDE_BASE_URL}/api/organizations/'
                    '{org}/chat_conversations')
 
-CLAUDE_CONTEXT_LENGTH = int(os.getenv('DSF_CLAUDE_CONTEXT_LENGTH', '200000'))
-CLAUDE_MAX_OUTPUT = int(os.getenv('DSF_CLAUDE_MAX_OUTPUT', '8192'))
+CLAUDE_CONTEXT_LENGTH = int(os.getenv('I4F_CLAUDE_CONTEXT_LENGTH', '200000'))
+CLAUDE_MAX_OUTPUT = int(os.getenv('I4F_CLAUDE_MAX_OUTPUT', '8192'))
 ORG_TTL = 600.0
 
 _USER_AGENT = (
