@@ -136,6 +136,12 @@ services:
       - I4F_REFRESHER_LOGIN=${I4F_REFRESHER_LOGIN:-true}
       - I4F_REFRESHER_HEADLESS=${I4F_REFRESHER_HEADLESS:-true}
       - I4F_REFRESHER_AUTOSIGNUP=${I4F_REFRESHER_AUTOSIGNUP:-true}
+      # Anonymous providers whose refusals are egress-shaped (Copilot geo-block,
+      # Perplexity datacenter-IP authwall): the ladder rotates their proxy
+      # assignment instead of running the credential ladder they don't have.
+      - I4F_EGRESS_ROTATE=${I4F_EGRESS_ROTATE:-copilot,perplexity}
+      - I4F_BREAKER_N=${I4F_BREAKER_N:-3}
+      - I4F_BREAKER_COOLDOWN_S=${I4F_BREAKER_COOLDOWN_S:-1800}
       - I4F_SIGNUP_PROXY=${I4F_SIGNUP_PROXY:-}
       - DEEPSEEK_LOGIN_EMAIL=${DEEPSEEK_LOGIN_EMAIL:-}
       - DEEPSEEK_LOGIN_PASSWORD=${DEEPSEEK_LOGIN_PASSWORD:-}

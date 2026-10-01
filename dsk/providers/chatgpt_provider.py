@@ -70,12 +70,25 @@ _USER_AGENT = (
     'Chrome/120.0.0.0 Safari/537.36'
 )
 
-# The one cookie that proves a chatgpt.com session: /api/auth/session accepts
-# exactly this and returns a fresh bearer for it. The accessToken the web
-# app stores in localStorage is NOT a cookie — when operators paste it (via
-# the providers UI or the jar) it is a usable BEARER, not a session cookie.
+# The cookie(s) that prove a chatgpt.com session: /api/auth/session returns a
+# fresh bearer for them. The accessToken the web app stores in localStorage is
+# NOT a cookie — when operators paste it (via the providers UI or the jar) it
+# is a usable BEARER, not a session cookie. 2026-10: the web app moved to
+# ``auth-session-minimized`` (+ ``oai-sc``); a jar holding ONLY the legacy
+# ``__Secure-next-auth.session-token`` is now the rare operator-pasted case.
 SESSION_COOKIE = '__Secure-next-auth.session-token'
+SESSION_COOKIES_2026 = ('auth-session-minimized', 'oai-sc')
 TOKEN_KEY = 'accessToken'
+
+
+def _has_session_cookie(cookies: Dict[str, str]) -> bool:
+    """True when the cookie set can authenticate /api/auth/session.
+
+    Accepts the legacy ``__Secure-next-auth.session-token`` and the 2026
+    ``auth-session-minimized``/``oai-sc`` scheme the web app now sets."""
+    if cookies.get(SESSION_COOKIE):
+        return True
+    return any(cookies.get(c) for c in SESSION_COOKIES_2026)
 
 
 def _relay_enabled() -> bool:
@@ -275,14 +288,15 @@ class ChatGPTProvider(Provider):
             if not refresh and self._token and \
                     time.monotonic() - self._token_at < TOKEN_TTL:
                 return self._token
-            if not cookies.get(SESSION_COOKIE) and not jar_token:
+            if not _has_session_cookie(cookies) and not jar_token:
                 raise ProviderAuthError(
                     'No ChatGPT credentials. Set CHATGPT_ACCESS_TOKEN, or provide '
-                    'the __Secure-next-auth.session-token cookies of a logged-in '
-                    'chatgpt.com session via CHATGPT_SESSION_COOKIES or '
-                    'chatgpt_cookies.json.'
+                    'the logged-in chatgpt.com session cookies '
+                    '(__Secure-next-auth.session-token, or the 2026 '
+                    'auth-session-minimized scheme) via CHATGPT_SESSION_COOKIES '
+                    'or chatgpt_cookies.json.'
                 )
-            if not cookies.get(SESSION_COOKIE):
+            if not _has_session_cookie(cookies):
                 # bearer only (pasted by the operator): use it as-is
                 self._token = jar_token
                 self._token_at = time.monotonic()

@@ -54,6 +54,17 @@ from typing import Any, Dict, List, Optional, Tuple
 MAILTM_API = 'https://api.mail.tm'
 MAILGW_API = 'https://api.mail.gw'
 TEMPMAIL_API = 'https://api.tempmail.lol'
+
+# ``after_ts`` guards against consuming a PREVIOUS signup attempt's
+# already-used link/code, not against the submit round-trip: the form
+# submit helper returns tens of seconds after the send actually fires, so
+# the current run's own email can carry a timestamp slightly BEFORE
+# ``sent_ts`` (observed 26-28s with emailnator). Mail younger than this
+# grace must never be cut; a previous run's mail is minutes older anyway.
+_AFTER_TS_GRACE_S = 120.0
+
+# percent-encoded https URL inside click-tracker query strings
+_ENC_URL_RE = re.compile(r'https?%3A%2F%2F[^\s"\'<>]+', re.I)
 _EMAILNATOR_BASE = 'https://www.emailnator.com'
 _EMAILNATOR_UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/131.0 Safari/537.36')
@@ -182,7 +193,6 @@ def _mailtm_fetch_otp(session: Dict[str, Any], sender_needle: str,
             for msg in _items(body):
                 if not isinstance(msg, dict) or msg.get('id') in seen_ids:
                     continue
-                seen_ids.add(msg.get('id'))
                 sender = str((msg.get('from') or {}).get('address', '')).lower()
                 if sender_needle and sender_needle not in sender:
                     continue
@@ -195,6 +205,9 @@ def _mailtm_fetch_otp(session: Dict[str, Any], sender_needle: str,
                                     f"{api}/messages/{msg.get('id')}",
                                     token=session['token'])
                 if mcode == 200:
+                    # blacklist only after a successful body fetch: a one-off
+                    # fetch failure must not hide the message for the window
+                    seen_ids.add(msg.get('id'))
                     otp = _mailtm_extract(full, code_re)
                     if otp:
                         return otp
@@ -424,25 +437,30 @@ def _emailnator_fetch_otp(session: Dict[str, Any], sender_needle: str,
             mid = str(msg.get('id') or '')
             if not mid or mid in seen_ids or msg.get('locked'):
                 continue
-            seen_ids.add(mid)
-            if after_ts is not None:
-                try:
-                    if float(msg.get('timestamp') or 0) <= after_ts:
-                        continue  # stale email: its code was already invalidated
-                except (TypeError, ValueError):
-                    pass
+            ts = _msg_ts(msg)
+            # only skip a provably stale email: backends whose listing
+            # carries no epoch (emailnator) must NOT be cut by after_ts —
+            # ``float(0) <= after_ts`` silently skipped EVERY message and
+            # the fetch timed out while the wanted email sat in the inbox.
+            if after_ts is not None and ts is not None \
+                    and ts <= after_ts - _AFTER_TS_GRACE_S:
+                continue  # stale email: its code was already invalidated
             sender = str(msg.get('from') or '').lower()
             subject = str(msg.get('subject') or '').lower()
             if sender_needle and sender_needle not in sender \
                     and sender_needle not in subject:
                 continue
-            try:
-                age = (time.time() - float(msg.get('timestamp'))) / 60.0
-            except (TypeError, ValueError):
-                age = None
+            age = ((time.time() - ts) / 60.0) if ts is not None else None
             if age is not None and age > max_age_min:
                 continue
-            match = code_re.search(_EMAILNATOR.message_body(mid))
+            body = _EMAILNATOR.message_body(mid)
+            if not body:
+                # transient empty fetch (backend hiccup): leave the message
+                # unblacklisted so the next pass retries it — a one-off
+                # failure must not silence the inbox for the whole window
+                continue
+            seen_ids.add(mid)
+            match = code_re.search(body)
             if match:
                 return match.group(1) or match.group(0)
         time.sleep(6)
@@ -480,7 +498,8 @@ def available() -> bool:
     return True  # mail.tm needs no configuration
 
 
-def create_email() -> Tuple[Optional[Dict[str, Any]], str]:
+def create_email(domain_suffixes: Optional[Tuple[str, ...]] = None,
+                 no_gmail: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
     """Create a throwaway mailbox. Returns (session, error).
 
     Session is a dict with backend/address and (for mail.tm) credentials.
@@ -492,32 +511,57 @@ def create_email() -> Tuple[Optional[Dict[str, Any]], str]:
     is allowlisted where disposable domains are dropped), then tempmail.lol
     (rotating obscure domains), then the well-known mail.tm/mail.gw pools
     (often blocklisted by big providers).
+
+    ``domain_suffixes``: when set, only mailboxes whose address ends with
+    one of these suffixes are accepted and others are regenerated (a few
+    tries). Google's signup outright rejects ``@googlemail.com`` — a pool
+    alias of the same inbox — so the gemini rung filters for @gmail.com.
     """
     if not autogen_enabled():
         return None, 'I4F_MAIL_AUTOGEN disabled'
     backends = (_imap_catchall_create, _emailnator_create,
                 _tempmail_create, _mailtm_create)
+    if no_gmail:
+        # the emailnator pool is gmail-only: Google's signup treats a gmail
+        # address as a username claim ("That username is taken") and rejects
+        # the googlemail.com alias outright, so its rungs need a non-gmail
+        # disposable (tempmail.lol domains pass Google's blocklist).
+        backends = tuple(b for b in backends if b is not _emailnator_create)
     errors: List[str] = []
+
+    def _accepted(session: Optional[Dict[str, Any]]) -> bool:
+        if not session:
+            return False
+        if not domain_suffixes:
+            return True
+        addr = str(session.get('address') or '').lower()
+        return any(addr.endswith(s) for s in domain_suffixes)
+
     for make in backends:
-        try:
-            session = make()
-        except Exception as e:  # noqa: BLE001
-            session = None
-            errors.append(f'{make.__name__}: {type(e).__name__}: {e}')
-        if session:
-            return session, ''
+        for _ in range(4):
+            try:
+                session = make()
+            except Exception as e:  # noqa: BLE001
+                session = None
+                errors.append(f'{make.__name__}: {type(e).__name__}: {e}')
+            if _accepted(session):
+                return session, ''
+        errors.append(f'{make.__name__}: no mailbox matching '
+                      f'{list(domain_suffixes or [])}')
     # public temp-mail backends rate-limit in bursts: one retry pass after a
     # short pause usually gets a mailbox without failing the whole signup
     time.sleep(3.0)
     for make in backends[1:]:  # retry the non-IMAP backends once
-        try:
-            session = make()
-        except Exception as e:  # noqa: BLE001
-            session = None
-            errors.append(f'{make.__name__} retry: {type(e).__name__}: {e}')
-        if session:
-            return session, ''
-    return None, '; '.join(errors) or 'no backend produced a mailbox'
+        for _ in range(4):
+            try:
+                session = make()
+            except Exception as e:  # noqa: BLE001
+                session = None
+                errors.append(f'{make.__name__} retry: '
+                              f'{type(e).__name__}: {e}')
+            if _accepted(session):
+                return session, ''
+    return None, '; '.join(errors[-6:]) or 'no backend produced a mailbox'
 
 
 def fetch_otp(session: Dict[str, Any], max_wait_s: int = 180,
@@ -551,6 +595,258 @@ def fetch_otp(session: Dict[str, Any], max_wait_s: int = 180,
         print(f'[mailgen] fetch_otp failed: {type(e).__name__}: {e}',
               file=__import__('sys').stderr)
         return None
+
+
+_BODY_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _msg_ts(msg: Dict[str, Any]) -> Optional[float]:
+    """Epoch timestamp of a listing entry, or None when it has none.
+
+    Only a plausible epoch (> 2001-09) counts: a missing or display-string
+    field must read as "unknown", never as 0 — an after_ts cut against 0
+    would drop every message the backend cannot date.
+    """
+    try:
+        ts = float(msg.get('timestamp'))
+    except (TypeError, ValueError):
+        return None
+    return ts if ts > 1_000_000_000 else None
+
+
+def _tempmail_messages(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """List the tempmail.lol inbox in the common message shape.
+
+    One GET returns every message with its body inline, so both the
+    listing and the body cache are filled here. ``timestamp`` is derived
+    from the ISO date so :func:`fetch_magic_link`'s ``after_ts`` cut works
+    the same way it does for the emailnator listing.
+    """
+    token = session.get('token') or ''
+    code, body = _http('GET', f'{TEMPMAIL_API}/auth/{token}')
+    if code != 200 or not isinstance(body, dict):
+        return []
+    cache = _BODY_CACHE.setdefault(session.get('address') or '', {})
+    while len(_BODY_CACHE) > 32:  # throwaway mailboxes: bound the cache
+        _BODY_CACHE.pop(next(iter(_BODY_CACHE)), None)
+    out: List[Dict[str, Any]] = []
+    for msg in body.get('email') or []:
+        if not isinstance(msg, dict):
+            continue
+        mid = str(msg.get('date') or '') + str(msg.get('from') or '') \
+            + str(msg.get('subject') or '')
+        if not mid:
+            continue
+        text = '\n'.join(str(msg.get(k) or '')
+                         for k in ('body', 'html', 'subject'))
+        cache[mid] = text
+        age = _iso_age_min(msg.get('date'))
+        out.append({'id': mid, 'from': msg.get('from') or '',
+                    'subject': msg.get('subject') or '',
+                    'timestamp': (time.time() - age * 60.0)
+                    if age is not None else None,
+                    'locked': False})
+    return out
+
+
+def _mailtm_messages(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """List the mail.tm / mail.gw inbox in the common message shape."""
+    api = str(session.get('api') or MAILTM_API)
+    code, body = _http('GET', f'{api}/messages?page=1',
+                       token=session.get('token') or '')
+    if code != 200:
+        return []
+    cache = _BODY_CACHE.setdefault(session.get('address') or '', {})
+    out: List[Dict[str, Any]] = []
+    for msg in _items(body):
+        if not isinstance(msg, dict):
+            continue
+        mid = str(msg.get('id') or '')
+        if not mid:
+            continue
+        text = ''
+        mcode, full = _http('GET', f'{api}/messages/{mid}',
+                            token=session.get('token') or '')
+        if mcode == 200 and isinstance(full, dict):
+            text = str(full.get('text') or '')
+            html = full.get('html')
+            if isinstance(html, list):
+                text += '\n' + '\n'.join(str(h) for h in html)
+            elif isinstance(html, str):
+                text += '\n' + html
+            if not text:
+                text = str(full.get('intro') or '')
+        cache[mid] = text
+        frm = msg.get('from')
+        sender = (frm.get('address') or '') if isinstance(frm, dict) \
+            else str(frm or '')
+        age = _iso_age_min(msg.get('createdAt'))
+        out.append({'id': mid, 'from': sender,
+                    'subject': msg.get('subject') or '',
+                    'timestamp': (time.time() - age * 60.0)
+                    if age is not None else None,
+                    'locked': False})
+    return out
+
+
+def _backend_messages(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """List inbox messages for the session's backend, common shape.
+
+    Returns ``{id, from, subject, timestamp, locked}`` dicts. Every public
+    backend is served — magic-link providers were assumed gmail-only, but
+    the disposable pools (tempmail.lol's rotating obscure domains, the
+    mail.tm/mail.gw pools) still deliver for a meaningful subset of them,
+    so the link/code fetch should look in those inboxes too instead of
+    silently polling nothing for the full timeout.
+    """
+    backend = session.get('backend')
+    try:
+        if backend == 'emailnator-gmail':
+            return _EMAILNATOR.messages(session.get('address') or '')
+        if backend == 'tempmail.lol':
+            return _tempmail_messages(session)
+        if backend in ('mail.tm', 'mail.gw'):
+            return _mailtm_messages(session)
+    except Exception:  # noqa: BLE001
+        return []
+    return []
+
+
+def _backend_body(session: Dict[str, Any], mid: str) -> str:
+    if session.get('backend') == 'emailnator-gmail':
+        try:
+            return _EMAILNATOR.message_body(mid)
+        except Exception:  # noqa: BLE001
+            return ''
+    return (_BODY_CACHE.get(session.get('address') or '') or {}).get(
+        str(mid), '')
+
+
+def _inbox_digest(session: Dict[str, Any], limit: int = 5) -> str:
+    """One-line inbox summary for failure details (what DID arrive?)."""
+    try:
+        msgs = _backend_messages(session)
+    except Exception:  # noqa: BLE001
+        return 'unreadable'
+    if not msgs:
+        return 'empty'
+    parts = []
+    for m in msgs[:limit]:
+        sender = str(m.get('from') or '')[:40]
+        subject = str(m.get('subject') or '')[:60]
+        parts.append(f'{sender}|{subject}')
+    return '; '.join(parts)
+
+
+def debug_magic_candidates(session: Dict[str, Any], url_needle: str,
+                           sender_re: str = r'claude|anthropic',
+                           limit: int = 2) -> str:
+    """Diagnostics for a magic-link miss: for the candidate message(s),
+    was a body fetched at all, did it hold the needle, which URLs showed?"""
+    try:
+        msgs = _backend_messages(session) or []
+    except Exception:  # noqa: BLE001
+        return 'listing failed'
+    pat = re.compile(sender_re, re.I)
+    cands = [m for m in msgs
+             if pat.search(str(m.get('from') or '') + ' '
+                           + str(m.get('subject') or ''))][-limit:]
+    if not cands:
+        return 'no candidate message'
+    out = []
+    url_re = re.compile(r'https?://[^\s"\'<>]+')
+    for m in cands:
+        mid = str(m.get('id') or '')
+        body = str(_backend_body(session, mid)) if mid else ''
+        urls = url_re.findall(body) + [urllib.parse.unquote(e)
+                                       for e in _ENC_URL_RE.findall(body)]
+        hits = [u for u in urls if url_needle.lower() in u.lower()]
+        out.append(f'len={len(body)} needle={"claude.ai" in body} '
+                   f'urls={len(urls)} hit={bool(hits)} '
+                   f'first={(urls[0][:70] if urls else "-")}')
+    return ' | '.join(out)
+
+
+def fetch_magic_link(session: Dict[str, Any], url_needle: str,
+                     sender_needle: str = '', max_wait_s: int = 180,
+                     max_age_min: float = 30.0,
+                     after_ts: Optional[float] = None,
+                     body_needle: str = '',
+                     with_body: bool = False):
+    """Poll the mailbox for a magic-link / verification URL.
+
+    Returns the URL string, or — with ``with_body=True`` — a
+    ``(url, body_text)`` tuple (the body lets callers fall back to a
+    numeric code printed next to the link, e.g. claude's
+    ``fallback_code_configuration`` 6-digit code).
+    """
+    """Poll the mailbox for a magic-link / verification URL and return it.
+
+    Claude (and a growing set of providers) sign up with an emailed *link*
+    rather than a numeric OTP: the email carries a one-time
+    ``https://<host>/magic-link#token`` URL that logs the browser in when
+    opened in the requesting session. This is the link analogue of
+    :func:`fetch_otp` — same shared-inbox hygiene (skip locked messages,
+    honour ``after_ts`` so a previous request's already-used link is never
+    reused, sender/subject needle), but it extracts a URL instead of a code.
+    """
+    if not session:
+        return None
+    needle = (url_needle or '').lower()
+    sender_needle = (sender_needle or '').strip().lower()
+    deadline = time.time() + max_wait_s
+    seen: set = set()    # body fetched OK and did not match: stop refetching
+    empty: set = set()   # body fetch failed (transient): retry next pass
+    url_re = re.compile(r'https?://[^\s"\'<>]+')
+    while time.time() < deadline:
+        for msg in _backend_messages(session):
+            mid = str(msg.get('id') or '')
+            if not mid or mid in seen or msg.get('locked'):
+                continue
+            # same provably-stale rule as fetch_otp: backends without an
+            # epoch timestamp (emailnator) must not be cut by after_ts
+            ts = _msg_ts(msg)
+            if after_ts is not None and ts is not None \
+                    and ts <= after_ts - _AFTER_TS_GRACE_S:
+                continue
+            sender = str(msg.get('from') or '').lower()
+            subject = str(msg.get('subject') or '').lower()
+            if sender_needle and sender_needle not in sender \
+                    and sender_needle not in subject:
+                continue
+            age = ((time.time() - ts) / 60.0) if ts is not None else None
+            if age is not None and age > max_age_min:
+                continue
+            body = str(_backend_body(session, mid))
+            if not body:
+                # transient empty fetch (backend hiccup): retry next pass —
+                # blacklisting here silenced the inbox for the whole window
+                # while the wanted email sat readable in the listing
+                empty.add(mid)
+                continue
+            empty.discard(mid)
+            seen.add(mid)
+            if body_needle and body_needle.lower() not in body.lower():
+                continue
+            for url in url_re.findall(body):
+                url = url.rstrip('.,;)')
+                if needle and needle in url.lower():
+                    return (url, body) if with_body else url
+            # click-tracker wrappers carry the real link percent-encoded in
+            # the query — scan for the encoded form and hand back the inner
+            # link (https%3A%2F%2Fclaude.ai%2Fmagic-link%23token=...), not
+            # the redirector URL
+            for enc in _ENC_URL_RE.findall(body):
+                try:
+                    inner = urllib.parse.unquote(enc).rstrip('.,;)')
+                except Exception:  # noqa: BLE001
+                    continue
+                if needle and needle in inner.lower():
+                    return (inner, body) if with_body else inner
+        time.sleep(6)
+    if with_body:
+        return None, ''
+    return None
 
 
 def main(argv: List[str]) -> int:  # pragma: no cover - CLI smoke test

@@ -136,7 +136,13 @@ class ChatGPTRelay:
     def _port(self) -> int:
         # A fixed local port makes DrissionPage ADOPT the already-running
         # Chrome instead of launching a competing one on the same profile.
-        return int(os.getenv('I4F_CHATGPT_RELAY_PORT', '9346') or '9346')
+        # Default to the refresher's per-profile derivation so the browser
+        # login rung (same profile) adopts this relay session too.
+        override = (os.getenv('I4F_CHATGPT_RELAY_PORT', '') or '').strip()
+        if override:
+            return int(override)
+        from dsk import refresher
+        return refresher._profile_port(self._profile_dir())
 
     def _alive(self) -> bool:
         try:
@@ -231,6 +237,15 @@ class ChatGPTRelay:
                     except Exception:  # noqa: BLE001
                         pass
                 self._page = None
+                # quit() above is a no-op on a wedged tab: the Chrome it
+                # spawned keeps owning the relay profile, and the next
+                # attempt then fails on the profile lock instead of the
+                # wall it was meant to test.
+                try:
+                    refresher._kill_stale_browsers(self._profile_dir(),
+                                                   self._port())
+                except Exception:  # noqa: BLE001
+                    pass
                 time.sleep(3)
         raise RelayBlocked(
             f'chatgpt relay: could not build a working session: {last}')

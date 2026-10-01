@@ -65,11 +65,14 @@ CLI:
 """
 
 import base64
+import hashlib
 import imaplib
 import json
+import logging
 import os
 import random
 import re
+import signal
 import threading
 import time
 from contextlib import contextmanager
@@ -80,6 +83,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import mailgen
 from .providers.base import provider_enabled
+
+logger = logging.getLogger('inference4free.refresher')
 
 _BASE = Path(__file__).resolve().parent
 
@@ -377,10 +382,12 @@ def _has_creds(name: str) -> bool:
         if os.getenv('CHATGPT_SESSION_COOKIES', '').strip():
             return True
         # a jar full of CloudFront/oai-did cookies is NOT a session: the
-        # provider needs the next-auth session cookie or a usable bearer
+        # provider needs a session cookie (2026: auth-session-minimized)
+        # or a usable bearer
         jar = _load_jar('chatgpt')
         return bool(jar.get('__Secure-next-auth.session-token')
-                   or jar.get('accessToken'))
+                   or jar.get('auth-session-minimized')
+                   or jar.get('oai-sc') or jar.get('accessToken'))
     if name in ('claude', 'grok', 'qwen', 'kimi'):
         env_key = {'claude': 'CLAUDE_SESSION_KEY', 'grok': 'GROK_SSO',
                    'qwen': 'QWEN_TOKEN', 'kimi': 'KIMI_TOKEN'}[name]
@@ -510,7 +517,11 @@ def refresh_gemini() -> Tuple[bool, str]:
 
 def refresh_chatgpt() -> Tuple[bool, str]:
     jar = _load_jar('chatgpt')
-    session_cookie = (jar.get('__Secure-next-auth.session-token') or '').strip()
+    # 2026-10: the web app sets auth-session-minimized/oai-sc; the legacy
+    # __Secure-next-auth.session-token remains valid when pasted manually.
+    session_cookie = (jar.get('__Secure-next-auth.session-token')
+                      or jar.get('auth-session-minimized')
+                      or jar.get('oai-sc') or '').strip()
     token = (jar.get('accessToken') or '').strip()
     if not session_cookie and not token:
         return False, 'no chatgpt credentials (jar/env)'
@@ -580,6 +591,47 @@ def _anonymous(provider: str):
     def _f() -> Tuple[bool, str]:
         return True, f'{provider}: anonymous access — nothing to refresh'
     return _f
+
+
+def _egress_rotate_providers() -> set:
+    """Anonymous providers whose refusals are a property of the exit IP.
+
+    Anonymous Copilot is geo-blocked from EU egresses and anonymous
+    Perplexity answers ``fraud_authwall_upsell`` for datacenter IPs. Neither
+    has a credential, so the credential ladder can never fix them — the only
+    lever is the egress. Both are served by the proxy pool, so rotating to a
+    fresh exit is the automatic rung.
+    """
+    raw = os.getenv('I4F_EGRESS_ROTATE', 'copilot,perplexity')
+    return {p.strip().lower() for p in raw.split(',') if p.strip()}
+
+
+def rotate_egress(name: str) -> Tuple[bool, str]:
+    """Drop the provider's sticky proxy assignment and draw a new exit.
+
+    Returns True when the provider now leaves through a *different* route, so
+    the router's retry hits the upstream from a new IP. ``direct_ok=False``
+    keeps the draw on the proxy pool: a geo-blocked provider must not be
+    handed back the same datacenter direct egress that was just refused.
+    """
+    try:
+        from . import proxies
+    except Exception as e:  # noqa: BLE001
+        return False, f'proxy pool unavailable: {e}'
+    try:
+        old = proxies.current(name)
+        if old:
+            proxies.mark_failure(old)
+        pool = proxies.ensure_pool()
+        new = proxies.get_proxy(name, direct_ok=False)
+    except Exception as e:  # noqa: BLE001
+        return False, f'egress rotation failed: {type(e).__name__}: {e}'
+    if not new:
+        return False, (f'{name}: no proxy available to rotate to '
+                       f'(pool size {pool}) — anonymous egress is fixed')
+    if new == old:
+        return False, f'{name}: egress unchanged ({new})'
+    return True, f'{name}: egress rotated {old or "direct"} -> {new}'
 
 
 def refresh_claude() -> Tuple[bool, str]:
@@ -770,10 +822,7 @@ def _qwen_activate(email: str, password: str) -> Tuple[bool, str]:
         pass
     finally:
         if page is not None:
-            try:
-                page.quit()
-            except Exception:  # noqa: BLE001
-                pass
+            _close_page(page)
     ok, detail = _qwen_signin(email, password)
     if ok:
         _log_history('qwen', 'stage', 'activation completed; re-login ok')
@@ -1040,6 +1089,119 @@ def _reap_dead_children() -> None:
             return
 
 
+def _kill_stale_browsers(user_data_path: Optional[str] = None,
+                         port: Optional[int] = None) -> int:
+    """Kill chromium processes wedged on a profile directory / debug port.
+
+    DrissionPage's ``quit()`` fails silently on a wedged tab, so the Chrome it
+    spawned stays alive. The next launch reuses the same ``--user-data-dir``,
+    and Chrome refuses the second owner ("the user folder does not conflict
+    with the open browser") — every retry leaked a whole browser process tree
+    (observed: 10+ live chromes on the chatgpt relay profile, 2h apart).
+    Only processes whose own command line names this profile/port are killed,
+    so unrelated browsers are untouched.
+    """
+    needles = []
+    if user_data_path:
+        needles.append(f'--user-data-dir={user_data_path}')
+    if port:
+        needles.append(f'--remote-debugging-port={port}')
+    if not needles:
+        return 0
+    killed = 0
+    try:
+        entries = os.listdir('/proc')
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open(f'/proc/{entry}/cmdline', 'rb') as fh:
+                cmd = fh.read().decode('utf-8', 'ignore')
+        except OSError:
+            continue
+        if 'chrom' not in cmd:
+            continue
+        if not any(needle in cmd for needle in needles):
+            continue
+        try:
+            os.kill(int(entry), signal.SIGKILL)
+            killed += 1
+        except OSError:
+            continue
+    if killed:
+        _reap_dead_children()
+        logger.info('reaped %d stale browser process(es) for %s',
+                    killed, needles[0])
+    return killed
+
+
+def _close_page(page) -> None:
+    """Quit a DrissionPage browser and guarantee its Chrome dies with it.
+
+    ``quit()`` raises on a wedged tab and leaves the Chrome it spawned alive;
+    the process then owns the profile/auto-port dir forever (observed: 16
+    leaked chromes during one signup run, each holding ~200 MB). After a
+    failed quit the whole tree is killed by its debug port.
+    """
+    port = None
+    for attr in ('_port', 'port'):
+        try:
+            port = int(getattr(page, attr, None))
+            if port:
+                break
+        except (TypeError, ValueError):
+            port = None
+    try:
+        page.quit()
+    except Exception:  # noqa: BLE001
+        pass
+    if port:
+        _kill_stale_browsers(None, port)
+
+
+def _profile_port(profile: str) -> int:
+    """Deterministic debug port for a persistent browser profile.
+
+    DrissionPage's ``set_user_data_path()`` clears ``auto_port`` while
+    leaving the address empty, so a later ``ChromiumPage()`` crashes on
+    ``''.split(':')`` ("not enough values to unpack (expected 2, got 1)")
+    — every profile-based launch must carry an explicit port. Deriving it
+    from the profile path keeps one stable port per profile: relaunches
+    adopt the running browser (the chatgpt login rung upgrades the relay
+    session in place) instead of racing a second Chrome onto the same
+    user-data dir.
+    """
+    digest = int(hashlib.sha1(
+        os.path.abspath(profile).encode('utf-8')).hexdigest(), 16)
+    return 19300 + digest % 40000  # 19300..59299, clear of auto_port picks
+
+
+def _clear_profile_lock(profile: str) -> None:
+    """Remove Chrome singleton locks orphaned by a dead/foreign owner.
+
+    A container restart leaves the profile's SingletonLock pointing at the
+    old container's hostname+pid; every new Chrome then refuses the
+    profile ("appears to be in use by another Chromium process ... on
+    another computer") and starts WITHOUT binding the DevTools port, so
+    the launch reads as a random connect failure while a browser process
+    lingers. Called only after _kill_stale_browsers, which guarantees no
+    live local owner is holding the profile.
+    """
+    try:
+        p = Path(profile)
+        if not p.is_dir():
+            return
+        for name in ('SingletonLock', 'SingletonSocket', 'SingletonCookie'):
+            try:
+                (p / name).unlink()
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _browser(proxy: Optional[str] = None, headed: bool = False,
              user_data_path: Optional[str] = None,
              local_port: Optional[int] = None):
@@ -1050,8 +1212,15 @@ def _browser(proxy: Optional[str] = None, headed: bool = False,
     attempts); without it every spawn is an ephemeral profile as before.
     """
     from DrissionPage import ChromiumPage, ChromiumOptions
-    options = (ChromiumOptions().set_local_port(int(local_port))
-               if local_port else ChromiumOptions().auto_port())
+    if local_port:
+        options = ChromiumOptions().set_local_port(int(local_port))
+    elif user_data_path:
+        # set_user_data_path() silently disables auto_port but leaves the
+        # address empty -> ChromiumPage crash; pin a deterministic port.
+        options = ChromiumOptions().set_local_port(
+            _profile_port(user_data_path))
+    else:
+        options = ChromiumOptions().auto_port()
     if user_data_path:
         Path(user_data_path).mkdir(parents=True, exist_ok=True)
         options.set_user_data_path(user_data_path)
@@ -1094,6 +1263,14 @@ def _browser(proxy: Optional[str] = None, headed: bool = False,
         options.headless(True)
         headless = True
     _reap_dead_children()
+    if user_data_path or local_port:
+        # A wedged Chrome still holding this profile makes the new launch
+        # fail in ways that look like a bot wall; clear it first.
+        _kill_stale_browsers(user_data_path, local_port)
+    if user_data_path:
+        # ...and clear the lock a killed/orphaned Chrome left behind, or
+        # Chrome refuses the profile and never binds the debug port.
+        _clear_profile_lock(user_data_path)
     try:
         return ChromiumPage(addr_or_opts=options)
     except Exception:
@@ -1119,6 +1296,33 @@ def _fill_first(page, selectors: List[str], value: str,
         except Exception:  # noqa: BLE001
             continue
     return False
+
+
+def _fill_react(page, selector: str, value: str) -> bool:
+    """Set a React-controlled input through the native value setter.
+
+    React tracks input state in a synthetic store; a plain CDP ``input``
+    (DrissionPage ``.input``) changes the DOM value without firing React's
+    ``onChange``, so the component's state stays empty and its submit button
+    is a no-op. Writing through ``HTMLInputElement.prototype``'s setter and
+    dispatching a bubbling ``input`` event is the documented way to drive a
+    controlled field. Returns True when the field ends up holding ``value``.
+    """
+    script = '''
+const el = document.querySelector(arguments[0]);
+if (!el) return false;
+const proto = el.tagName === 'TEXTAREA'
+  ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+setter.call(el, arguments[1]);
+el.dispatchEvent(new Event('input', {bubbles: true}));
+el.dispatchEvent(new Event('change', {bubbles: true}));
+return el.value === arguments[1];
+'''
+    try:
+        return bool(page.run_js(script, selector, value))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _body_head(page) -> str:
@@ -1203,22 +1407,56 @@ def _js_click_text(page, texts: List[str]) -> bool:
     memory exhaustion); a JS click runs the page's own handlers without the
     CDP input path, so it is preferred for menu navigation in renewal flows.
     """
+    # DrissionPage's run_js rejects a Python list argument (TypeError:
+    # "type ... is not supported: <class 'list'>"), so the wanted strings are
+    # serialised into the script as a JSON array literal instead of passed as
+    # arguments[0] — passing the list made every call raise, and the broad
+    # except turned it into a silent False for every signup menu click.
+    payload = json.dumps([str(t) for t in texts])
     script = '''
-const wanted = (arguments[0] || []).map(t => String(t).trim().toLowerCase());
+const wanted = %s.map(t => String(t).trim().toLowerCase());
+const INTERACTIVE = new Set(['A','BUTTON','INPUT']);
+const ROLES = new Set(['button','menuitem','tab','link','checkbox']);
+// Rank by interactivity: a real <button> fires the component's onClick,
+// a matching <span> inside it does not — clicking the span was enough to
+// report success while the form never advanced. Walk a text match up to
+// its nearest interactive ancestor and click that instead.
+function targetable(e) {
+  return INTERACTIVE.has(e.tagName) || ROLES.has(e.getAttribute('role') || '');
+}
+function interactiveAncestor(e) {
+  let n = e;
+  for (let i = 0; n && i < 6; i++, n = n.parentElement) {
+    if (targetable(n)) return n;
+  }
+  return null;
+}
+function visible(e) {
+  const r = e.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return false;
+  const s = getComputedStyle(e);
+  return s.visibility !== 'hidden' && s.display !== 'none';
+}
+function score(e) {
+  const t = (e.innerText || e.value || '').trim().toLowerCase();
+  let s = 0;
+  if (wanted.some(w => t === w)) s += 4;
+  else if (wanted.some(w => t.includes(w))) s += 2;
+  else return -1;
+  if (targetable(e)) s += 3;
+  if (e.type === 'submit') s += 1;
+  return s;
+}
 const nodes = [...document.querySelectorAll(
   'a,button,div[role=button],div[role=menuitem],li,span,input')]
-  .filter(e => {
-    const t = (e.innerText || e.value || '').trim().toLowerCase();
-    return wanted.some(w => t === w || (t.includes(w) && t.length < w.length + 25));
-  });
-for (const e of nodes) {
-  const r = e.getBoundingClientRect();
-  if (r.width > 0 && r.height > 0) { e.click(); return true; }
-}
+  .map(e => ({e: interactiveAncestor(e) || e, s: score(interactiveAncestor(e) || e)}))
+  .filter(x => x.s >= 0 && visible(x.e))
+  .sort((a, b) => b.s - a.s);
+for (const x of nodes) { x.e.click(); return true; }
 return false;
-'''
+''' % payload
     try:
-        return bool(page.run_js(script, list(texts)))
+        return bool(page.run_js(script))
     except Exception:  # noqa: BLE001
         return False
 
@@ -1232,6 +1470,98 @@ def _select_first(page, selectors: List[str], value: str) -> bool:
                 return True
         except Exception:  # noqa: BLE001
             continue
+    return False
+
+
+# Google's 2026 signup form has no <select> at all: Month and Gender are
+# Material-Web comboboxes whose option lists live in shadow-root overlays, so
+# select-by-text can never match them and the form silently refuses to
+# advance (the ladder then reports the *next* step's field as missing).
+_DEEP_QUERY_JS = '''
+function deepAll(sel, root) {
+  const out = [];
+  const stack = [root];
+  while (stack.length) {
+    const r = stack.pop();
+    let nodes = [];
+    try { nodes = Array.from(r.querySelectorAll('*')); } catch (e) { continue; }
+    for (const n of nodes) {
+      try { if (n.matches && n.matches(sel)) out.push(n); } catch (e) {}
+      if (n.shadowRoot) stack.push(n.shadowRoot);
+    }
+  }
+  return out;
+}
+'''
+
+
+def _combobox_pick(page, label: str, value: str) -> bool:
+    """Choose an option in a combobox found by its accessible label.
+
+    Opens the control, types the value through the native setter (so the
+    framework registers it), then clicks the matching option anywhere in the
+    shadow tree; falls back to arrow-key + Enter selection.
+    """
+    open_js = (_DEEP_QUERY_JS + '''
+const want = %s.toLowerCase();
+const all = deepAll('*', document);
+const target = all.find(e =>
+  (e.getAttribute('aria-label') || '').trim().toLowerCase() === want);
+if (!target) return 'notfound';
+try { target.scrollIntoView({block: 'center'}); } catch (e) {}
+try { target.focus(); } catch (e) {}
+try { target.click(); } catch (e) {}
+const input = (target.matches && target.matches('input')) ? target
+  : (target.querySelector && target.querySelector('input'));
+if (input) {
+  const d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+  if (d && d.set) d.set.call(input, %s); else input.value = %s;
+  ['input', 'change'].forEach(t =>
+    input.dispatchEvent(new Event(t, {bubbles: true})));
+}
+return 'opened:' + target.tagName + (input ? '+input' : '');
+''' % (json.dumps(label), json.dumps(value), json.dumps(value)))
+    pick_js = (_DEEP_QUERY_JS + '''
+const want = %s.trim().toLowerCase();
+const opts = deepAll('[role=option], option, li, material-option, [role=listbox] > *',
+                     document);
+const text = o => (o.textContent || o.innerText || '').trim().toLowerCase();
+const hit = opts.find(o => text(o) === want) || opts.find(o => text(o).includes(want));
+if (!hit) return 'nooption:' + opts.length;
+try { hit.click(); } catch (e) {}
+return 'picked:' + hit.tagName;
+''' % json.dumps(value))
+    try:
+        opened = page.run_js(open_js)
+    except Exception as e:  # noqa: BLE001
+        return False
+    if not str(opened).startswith('opened'):
+        return False
+    time.sleep(1.2)
+    try:
+        picked = str(page.run_js(pick_js) or '')
+    except Exception:  # noqa: BLE001
+        picked = ''
+    if picked.startswith('picked'):
+        return True
+    # Material comboboxes also accept type-and-take-the-highlighted-match.
+    for key in ('ArrowDown', 'Enter'):
+        try:
+            page.run_js('''
+const el = document.activeElement;
+if (!el) return false;
+const opts = {bubbles: true, cancelable: true, key: %s, code: %s, keyCode: 0};
+['keydown','keypress','keyup'].forEach(t =>
+  el.dispatchEvent(new KeyboardEvent(t, opts)));
+return true;''' % (json.dumps(key), json.dumps(key)))
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.8)
+        try:
+            if str(page.run_js(pick_js) or '').startswith('picked'):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
     return False
 
 
@@ -1313,8 +1643,12 @@ def _mail_session_for(name: str, email: str) -> Optional[Dict[str, Any]]:
 
 _DEEPSEEK_EMAIL_SELECTORS = ['@placeholder:email', '@placeholder:Email',
                              'css:input[type=text]', 'css:input[name=email]']
-_CHATGPT_EMAIL_SELECTORS = ['css:input[name=email]', 'css:input[type=email]',
-                            '@placeholder:Email address']
+# type=email first: on claude.ai/login (and other SPA login pages) the real
+# email box is input[type=email] while invisible 1x1 radio inputs share
+# name=email — a name-first order filled the hidden radio and the email
+# never landed, surfacing as a false "email field not found (bot wall?)".
+_CHATGPT_EMAIL_SELECTORS = ['css:input[type=email]', '@placeholder:Enter your email',
+                            '@placeholder:Email address', 'css:input[name=email]']
 _GEMINI_EMAIL_SELECTORS = ['css:input[type=email]', '@placeholder:Email or phone']
 _PASSWORD_SELECTORS = ['css:input[type=password]']
 
@@ -1474,10 +1808,7 @@ def browser_login(name: str) -> Tuple[bool, str]:
     except Exception as e:  # noqa: BLE001
         return False, f'browser flow failed: {type(e).__name__}: {e}'
     finally:
-        try:
-            page.quit()
-        except Exception:  # noqa: BLE001
-            pass
+        _close_page(page)
 
 
 def _cool(proxy: Optional[str]) -> None:
@@ -1742,10 +2073,7 @@ def signup_deepseek() -> Tuple[bool, str]:
                          f'{proxy or "direct"}: {last_error}')
         finally:
             if page is not None:
-                try:
-                    page.quit()
-                except Exception:  # noqa: BLE001
-                    pass
+                _close_page(page)
     return False, last_error or 'all signup egresses failed'
 
 
@@ -1773,50 +2101,74 @@ def signup_chatgpt() -> Tuple[bool, str]:
     try:
         page.get('https://chatgpt.com/auth/login')
         time.sleep(6)
-        if not _click_any(page, ['Sign up', 'Sign Up', 'Create account']):
-            return False, 'sign-up entry not found (bot wall?)'
-        time.sleep(4)
-        _click_any(page, ['Continue with email', 'Email'])
-        time.sleep(2)
+        _click_any(page, ['Reject non-essential', 'Accept all'])
+        time.sleep(1)
+        # hook installed after navigation: it lives on the page's window and
+        # a page load wipes it
+        _net_log_install(page)
+        # 2026-10 probe: chatgpt.com/auth/login is a combined "Log in or
+        # sign up" page — an unknown email signing in CREATES the account.
+        # There is no "Sign up" link at all, so the old entry click always
+        # failed with "sign-up entry not found (bot wall?)".
         if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
             return False, 'email field not found (bot wall?)'
-        _click_any(page, ['Continue', 'Next'])
-        time.sleep(3)
-        if not _fill_first(page, _PASSWORD_SELECTORS, password):
-            return False, 'password field not found'
-        _click_any(page, ['Continue', 'Next'])
-        time.sleep(8)
+        # Confirm the code-send request fires; a no-op Continue click (empty
+        # React state, hidden Arkose challenge) otherwise surfaces as the
+        # misleading 'verification email not found' below.
+        _click_and_fire(page, ['Continue', 'Next'], 'chatgpt.com')
+        # The code email is sent by the Continue click; fetch it first, then
+        # enter it — the code page renders as soon as the send lands.
         code = mailgen.fetch_otp(session, max_wait_s=240,
                                  sender_needle='openai')
         if not code:
             return False, 'verification email not found (captcha/phone wall may have blocked signup)'
-        if not _fill_first(page, ['css:input[name=code]',
-                                  'css:input[inputmode=numeric]',
-                                  'css:input[autocomplete=one-time-code]',
-                                  '@placeholder:code', '@placeholder:Code',
-                                  'css:input[type=text]'], code):
+        code_ele = None
+        code_deadline = time.time() + 60
+        while time.time() < code_deadline:
+            code_ele = page.ele('css:input[inputmode=numeric]', timeout=2) \
+                or page.ele('css:input[name=code]', timeout=2) \
+                or page.ele('css:input[autocomplete=one-time-code]', timeout=2)
+            if code_ele:
+                break
+            time.sleep(3)
+        if not code_ele:
             return False, 'verification code field not found'
+        try:
+            code_ele.clear()
+            code_ele.input(code)
+        except Exception:  # noqa: BLE001
+            _fill_first(page, ['css:input[name=code]',
+                               'css:input[inputmode=numeric]',
+                               'css:input[autocomplete=one-time-code]',
+                               '@placeholder:code', '@placeholder:Code',
+                               'css:input[type=text]'], code)
         _click_any(page, ['Continue', 'Verify'])
-        time.sleep(12)
+        time.sleep(10)
+        # 2026 flow: password is optional (code-only accounts). Fill it only
+        # when the page asks — the old hard requirement failed the signup.
+        if page.ele('css:input[type=password]', timeout=4):
+            _fill_first(page, _PASSWORD_SELECTORS, password)
+            _click_any(page, ['Continue', 'Next'])
+        time.sleep(8)
         _save_account('chatgpt', email, password,
                       session.get('backend', ''))
         pre_token = _load_jar('chatgpt').get('accessToken', '')
         n = _export_cookies(page, 'chatgpt', ('chatgpt.com', 'openai.com'))
         via = f'account created ({session["backend"]}: {email})'
-        # require the actual session cookie — CF cookies alone are not a
-        # logged-in account (the old n>0 check celebrated failed signups)
+        # require an actual session cookie — CF cookies alone are not a
+        # logged-in account (the old n>0 check celebrated failed signups).
+        # 2026-10: the web app sets auth-session-minimized/oai-sc instead of
+        # the legacy __Secure-next-auth.session-token.
         jar = _load_jar('chatgpt')
-        if jar.get('__Secure-next-auth.session-token'):
+        if jar.get('__Secure-next-auth.session-token') \
+                or jar.get('auth-session-minimized') or jar.get('oai-sc'):
             return True, f'{via}, {n} cookies exported (session token captured)'
         _chatgpt_restore_token(jar, pre_token)
         return False, f'{via} but no session token captured'
     except Exception as e:  # noqa: BLE001
         return False, f'chatgpt signup failed: {type(e).__name__}: {e}'
     finally:
-        try:
-            page.quit()
-        except Exception:  # noqa: BLE001
-            pass
+        _close_page(page)
 
 
 def signup_gemini() -> Tuple[bool, str]:
@@ -1828,7 +2180,12 @@ def signup_gemini() -> Tuple[bool, str]:
     code; the account is persisted for later re-login attempts."""
     if not mailgen.autogen_enabled():
         return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
-    session, err = mailgen.create_email()
+    # googlemail.com — an alias of the emailnator gmail pool — is outright
+    # rejected by Google's signup, and a gmail address is treated as a
+    # username claim ("That username is taken"): the existing-email branch
+    # needs a NON-gmail disposable (tempmail.lol domains pass Google's
+    # blocklist, verified live 2026-10).
+    session, err = mailgen.create_email(no_gmail=True)
     if not session:
         return False, f'autogen mailbox unavailable: {err}'
     email = session['address']
@@ -1860,56 +2217,111 @@ def signup_gemini() -> Tuple[bool, str]:
         _click_any(page, ['Next', 'Weiter'])
         time.sleep(4)
         _fill_first(page, ['css:input#day', 'css:input[name=day]'], '12')
-        _select_first(page, ['css:select#month'], 'June')
+        if not _select_first(page, ['css:select#month'], 'June'):
+            # 2026 form: no <select> — Material combobox in a shadow root
+            for label in ('Month', 'Choose your birth month', 'Birth month'):
+                if _combobox_pick(page, label, 'June'):
+                    break
         _fill_first(page, ['css:input#year', 'css:input[name=year]'], '1994')
-        _select_first(page, ['css:select#gender'], 'Rather not say')
+        if not _select_first(page, ['css:select#gender'], 'Rather not say'):
+            for label in ("What's your gender?", 'Gender', 'Choose your gender'):
+                if _combobox_pick(page, label, 'Rather not say'):
+                    break
         _click_any(page, ['Next', 'Weiter'])
         time.sleep(4)
-        # prefer the "use existing email" branch so no Gmail is required
-        _click_any(page, ['Use your existing email', 'current email address'])
-        time.sleep(2)
-        if not _fill_first(page, ['css:input#userName',
-                                  'css:input[name=userName]',
+        # 2026-10 probe: the birthday Next lands on
+        # lifecycle/steps/signup/collectemailphone — one text field
+        # #emailPhone; the old #userName field and the 'Use your existing
+        # email' button no longer exist. A NON-gmail address is verified
+        # with an emailed code ("Verify your email address"); a gmail
+        # address is treated as a username claim ("That username is
+        # taken"), which is why the mailbox here is non-gmail.
+        if not _fill_first(page, ['css:input#emailPhone',
+                                  'css:input[name=emailPhone]',
+                                  '@placeholder:Email address',
                                   'css:input[type=email]'], email):
-            return False, 'existing-email field not found'
-        _click_any(page, ['Next', 'Weiter'])
-        time.sleep(3)
+            return False, 'email-phone field not found (bot wall?)'
+        _net_log_install(page)
+        _click_and_fire(page, ['Next', 'Weiter'], 'accounts.google.com')
+        time.sleep(4)
+        body = str(page.run_js(
+            'return document.body.innerText.slice(0, 3000);') or '')
+        if 'cannot create an account with this domain' in body.lower():
+            domain = email.rsplit('@', 1)[-1]
+            return False, f'google rejected mailbox domain ({domain})'
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='google')
+        if not code:
+            return False, ('google verification email not found '
+                           f'({session.get("backend")}; '
+                           f'inbox: {mailgen._inbox_digest(session)})')
+        if not _fill_first(page, ['css:input#code', 'css:input[name=code]',
+                                  'css:input[inputmode=numeric]',
+                                  '@placeholder:Enter code',
+                                  'css:input[type=text]'], code):
+            return False, 'google code field not found'
+        _click_and_fire(page, ['Next', 'Weiter'], 'accounts.google.com')
+        time.sleep(4)
+        body = str(page.run_js(
+            'return document.body.innerText.slice(0, 3000);') or '')
+        if 'wrong code' in body.lower() or 'invalid code' in body.lower():
+            return False, 'google rejected the verification code'
         if not _fill_first(page, ['css:input[name=Passwd]',
                                   'css:input[type=password]'], password):
-            return False, 'google password field not found'
+            return False, (f'google password field not found '
+                           f'(after code: {body[:90]!r})')
         _fill_first(page, ['css:input[name=PasswdAgain]'], password)
-        _click_any(page, ['Next', 'Weiter'])
-        time.sleep(6)
-        code = mailgen.fetch_otp(session, max_wait_s=240,
-                                 sender_needle='accounts.google')
-        if not code:
-            return False, 'google verification email not found (captcha/phone wall likely)'
-        if not _fill_first(page, ['css:input#code',
-                                  'css:input[name=code]'], code):
-            return False, 'google code field not found'
-        _click_any(page, ['Next', 'Weiter'])
+        _click_and_fire(page, ['Next', 'Weiter'], 'accounts.google.com')
         time.sleep(6)
         _click_any(page, ["Yes, I'm in", 'Skip', 'Not now', 'Confirm'])
         time.sleep(3)
         _click_any(page, ['I agree'])
-        time.sleep(8)
+        time.sleep(4)
         _save_account('gemini', email, password, session.get('backend', ''))
-        page.get('https://gemini.google.com/app')
-        time.sleep(6)
-        n = _export_cookies(page, 'gemini', ('google.com',))
         via = f'account created ({session["backend"]}: {email})'
+        # was a google.com session established at all before the gemini
+        # hop? A signed-out landing there means the session died earlier
+        # (verification wall / consent dismissed into sign-in).
+        post_consent = str(_body_head(page) or '').replace('\n', ' ')[:90]
+
+        def _has_psid() -> bool:
+            try:
+                cookies = page.cookies(all_domains=True) or []
+            except TypeError:
+                cookies = page.cookies() or []
+            except Exception:  # noqa: BLE001
+                return False
+            return any(c.get('name') == '__Secure-1PSID' for c in cookies)
+
+        # Google interleaves post-signup interstitials before gemini.google.com
+        # sets the session cookie (recovery-email prompt, Gemini Apps ToS,
+        # welcome cards) — dismiss whatever appears and poll for the cookie
+        # instead of betting everything on one fixed sleep.
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            page.get('https://gemini.google.com/app')
+            for _ in range(8):
+                time.sleep(5)
+                if _has_psid():
+                    break
+                _click_any(page, ['I agree', 'Accept all', 'Got it',
+                                  'Continue', 'Not now', 'Skip',
+                                  "Yes, I'm in", 'Yes, continue'])
+            if _has_psid():
+                break
+        n = _export_cookies(page, 'gemini', ('google.com',))
         # require the real session credential (n>0 counted any google.com
         # cookie and celebrated failed signups)
         if _load_jar('gemini').get('__Secure-1PSID'):
             return True, f'{via}, {n} cookies exported (1PSID captured)'
-        return False, f'{via} but no __Secure-1PSID captured (2FA/anti-bot?)'
+        head = str(_body_head(page) or '').replace('\n', ' ')[:120]
+        return False, (f'{via} but no __Secure-1PSID captured '
+                       f'(post-consent: {post_consent!r}; '
+                       f'page: {head or "blank"})')
     except Exception as e:  # noqa: BLE001
         return False, f'gemini signup failed: {type(e).__name__}: {e}'
     finally:
-        try:
-            page.quit()
-        except Exception:  # noqa: BLE001
-            pass
+        _close_page(page)
 
 
 # ---------------------------------------------------------------- token signups
@@ -1918,12 +2330,66 @@ def signup_gemini() -> Tuple[bool, str]:
 # that the refresher exports automatically — no human, no cookie export.
 
 
+def _claude_session_key(page) -> str:
+    """Return the claude.ai sessionKey cookie value, '' when absent."""
+    cookies = []
+    try:
+        cookies = page.cookies(all_domains=True) or []
+    except TypeError:
+        cookies = page.cookies() or []
+    except Exception:  # noqa: BLE001
+        return ''
+    for c in cookies:
+        if 'claude.ai' in str(c.get('domain', '')) and c.get('name') == 'sessionKey':
+            return str(c.get('value') or '')
+    return ''
+
+
+def _click_and_fire(page, texts: List[str], needle: str,
+                    attempts: int = 3) -> bool:
+    """Click a button and confirm it fired a network request.
+
+    SPA submit buttons silently no-op when the framework's state is empty
+    (React controlled inputs, disabled buttons), so the magic link / code
+    email is never sent and the mail poll below times out with a
+    misleading 'email not found'. The fetch/XHR log makes the difference
+    observable: retry the click until a new request matching ``needle``
+    appears, and log the recorded requests when none ever does.
+    """
+    def _count() -> int:
+        try:
+            log = page.run_js('return window.__i4f_log || [];') or []
+        except Exception:  # noqa: BLE001
+            return -1
+        return len([e for e in log
+                    if needle.lower() in str(e[0]).lower()])
+
+    base = _count()
+    for attempt in range(attempts):
+        _js_click_text(page, texts)
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            time.sleep(2)
+            now = _count()
+            if now > base:
+                return True
+        base = now
+        logger.debug('send click %r (%s) attempt %d fired no request',
+                     texts[0], needle, attempt + 1)
+    logger.info('send click %r (%s) never fired a request: %s',
+                texts[0], needle, _net_log_read(page, needle, 8))
+    return False
+
+
 def signup_claude() -> Tuple[bool, str]:
     """Create a fresh claude.ai account and harvest the sessionKey cookie.
 
-    claude.ai signup is email + password + emailed OTP; the sessionKey
-    cookie appears in the jar once the SPA lands in the app. Created
-    credentials are persisted for later re-login.
+    2026-10: claude.ai signup is a magic-link flow, not password+OTP. The
+    login SPA takes an email; "Continue with email" sends a one-time
+    ``https://claude.ai/magic-link#token`` URL, and opening that link in the
+    SAME browser session logs the new account in and sets the sessionKey
+    cookie. There is no password field and no numeric code, so the old
+    password+OTP rung could never complete. claude.ai/signup is a dead end.
     """
     if not mailgen.autogen_enabled():
         return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
@@ -1935,50 +2401,116 @@ def signup_claude() -> Tuple[bool, str]:
     page = None
     try:
         page = _browser(headed=True)
-        page.get('https://claude.ai/login')
-        time.sleep(6)
-        if not _click_any(page, ['Sign up', 'Create account']):
-            page.get('https://claude.ai/signup')
-        time.sleep(4)
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+        # Step 1: fill the email box. The SPA renders it late and
+        # intermittently, so poll across re-navigations; drive it through the
+        # React native setter so the component registers the value — a plain
+        # .input changes the DOM but leaves React state empty, so the
+        # "Continue with email" button fires with an empty email and the
+        # magic link is never sent.
+        email_filled = False
+        deadline = time.time() + 90
+        while time.time() < deadline and not email_filled:
+            page.get('https://claude.ai/login')
+            time.sleep(5)
+            _click_any(page, ['Reject all cookies', 'Accept all cookies'])
+            time.sleep(1)
+            # hook re-installed after every navigation: it lives on the
+            # page's window and a page load wipes it
+            _net_log_install(page)
+            sub_deadline = time.time() + 20
+            while time.time() < sub_deadline:
+                if _fill_react(page, 'input[type=email]', email):
+                    email_filled = True
+                    break
+                time.sleep(2)
+        if not email_filled:
             return False, 'email field not found (bot wall?)'
-        _fill_first(page, _PASSWORD_SELECTORS, password)
-        _click_any(page, ['Continue', 'Sign up', 'Create account'])
-        time.sleep(6)
-        code = mailgen.fetch_otp(session, max_wait_s=240,
-                                 sender_needle='claude')
-        if not code:
-            return False, 'claude verification email not found (bot wall/OTP)'
-        if not _fill_first(page, ['css:input[name=code]',
-                                  '@placeholder:code', '@placeholder:Code',
-                                  'css:input[inputmode=numeric]'], code):
-            return False, 'code field not found'
-        _click_any(page, ['Verify', 'Continue', 'Sign up'])
-        time.sleep(12)
-        jar_cookies = {}
-        try:
-            for c in (page.cookies(all_domains=True) or []):
-                if 'claude.ai' in str(c.get('domain', '')):
-                    jar_cookies[c['name']] = c['value']
-        except TypeError:
-            for c in (page.cookies() or []):
-                if 'claude.ai' in str(c.get('domain', '')):
-                    jar_cookies[c['name']] = c['value']
-        session_key = jar_cookies.get('sessionKey', '')
+        # Step 2: press "Continue with email" (JS click — native clicks crash
+        # the container Chrome) and record the send time for the inbox cut.
+        # Confirm the send request actually fired: the button no-ops when
+        # React state is empty, and polling mail for a link that was never
+        # sent reads as a bot wall that is really a dead click.
+        _click_and_fire(page, ['Continue with email', 'Continue'], 'claude.ai')
+        sent_ts = time.time()
+        # Step 3: the magic link is emailed; poll the shared inbox for it.
+        # The send response advertises a numeric fallback code
+        # (fallback_code_configuration, 6 digits) printed next to the link —
+        # kept as a second way in when the link is not clickable in-session.
+        magic, mail_body = mailgen.fetch_magic_link(
+            session, url_needle='claude.ai/magic-link',
+            sender_needle='', body_needle='claude.ai',
+            # 240s expired seconds before emailnator's gmail forward
+            # actually delivered the Anthropic mail (observed ~4-5 min
+            # latency); 480s covers it without changing poll cadence.
+            max_wait_s=480, after_ts=sent_ts, with_body=True)
+        if not magic:
+            # say WHY it likely failed: the mailbox backend (Anthropic
+            # silently drops known disposable domains — the email never
+            # arrives), and what the inbox actually received, so a real
+            # bot wall is distinguishable from a filtered mailbox.
+            domain = email.rsplit('@', 1)[-1]
+            return False, ('claude magic-link email not found '
+                           f'({session.get("backend")}: @{domain}; '
+                           f'inbox: {mailgen._inbox_digest(session)}; '
+                           'cand: '
+                           f'{mailgen.debug_magic_candidates(session, "claude.ai/magic-link")})')
+        # Step 4: open the magic link in the SAME session (the token is bound
+        # to this browser's pendingLogin/device cookies) and poll for the
+        # sessionKey the SPA sets once the exchange lands. When the link
+        # exchange stalls on a challenge, the emailed 6-digit code entered
+        # on the same page is the fallback.
+        page.get(magic)
+        session_key = ''
+        code_m = re.search(r'\b(\d{6})\b', mail_body or '')
+        code_filled = False
+        retries = 0
+        states: List[str] = []
+        # the SPA exchange can stall on "loading..." well past a minute and
+        # only then render the 6-digit verify input — poll for BOTH outcomes
+        # and fill the emailed code the moment an input shows up
+        sub_deadline = time.time() + 150
+        while time.time() < sub_deadline:
+            session_key = _claude_session_key(page)
+            if session_key:
+                break
+            head = _body_head(page)
+            if head and (not states or states[-1] != head[:60]):
+                states.append(head[:60])
+            if 'verify' in head and 'try again' in head:
+                # the exchange failed claude's browser check — "try again"
+                # re-fires it, and retries sometimes pass once the page's
+                # own challenge widget has quietly completed
+                retries += 1
+                _click_any(page, ['Try again', 'try again'])
+            if code_m and not code_filled and _fill_first(
+                    page, ['css:input[inputmode=numeric]',
+                           'css:input[name=code]', '@placeholder:code',
+                           'css:input[autocomplete=one-time-code]',
+                           'css:input[type=text]'], code_m.group(1)):
+                code_filled = True
+                _click_any(page, ['Continue', 'Verify'])
+            time.sleep(4)
         if session_key:
             _save_jar('claude', {'sessionKey': session_key})
             _save_account('claude', email, password, session.get('backend', ''))
             return True, (f'account created, sessionKey harvested '
                           f'({session.get("backend")}: {email})')
-        return False, 'signup finished but no sessionKey cookie captured'
+        mail_code = bool(re.search(r'\b\d{6}\b', mail_body or ''))
+        try:
+            final_url = str(page.url)
+        except Exception:  # noqa: BLE001
+            final_url = ''
+        return False, ('signup finished but no sessionKey cookie captured '
+                       f'(magic: {str(magic)[:90]}; final: {final_url} | '
+                       f'{_body_head(page)[:150] or "blank"}; '
+                       f'mail 6-digit code: {mail_code} filled: {code_filled} '
+                       f'retries: {retries}; '
+                       f'states: {" -> ".join(states[-3:]) or "-"} )')
     except Exception as e:  # noqa: BLE001
         return False, f'claude signup failed: {type(e).__name__}: {e}'
     finally:
         if page is not None:
-            try:
-                page.quit()
-            except Exception:  # noqa: BLE001
-                pass
+            _close_page(page)
 
 
 def signup_grok() -> Tuple[bool, str]:
@@ -2049,10 +2581,7 @@ def signup_grok() -> Tuple[bool, str]:
         return False, f'grok signup failed: {type(e).__name__}: {e}'
     finally:
         if page is not None:
-            try:
-                page.quit()
-            except Exception:  # noqa: BLE001
-                pass
+            _close_page(page)
 
 
 def signup_kimi() -> Tuple[bool, str]:
@@ -2125,10 +2654,7 @@ def signup_kimi() -> Tuple[bool, str]:
         return False, f'kimi signup failed: {type(e).__name__}: {e}'
     finally:
         if page is not None:
-            try:
-                page.quit()
-            except Exception:  # noqa: BLE001
-                pass
+            _close_page(page)
 
 
 _MISTRAL_AUTH = 'https://auth.mistral.ai'
@@ -2494,10 +3020,7 @@ def signup_mistral() -> Tuple[bool, str]:
         return False, f'mistral signup failed: {type(e).__name__}: {e}'
     finally:
         if page is not None:
-            try:
-                page.quit()
-            except Exception:  # noqa: BLE001
-                pass
+            _close_page(page)
 
 
 _QWEN_SIGNUP_URL = 'https://chat.qwen.ai/auth?action=signup'
@@ -3111,10 +3634,7 @@ def signup_qwen() -> Tuple[bool, str]:
             last_error = f'qwen signup failed: {type(e).__name__}: {e}'
         finally:
             if page is not None:
-                try:
-                    page.quit()
-                except Exception:  # noqa: BLE001
-                    pass
+                _close_page(page)
     return False, last_error or 'all qwen signup egresses failed'
 
 
@@ -3254,6 +3774,24 @@ def _renew_locked(name: str, reason: str) -> Dict[str, Any]:
     steps: List[str] = []
     _log_history(name, 'renew-start', reason or 'proactive')
 
+    # Anonymous providers have no credential, so the credential ladder below
+    # can only ever report its no-op stub as a success. Their refusals are
+    # egress-shaped (geo-block, datacenter-IP authwall), so rotate the exit
+    # first and let the router retry from the new IP.
+    rotate = name in _egress_rotate_providers()
+    if rotate:
+        if _rung_open(name, 'egress'):
+            steps.append('egress: skipped (breaker open)')
+        else:
+            ok, detail = rotate_egress(name)
+            steps.append(f'egress: {detail}')
+            _log_history(name, 'egress-rotate', detail)
+            _rung_result(name, 'egress', ok)
+            if ok:
+                _log_history(name, 'renewed', '; '.join(steps))
+                return {'renewed': True, 'via': 'egress-rotation',
+                        'steps': steps, 'egress': detail}
+
     if _rung_open(name, 'refresh'):
         steps.append('refresh: skipped (breaker open)')
         status = 'fail'
@@ -3267,7 +3805,13 @@ def _renew_locked(name: str, reason: str) -> Dict[str, Any]:
         # never re-logged in. The refresh rung's own success is the
         # credential verdict; only escalate to login/signup when it fails.
         _rung_result(name, 'refresh', ok)
-        if ok:
+        if ok and rotate:
+            # 'anonymous access — nothing to refresh' proves nothing about
+            # the wall that triggered this renewal; declaring it renewed is
+            # what made copilot/perplexity spin: the same inline-auth error
+            # recurred minutes later with a 'renewed' line in between.
+            status = 'fail'
+        elif ok:
             status = _verify(name)
             if status == 'ok':
                 _log_history(name, 'renewed', '; '.join(steps))

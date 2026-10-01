@@ -149,7 +149,7 @@ normal browser session (or runs fully anonymous) — no API keys, no payments.
 Providers without configured credentials are simply skipped; the server runs
 with whichever are available. Configure them in `.env` (see
 `cp .env.example .env`) and restart the stack
-(`sudo systemctl restart docker-compose@deepseek4free` or `docker compose up -d`).
+(`sudo systemctl restart docker-compose@inference4free` or `docker compose up -d`).
 
 ### 1. DeepSeek (`deepseek-chat`, `deepseek-reasoner`, `deepseek-search`)
 
