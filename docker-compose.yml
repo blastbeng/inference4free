@@ -137,6 +137,10 @@ services:
       - I4F_REFRESHER_COOLDOWN=${I4F_REFRESHER_COOLDOWN:-1800}
       - I4F_REFRESHER_MAX_RENEWS=${I4F_REFRESHER_MAX_RENEWS:-6}
       - I4F_REFRESHER_EXCLUDE=${I4F_REFRESHER_EXCLUDE:-}
+      # signup attempts are multi-minute browser flows: after 3 consecutive
+      # failures the rung sleeps 12h (not 30min) so a never-succeeding
+      # signup cannot burn RAM all day
+      - I4F_SIGNUP_BREAKER_COOLDOWN_S=${I4F_SIGNUP_BREAKER_COOLDOWN_S:-43200}
       - I4F_REFRESHER_LOGIN=${I4F_REFRESHER_LOGIN:-true}
       - I4F_REFRESHER_HEADLESS=${I4F_REFRESHER_HEADLESS:-true}
       - I4F_REFRESHER_AUTOSIGNUP=${I4F_REFRESHER_AUTOSIGNUP:-true}

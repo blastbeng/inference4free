@@ -2185,76 +2185,121 @@ def signup_gemini() -> Tuple[bool, str]:
     # username claim ("That username is taken"): the existing-email branch
     # needs a NON-gmail disposable (tempmail.lol domains pass Google's
     # blocklist, verified live 2026-10).
-    session, err = mailgen.create_email(no_gmail=True)
-    if not session:
-        return False, f'autogen mailbox unavailable: {err}'
-    email = session['address']
-    # token-addressed backends (emailnator, tempmail.lol) carry no mailbox
-    # password: mint a form password independent of the mailbox creds.
-    password = session.get('password') or mailgen.gen_password()
     try:
         page = _browser(headed=True)
     except Exception as e:  # noqa: BLE001
         return False, f'browser unavailable: {e}'
     try:
-        # 2026-10: the /signup/v2/createaccount deep link redirects to the
-        # sign-in identifier page, which has no firstName field — the rung
-        # used to report that as a bot wall. /SignUp lands on the real form
-        # (/lifecycle/steps/signup/name); the sign-in page's "Create account"
-        # → "For my personal use" menu is the fallback entry.
-        page.get('https://accounts.google.com/SignUp')
-        time.sleep(6)
-        if not page.ele('css:input#firstName', timeout=5):
-            _js_click_text(page, ['Create account'])
-            time.sleep(3)
-            _js_click_text(page, ['For my personal use'])
-            time.sleep(5)
-        if not _fill_first(page, ['css:input#firstName',
-                                  'css:input[name=firstName]'], 'Alex'):
-            return False, 'google first-name field not found (bot wall?)'
-        _fill_first(page, ['css:input#lastName',
-                           'css:input[name=lastName]'], 'Free')
-        _click_any(page, ['Next', 'Weiter'])
-        time.sleep(4)
-        _fill_first(page, ['css:input#day', 'css:input[name=day]'], '12')
-        if not _select_first(page, ['css:select#month'], 'June'):
-            # 2026 form: no <select> — Material combobox in a shadow root
-            for label in ('Month', 'Choose your birth month', 'Birth month'):
-                if _combobox_pick(page, label, 'June'):
-                    break
-        _fill_first(page, ['css:input#year', 'css:input[name=year]'], '1994')
-        if not _select_first(page, ['css:select#gender'], 'Rather not say'):
-            for label in ("What's your gender?", 'Gender', 'Choose your gender'):
-                if _combobox_pick(page, label, 'Rather not say'):
-                    break
-        _click_any(page, ['Next', 'Weiter'])
-        time.sleep(4)
-        # 2026-10 probe: the birthday Next lands on
-        # lifecycle/steps/signup/collectemailphone — one text field
-        # #emailPhone; the old #userName field and the 'Use your existing
-        # email' button no longer exist. A NON-gmail address is verified
-        # with an emailed code ("Verify your email address"); a gmail
-        # address is treated as a username claim ("That username is
-        # taken"), which is why the mailbox here is non-gmail.
-        if not _fill_first(page, ['css:input#emailPhone',
-                                  'css:input[name=emailPhone]',
-                                  '@placeholder:Email address',
-                                  'css:input[type=email]'], email):
-            return False, 'email-phone field not found (bot wall?)'
-        _net_log_install(page)
-        _click_and_fire(page, ['Next', 'Weiter'], 'accounts.google.com')
-        time.sleep(4)
-        body = str(page.run_js(
-            'return document.body.innerText.slice(0, 3000);') or '')
-        if 'cannot create an account with this domain' in body.lower():
-            domain = email.rsplit('@', 1)[-1]
-            return False, f'google rejected mailbox domain ({domain})'
-        code = mailgen.fetch_otp(session, max_wait_s=240,
-                                 sender_needle='google')
+
+        def _submit_address(mail_page, address: str) -> str:
+            """Drive the Google signup form through name/birthday/address
+            and request the verification email. Returns '' once the code
+            send has been requested, else a failure reason (no retries
+            here — the caller decides whether a fresh mailbox round makes
+            sense)."""
+            # 2026-10: the /signup/v2/createaccount deep link redirects to
+            # the sign-in identifier page, which has no firstName field —
+            # the rung used to report that as a bot wall. /SignUp lands on
+            # the real form (/lifecycle/steps/signup/name); the sign-in
+            # page's "Create account" → "For my personal use" menu is the
+            # fallback entry.
+            mail_page.get('https://accounts.google.com/SignUp')
+            time.sleep(6)
+            if not mail_page.ele('css:input#firstName', timeout=5):
+                _js_click_text(mail_page, ['Create account'])
+                time.sleep(3)
+                _js_click_text(mail_page, ['For my personal use'])
+                time.sleep(5)
+            if not _fill_first(mail_page, ['css:input#firstName',
+                                           'css:input[name=firstName]'],
+                               'Alex'):
+                return 'google first-name field not found (bot wall?)'
+            _fill_first(mail_page, ['css:input#lastName',
+                                    'css:input[name=lastName]'], 'Free')
+            _click_any(mail_page, ['Next', 'Weiter'])
+            time.sleep(4)
+            _fill_first(mail_page, ['css:input#day',
+                                    'css:input[name=day]'], '12')
+            if not _select_first(mail_page, ['css:select#month'], 'June'):
+                # 2026 form: no <select> — Material combobox in a shadow root
+                for label in ('Month', 'Choose your birth month',
+                              'Birth month'):
+                    if _combobox_pick(mail_page, label, 'June'):
+                        break
+            _fill_first(mail_page, ['css:input#year',
+                                    'css:input[name=year]'], '1994')
+            if not _select_first(mail_page, ['css:select#gender'],
+                                 'Rather not say'):
+                for label in ("What's your gender?", 'Gender',
+                              'Choose your gender'):
+                    if _combobox_pick(mail_page, label, 'Rather not say'):
+                        break
+            _click_any(mail_page, ['Next', 'Weiter'])
+            time.sleep(4)
+            # 2026-10 probe: the birthday Next lands on
+            # lifecycle/steps/signup/collectemailphone — one text field
+            # #emailPhone; the old #userName field and the 'Use your
+            # existing email' button no longer exist. A NON-gmail address
+            # is verified with an emailed code ("Verify your email
+            # address"); a gmail address is treated as a username claim
+            # ("That username is taken"), which is why the mailbox here is
+            # non-gmail.
+            if not _fill_first(mail_page, ['css:input#emailPhone',
+                                           'css:input[name=emailPhone]',
+                                           '@placeholder:Email address',
+                                           'css:input[type=email]'], address):
+                return 'email-phone field not found (bot wall?)'
+            _net_log_install(mail_page)
+            _click_and_fire(mail_page, ['Next', 'Weiter'],
+                            'accounts.google.com')
+            time.sleep(4)
+            body = str(mail_page.run_js(
+                'return document.body.innerText.slice(0, 3000);') or '')
+            if 'cannot create an account with this domain' in body.lower():
+                return ('google rejected mailbox domain '
+                        f'({address.rsplit("@", 1)[-1]})')
+            return ''
+
+        # Two mailbox rounds, ONE browser: Google silently drops some
+        # disposable providers' mail (measured 2026-10: the tempmail.lol
+        # address was accepted by the form but the inbox stayed empty), so
+        # when the first backend delivers nothing the form is re-run with
+        # a fresh mailbox from the NEXT backend (mail.tm/mail.gw). The
+        # retry re-navigates the form — it does not respawn Chromium.
+        email = ''
+        password = ''
+        session = None
+        code = None
+        last_err = ''
+        for round_no in range(2):
+            session, err = mailgen.create_email(
+                no_gmail=True,
+                exclude_backends=('_tempmail_create',) if round_no else ())
+            if not session:
+                last_err = f'autogen mailbox unavailable: {err}'
+                continue
+            email = session['address']
+            # token-addressed backends (emailnator, tempmail.lol) carry no
+            # mailbox password: mint a form password independent of the
+            # mailbox creds.
+            password = session.get('password') or mailgen.gen_password()
+            ferr = _submit_address(page, email)
+            if ferr:
+                last_err = ferr
+                if 'bot wall' in ferr or 'not found' in ferr:
+                    break  # form unreachable — a new mailbox won't help
+                continue  # e.g. domain rejected — next backend may pass
+            code = mailgen.fetch_otp(session, max_wait_s=180
+                                     if round_no == 0 else 240,
+                                     sender_needle='google')
+            if code:
+                break
+            last_err = ('google verification email not found '
+                        f'({session.get("backend")}; '
+                        f'inbox: {mailgen._inbox_digest(session)})')
         if not code:
-            return False, ('google verification email not found '
-                           f'({session.get("backend")}; '
-                           f'inbox: {mailgen._inbox_digest(session)})')
+            return False, (last_err
+                           or 'google verification email not found')
         if not _fill_first(page, ['css:input#code', 'css:input[name=code]',
                                   'css:input[inputmode=numeric]',
                                   '@placeholder:Enter code',
@@ -2283,6 +2328,48 @@ def signup_gemini() -> Tuple[bool, str]:
         # hop? A signed-out landing there means the session died earlier
         # (verification wall / consent dismissed into sign-in).
         post_consent = str(_body_head(page) or '').replace('\n', ' ')[:90]
+        # 2026-10 measured: right after consent Google can interject
+        # "before creating an account, Google needs to verify some info
+        # about you" — the account IS created (and saved below), but the
+        # session is withheld until the check passes. Try the email branch
+        # with the SAME mailbox (a second code, same fetch_otp): if Google
+        # offers "verify your email" this completes the check without any
+        # extra browser; a phone-only wall falls through to the poll below
+        # and the cookie harvest stays as bounded as before.
+        if 'verify some info' in post_consent.lower():
+            _click_any(page, ['Verify your email', 'Get a code by email',
+                              'Verify by email'])
+            time.sleep(4)
+            code2 = mailgen.fetch_otp(session, max_wait_s=180,
+                                      sender_needle='google')
+            if code2 and _fill_first(
+                    page, ['css:input#code', 'css:input[name=code]',
+                           'css:input[inputmode=numeric]',
+                           '@placeholder:Enter code',
+                           'css:input[type=text]'], code2):
+                _click_and_fire(page, ['Next', 'Weiter'],
+                                'accounts.google.com')
+                time.sleep(6)
+                post_consent = str(_body_head(page) or '').replace(
+                    '\n', ' ')[:90]
+            else:
+                # the branch didn't complete — record what the interstitial
+                # actually offers (2026-10: measured as Google's phone gate
+                # on flagged signups; if an email option exists under other
+                # wording the next attempt's detail will name it)
+                try:
+                    opts = page.run_js(
+                        "return Array.from(document.querySelectorAll("
+                        "'button,[role=button],a,li'))"
+                        ".map(e => (e.innerText || '').trim())"
+                        ".filter(t => t && t.length < 60)"
+                        ".slice(0, 25);") or []
+                except Exception:  # noqa: BLE001
+                    opts = []
+                seen = list(dict.fromkeys(str(t) for t in opts))
+                if seen:
+                    post_consent = (post_consent + ' | options: '
+                                    + ' / '.join(seen[:6]))[:220]
 
         def _has_psid() -> bool:
             try:
@@ -2465,10 +2552,17 @@ def signup_claude() -> Tuple[bool, str]:
         code_filled = False
         retries = 0
         states: List[str] = []
-        # the SPA exchange can stall on "loading..." well past a minute and
-        # only then render the 6-digit verify input — poll for BOTH outcomes
-        # and fill the emailed code the moment an input shows up
-        sub_deadline = time.time() + 150
+        # The SPA exchange runs claude's browser check and a flagged
+        # session lands on "couldn't verify your browser" (measured
+        # 2026-10: the check failed once within 150s and the 6-digit
+        # input never rendered on that error page). Give it a full 5
+        # minutes of "try again" rounds — the page's own challenge widget
+        # sometimes passes on a later round — and every second failure
+        # re-open the magic link itself, which re-fires the exchange from
+        # scratch (equivalent to "start over" while keeping the emailed
+        # token). Poll for BOTH outcomes: the sessionKey, or the 6-digit
+        # verify input the moment it renders.
+        sub_deadline = time.time() + 300
         while time.time() < sub_deadline:
             session_key = _claude_session_key(page)
             if session_key:
@@ -2477,11 +2571,12 @@ def signup_claude() -> Tuple[bool, str]:
             if head and (not states or states[-1] != head[:60]):
                 states.append(head[:60])
             if 'verify' in head and 'try again' in head:
-                # the exchange failed claude's browser check — "try again"
-                # re-fires it, and retries sometimes pass once the page's
-                # own challenge widget has quietly completed
                 retries += 1
-                _click_any(page, ['Try again', 'try again'])
+                if retries % 2 == 0:
+                    page.get(magic)
+                    time.sleep(5)
+                else:
+                    _click_any(page, ['Try again', 'try again'])
             if code_m and not code_filled and _fill_first(
                     page, ['css:input[inputmode=numeric]',
                            'css:input[name=code]', '@placeholder:code',
@@ -3744,12 +3839,24 @@ def _breaker_cooldown() -> float:
     return max(60.0, float(os.getenv('I4F_BREAKER_COOLDOWN_S', '1800') or 1800))
 
 
+def _signup_breaker_cooldown() -> float:
+    """Cooldown for the SIGNUP rung's breaker. A signup attempt is the most
+    expensive kind of renewal (a multi-minute Chromium flow), so a rung that
+    fails systematically must not retry every 30 minutes: after N consecutive
+    failures it sleeps for hours instead (default 12h, floor at the plain
+    breaker cooldown). One success resets it via _rung_result."""
+    return max(_breaker_cooldown(),
+               float(os.getenv('I4F_SIGNUP_BREAKER_COOLDOWN_S', '43200')
+                     or 43200))
+
+
 def _rung_open(name: str, rung: str) -> bool:
     with _STATE.lock:
         return time.time() < _STATE.rung_blocked_until.get((name, rung), 0.0)
 
 
 def _rung_result(name: str, rung: str, ok: bool) -> None:
+    opened = 0.0
     with _STATE.lock:
         key = (name, rung)
         if ok:
@@ -3760,14 +3867,36 @@ def _rung_result(name: str, rung: str, ok: bool) -> None:
         _STATE.rung_fails[key] = n
         if n >= _breaker_n():
             _STATE.rung_fails[key] = 0
-            _STATE.rung_blocked_until[key] = time.time() + _breaker_cooldown()
-    if not ok:
-        with _STATE.lock:
-            open_ = time.time() < _STATE.rung_blocked_until.get((name, rung), 0.0)
-        if open_:
-            _log_history(name, 'breaker-open',
-                         f'{rung}: {_breaker_n()} consecutive failures -> '
-                         f'{_breaker_cooldown():.0f}s cooldown')
+            # signup failures cost a browser flow each — a rung that keeps
+            # failing there sleeps for hours, not minutes
+            cooldown = (_signup_breaker_cooldown() if rung == 'signup'
+                        else _breaker_cooldown())
+            _STATE.rung_blocked_until[key] = time.time() + cooldown
+            opened = cooldown
+    if opened:
+        _log_history(name, 'breaker-open',
+                     f'{rung}: {_breaker_n()} consecutive failures -> '
+                     f'{opened:.0f}s cooldown')
+
+
+_BAN_PATTERNS = ('account_banned', 'banned', 'suspended', 'deactivated')
+
+
+def _permanent_auth_block(name: str) -> bool:
+    """True when the live probe reports the account itself gone for good
+    (ban/suspension/deactivation). A banned credential can never be
+    refreshed or re-logged-into, so the ladder should rotate to a fresh
+    signup instead of spending its rungs (and breaker history) on the
+    corpse. HTTP-only: the probe is a cheap authenticated GET, no browser."""
+    try:
+        from . import selfheal
+        status, detail = selfheal._probe_once(name)
+    except Exception:  # noqa: BLE001
+        return False
+    if str(status) != 'auth':
+        return False
+    low = str(detail).lower()
+    return any(p in low for p in _BAN_PATTERNS)
 
 
 def _renew_locked(name: str, reason: str) -> Dict[str, Any]:
@@ -3819,7 +3948,17 @@ def _renew_locked(name: str, reason: str) -> Dict[str, Any]:
         else:
             status = 'fail'
 
-    if _env_bool('I4F_REFRESHER_LOGIN', True) and not _rung_open(name, 'login'):
+    # A permanently dead account can never be refreshed back: rotate to a
+    # fresh signup instead of burning the browser-login rung (and its
+    # breaker history) against the corpse.
+    banned = status == 'fail' and _permanent_auth_block(name)
+    if banned:
+        steps.append('ban detected — rotating to a fresh account')
+        _log_history(name, 'ban-rotate',
+                     'account banned/suspended — skipping refresh/login, '
+                     'rotating straight to signup')
+    if (not banned and _env_bool('I4F_REFRESHER_LOGIN', True)
+            and not _rung_open(name, 'login')):
         ok, detail = browser_login(name)
         steps.append(f'login: {detail}')
         _log_history(name, 'browser-login', detail)

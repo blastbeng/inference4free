@@ -499,7 +499,8 @@ def available() -> bool:
 
 
 def create_email(domain_suffixes: Optional[Tuple[str, ...]] = None,
-                 no_gmail: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
+                 no_gmail: bool = False,
+                 exclude_backends: Tuple[str, ...] = ()) -> Tuple[Optional[Dict[str, Any]], str]:
     """Create a throwaway mailbox. Returns (session, error).
 
     Session is a dict with backend/address and (for mail.tm) credentials.
@@ -527,6 +528,11 @@ def create_email(domain_suffixes: Optional[Tuple[str, ...]] = None,
         # the googlemail.com alias outright, so its rungs need a non-gmail
         # disposable (tempmail.lol domains pass Google's blocklist).
         backends = tuple(b for b in backends if b is not _emailnator_create)
+    if exclude_backends:
+        # callers rotating across backends after a delivery failure name the
+        # spent maker by function name (e.g. ('_tempmail_create',))
+        backends = tuple(b for b in backends
+                         if b.__name__ not in exclude_backends)
     errors: List[str] = []
 
     def _accepted(session: Optional[Dict[str, Any]]) -> bool:
