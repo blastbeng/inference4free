@@ -181,6 +181,7 @@ class QwenRelay:
         self._page = None
         self._lock = threading.RLock()
         self._loaded_at: float = 0.0
+        self._last_used: float = 0.0
         self._offered: List[str] = []  # display titles seen in the picker
 
     # ------------------------------------------------------------- lifecycle
@@ -366,6 +367,27 @@ class QwenRelay:
                 except Exception:  # noqa: BLE001
                     pass
                 self._page = None
+
+    def reap_if_idle(self, stale_after: float) -> None:
+        """Close the browser when idle past ``stale_after`` seconds.
+
+        Without this the ~300-500 MB Chromium footprint of the guest session
+        stays resident forever after the first stream (the next stream
+        cold-starts a fresh session via _build, same as the RelayPunish
+        recovery path). Zero-timeout lock acquire: a reap can never race an
+        in-flight stream (stream() holds the lock across its yields)."""
+        if self._page is None or self._last_used <= 0:
+            return
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            if (self._page is not None and self._last_used > 0
+                    and time.time() - self._last_used > stale_after):
+                logger.debug('qwen relay idle %.0fs — reaper closing',
+                             time.time() - self._last_used)
+                self.shutdown()
+        finally:
+            self._lock.release()
 
     # ------------------------------------------------------------- streaming
     def _composer(self):
@@ -622,7 +644,9 @@ class QwenRelay:
         """
         if not self.enabled():
             raise RuntimeError('qwen relay disabled')
+        _start_reaper()
         with self._lock:
+            self._last_used = time.time()
             self._ensure()
             for attempt in (1, 2):
                 try:
@@ -636,6 +660,7 @@ class QwenRelay:
                     self._resend_if_swallowed(prompt)
                     entry = self._wait_entry()
                     yield from self._drain(int(entry['id']), model)
+                    self._last_used = time.time()
                     return
                 except RelayPunish:
                     logger.warning('qwen relay: stream failed; rebuilding session')
@@ -660,6 +685,43 @@ class QwenRelay:
 
 _RELAY: Optional[QwenRelay] = None
 _RELAY_LOCK = threading.Lock()
+_RELAY_REAPER: Optional[threading.Thread] = None
+
+
+def _stale_after() -> float:
+    """Idle seconds after which the reaper closes the relay browser
+    (``I4F_QWEN_RELAY_STALE_AFTER``, default 10 min — matches the z.ai
+    session reaper; 0/empty keeps the browser resident forever)."""
+    raw = (os.getenv('I4F_QWEN_RELAY_STALE_AFTER', '600') or '').strip()
+    try:
+        val = float(raw) if raw else 0.0
+    except ValueError:
+        return 600.0
+    return max(60.0, val) if val > 0 else float('inf')
+
+
+def _reaper_loop(stale_after: float) -> None:
+    """Periodically close the relay browser idle beyond ``stale_after``."""
+    interval = 60.0 if stale_after == float('inf') \
+        else max(30.0, min(60.0, stale_after / 4))
+    while True:
+        time.sleep(interval)
+        try:
+            get_relay().reap_if_idle(stale_after)
+        except Exception:  # noqa: BLE001 — reaping is best effort
+            logger.debug('qwen relay reaper failed', exc_info=True)
+
+
+def _start_reaper() -> None:
+    """Start the idle-session reaper once, when the relay is first used."""
+    global _RELAY_REAPER
+    with _RELAY_LOCK:
+        if _RELAY_REAPER is not None and _RELAY_REAPER.is_alive():
+            return
+        _RELAY_REAPER = threading.Thread(
+            target=_reaper_loop, args=(_stale_after(),),
+            name='qwen-relay-reaper', daemon=True)
+        _RELAY_REAPER.start()
 
 
 def get_relay() -> QwenRelay:

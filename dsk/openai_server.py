@@ -106,7 +106,9 @@ async def lifespan(_app: FastAPI):
         # not pay the ~30-60s browser spawn + captcha flow. Fire-and-forget.
         def _prewarm_zai():
             try:
-                from .providers.glm_provider import _zai_browser
+                from .providers.glm_provider import _zai_browser, _browser_enabled
+                if not _browser_enabled():
+                    return  # I4F_ZAI_BROWSER=false — no chromium at all
                 b = _zai_browser()
                 # Serialize with real requests: _ensure() is not thread-safe
                 # (it may close/replace the page), so warm up under the
