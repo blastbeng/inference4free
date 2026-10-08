@@ -66,7 +66,7 @@ from .providers.base import (
     fetch_image_bytes,
     parse_data_uri,
 )
-from .providers.router import Router
+from .providers.router import Router, public_model_id
 
 HOST = os.getenv("I4F_HOST", "0.0.0.0")
 PORT = int(os.getenv("I4F_PORT", "8000"))
@@ -101,6 +101,20 @@ async def lifespan(_app: FastAPI):
         _refresher.start_daemon()
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[refresher] daemon unavailable: {exc}")
+    try:
+        from dsk import toolprobe as _toolprobe
+
+        def _leaf_models() -> List[str]:
+            try:
+                return [public_model_id(r.provider_name, r.model_id)
+                        for r in ROUTER.routes.values()
+                        if r.provider_name != 'router']
+            except Exception:  # noqa: BLE001 — registry not ready yet
+                return []
+
+        _toolprobe.start_prober(_leaf_models)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[toolprobe] prober unavailable: {exc}")
     try:
         # Pre-warm one z.ai browser session so the FIRST glm request does
         # not pay the ~30-60s browser spawn + captcha flow. Fire-and-forget.
@@ -294,6 +308,28 @@ def _chain_capability(route, key: str) -> Optional[bool]:
     if getattr(route, key, False):
         return True
     return any(getattr(ROUTER.routes[f], key, False) for f in fallbacks)
+
+
+def _tool_traffic_signal(pub: Optional[str], success: bool, soft: bool) -> None:
+    """Feed the dynamic tool-probe with real-traffic outcomes.
+
+    A request carrying tools that produced a tool call is a positive signal
+    (re-includes an excluded model instantly); a request answered without a
+    call under ``tool_choice='required'`` is an unambiguous soft failure
+    (K consecutive ones exclude the model). Best-effort: never raises."""
+    if not pub:
+        return
+    try:
+        from dsk import toolprobe
+        if success:
+            toolprobe.record_success(pub, 'traffic: tool call produced')
+        elif soft:
+            if toolprobe.record_soft_failure(
+                    pub, 'traffic: no tool call under tool_choice=required'):
+                logger.warning(
+                    'toolprobe: %s excluded after repeated soft failures', pub)
+    except Exception:  # noqa: BLE001 — signals are best-effort
+        pass
 
 
 def _llmtrim_stage(messages: List[ChatMessage], route: Route) -> List[ChatMessage]:
@@ -1259,7 +1295,44 @@ async def list_models(request: Request):
     # up to a minute (browser-warming providers), so doing it inline here made
     # every stale first load hang on "loading…" until the manual reload.
     ROUTER.maybe_refresh_async()
-    return {"object": "list", "data": ROUTER.list_models()}
+    data = ROUTER.list_models()
+    try:  # dynamic tool-calling capability: flag + drop known-failed models
+        from dsk import toolprobe
+        data = toolprobe.annotate_models(data)
+    except Exception:  # noqa: BLE001 — listing must never fail on the probe
+        pass
+    return {"object": "list", "data": data}
+
+
+@app.get("/toolcall/status")
+async def toolcall_status(request: Request):
+    """Dynamic tool-calling probe state for every served model."""
+    _check_api_key(request)
+    from dsk import toolprobe
+    return {"object": "list", "data": toolprobe.status_snapshot()}
+
+
+@app.post("/toolcall/reprobe")
+async def toolcall_reprobe(request: Request):
+    """Schedule an immediate canary probe for one model (JSON or ?model=)."""
+    _check_api_key(request)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 — empty/invalid body falls back to query
+        payload = {}
+    model_id = ''
+    if isinstance(payload, dict):
+        model_id = str(payload.get('model') or '')
+    if not model_id:
+        model_id = request.query_params.get('model') or ''
+    if not model_id:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "missing 'model' (JSON body or query param)",
+            "type": "invalid_request_error"}})
+    from dsk import toolprobe
+    toolprobe.force_probe(model_id)
+    return {"ok": True, "model": model_id,
+            "status": toolprobe.capability(model_id)}
 
 
 def _error_status(err: ProviderError) -> tuple:
@@ -1320,6 +1393,40 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 },
             )
     use_tools = bool(body.tools) and body.tool_choice != "none"
+    # The canary probe itself carries tools and targets possibly-excluded
+    # models — it must reach them or an excluded model could never re-enter
+    # (the gate's 400 would keep the probe at 'infra' forever).
+    _from_probe = (request.headers.get("x-i4f-toolprobe") == "1")
+    if use_tools and route.provider_name != 'router' and not _from_probe:
+        # Dynamic tool-calling gate: a model the canary/traffic probe proved
+        # incapable answers 400 with the tool-capable alternatives — it is
+        # re-probed on a schedule and becomes selectable again on pass.
+        _gate = None
+        try:
+            from dsk import toolprobe as _gate
+        except Exception:  # noqa: BLE001 — probing is best-effort
+            _gate = None
+        if _gate is not None:
+            _pub_model = public_model_id(route.provider_name, route.model_id)
+            if _gate.capability(_pub_model) == 'failed':
+                try:
+                    _capable = [m['id'] for m in _gate.annotate_models(
+                        ROUTER.list_models()) if m.get('tools') is not False]
+                except Exception:  # noqa: BLE001
+                    _capable = []
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                f"Model {_pub_model} does not support tool "
+                                "calling. Tool-capable models: "
+                                + ", ".join(_capable[:10])),
+                            "type": "invalid_request_error",
+                            "code": "model_does_not_support_tools",
+                        }
+                    },
+                )
     # Continuation turn? Once a tool result is in the history, the "call the
     # tool" instructions flip from helpful to harmful: models re-issue the
     # same call (agent-loop repeat bug) instead of consuming the result. The
@@ -1369,6 +1476,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         search_override=search_override,
         images=images or None,
         no_proxy=body.disable_proxy,
+        tools=use_tools,
+        tools_ignore_probe=_from_probe,
     )
 
     # ---- Streaming ----
@@ -1377,7 +1486,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         return StreamingResponse(
             _stream_completion(chunk_gen, created, model_name,
                                use_tools, include_usage, prompt_len,
-                               tools=body.tools),
+                               tools=body.tools,
+                               soft_signal=(body.tool_choice == "required"
+                                            and not has_tool_result)),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1391,25 +1502,27 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         c_parts: List[str] = []
         r_parts: List[str] = []
         n_chunks = 0
-        served = {"by": None}
+        served = {"by": None, "pub": None}
         for chunk in chunk_gen:
             n_chunks += 1
             served["by"] = chunk.get("served_by") or served["by"]
+            served["pub"] = chunk.get("served_pub") or served["pub"]
             if chunk.get("type") == "thinking" and chunk.get("content"):
                 r_parts.append(chunk["content"])
             elif chunk.get("type") == "image" and chunk.get("content"):
                 c_parts.append(chunk["content"])
             elif chunk.get("type") == "text" and chunk.get("content"):
                 c_parts.append(chunk["content"])
-        return c_parts, r_parts, n_chunks, served["by"]
+        return c_parts, r_parts, n_chunks, served["by"], served["pub"]
 
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
     served_by: Optional[str] = None
+    served_pub: Optional[str] = None
     try:
         # Consume the blocking provider stream in a worker thread — pulling
         # it on the event loop would serialize ALL requests behind this one.
-        content_parts, reasoning_parts, n_chunks, served_by = (
+        content_parts, reasoning_parts, n_chunks, served_by, served_pub = (
             await asyncio.get_running_loop().run_in_executor(
                 None, _collect))
     except ProviderError as e:
@@ -1430,6 +1543,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     if use_tools:
         pre_text, calls = _parse_tool_calls(full_text)
         calls = _resolve_tool_names(calls, body.tools)
+        _tool_traffic_signal(
+            served_pub or public_model_id(route.provider_name,
+                                          route.model_id),
+            bool(calls),
+            body.tool_choice == 'required' and not has_tool_result)
 
     message: Dict[str, Any] = {
         "role": "assistant",
@@ -1479,6 +1597,7 @@ async def _stream_completion(
     include_usage: bool = False,
     prompt_len: int = 0,
     tools: Optional[List[Dict[str, Any]]] = None,
+    soft_signal: bool = False,
 ):
     """Streams a provider-agnostic chunk generator into OpenAI-style SSE chunks.
 
@@ -1518,7 +1637,7 @@ async def _stream_completion(
     # for cross-thread put_nowait and can deadlock the event loop).
     q: "queue.Queue[Optional[str]]" = queue.Queue()
     finish_holder = {"reason": "stop"}
-    served_holder = {"by": None}
+    served_holder = {"by": None, "pub": None}
     errored = {"flag": False}
     stop = threading.Event()
     out_chars = {"n": 0}   # completion characters (for include_usage stats)
@@ -1600,6 +1719,8 @@ async def _stream_completion(
                 content = chunk.get("content", "") or ""
                 if not served_holder["by"] and chunk.get("served_by"):
                     served_holder["by"] = chunk["served_by"]
+                if not served_holder["pub"] and chunk.get("served_pub"):
+                    served_holder["pub"] = chunk["served_pub"]
                 if not content:
                     continue
                 if ctype == "image":
@@ -1652,6 +1773,8 @@ async def _stream_completion(
             if use_tools:
                 _pre, calls = _parse_tool_calls(text)
                 calls = _resolve_tool_names(calls, tools)
+                _tool_traffic_signal(served_holder["pub"], bool(calls),
+                                     soft_signal)
                 if calls:
                     if boundary is not None:
                         _emit_upto(boundary)  # release any prose tail

@@ -1102,6 +1102,8 @@ class Router:
                images: Optional[List[Dict[str, Any]]] = None,
                image_generation: bool = False,
                no_proxy: bool = False,
+               tools: bool = False,
+               tools_ignore_probe: bool = False,
                ) -> Generator[Dict[str, Any], None, None]:
         """Yield unified chunks, retrying rate limits/network errors and
         falling back through the route's chain when a provider keeps failing.
@@ -1112,6 +1114,9 @@ class Router:
 
         ``images``/``image_generation`` restrict the fallback chain to
         vision/image-gen capable targets and are forwarded to the provider.
+        ``tools`` restricts it to targets whose dynamic tool-calling probe
+        (see dsk/toolprobe.py) has not failed; excluded models re-enter the
+        chain automatically when a later probe passes.
         """
         thinking = route.thinking_enabled if thinking_override is None else thinking_override
         search = route.search_enabled if search_override is None else search_override
@@ -1167,6 +1172,34 @@ class Router:
                     f'chatgpt, gemini — they need credentials; the bot '
                     f'creates them automatically when possible)')
             chain = capable
+
+        if tools and not tools_ignore_probe:
+            # Tool-calling requests may only be served by targets whose
+            # dynamic probe (canary or real traffic) has not disproved the
+            # capability. Unknown targets stay in (optimistic — they are
+            # probed on a schedule); known-failed ones drop out and re-enter
+            # automatically when a later probe passes.
+            try:
+                from dsk import toolprobe as _toolprobe
+            except Exception:  # pragma: no cover - defensive
+                _toolprobe = None
+            if _toolprobe is not None:
+                tool_capable = [mid for mid in chain
+                                if (tgt := self.routes.get(mid))
+                                and _toolprobe.capability(
+                                    public_model_id(tgt.provider_name, mid))
+                                != 'failed']
+                if tool_capable:
+                    chain = tool_capable
+                else:
+                    # Every target is known-failed: keep the original chain.
+                    # The /v1 gate already 400s failed leaf models (except
+                    # the canary, which must reach them to re-test) — refusing
+                    # here would make excluded models unreachable for their
+                    # own re-probe (dead loop).
+                    logger.info(
+                        'toolprobe: no tool-capable target in chain of %s — '
+                        'serving the original chain', route.model_id)
 
         for position, model_id in enumerate(chain):
             target = self.routes.get(model_id)
@@ -1243,6 +1276,10 @@ class Router:
                             self._mark_served(target.provider_name)
                             if isinstance(first, dict):
                                 first.setdefault('served_by', served_by)
+                                first.setdefault(
+                                    'served_pub',
+                                    public_model_id(target.provider_name,
+                                                    target.model_id))
                             yield first
                     rest = (_silence_guard(gen, STREAM_SILENCE_TIMEOUT)
                             if (first is not None
@@ -1257,6 +1294,10 @@ class Router:
                             self._mark_served(target.provider_name)
                         if isinstance(chunk, dict):
                             chunk.setdefault('served_by', served_by)
+                            chunk.setdefault(
+                                'served_pub',
+                                public_model_id(target.provider_name,
+                                                target.model_id))
                         yield chunk
                     return
                 except ProviderRateLimitError as e:

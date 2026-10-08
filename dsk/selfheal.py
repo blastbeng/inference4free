@@ -802,6 +802,14 @@ def probe_cycle() -> Dict[str, Dict[str, Any]]:
                 results[name]['renew'] = refresher.renew(name, reason='auth')
             except Exception as e:  # noqa: BLE001
                 results[name]['renew'] = {'error': str(e)[:300]}
+            else:
+                renewed = results[name]['renew']
+                if isinstance(renewed, dict) and not renewed.get('error'):
+                    try:  # fresh credentials: re-probe tool calling soon
+                        from dsk import toolprobe
+                        toolprobe.mark_provider_dirty(name)
+                    except Exception:  # noqa: BLE001
+                        pass
     return results
 
 
