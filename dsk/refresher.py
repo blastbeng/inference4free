@@ -597,13 +597,17 @@ def _anonymous(provider: str):
 def _egress_rotate_providers() -> set:
     """Anonymous providers whose refusals are a property of the exit IP.
 
-    Anonymous Copilot is geo-blocked from EU egresses and anonymous
-    Perplexity answers ``fraud_authwall_upsell`` for datacenter IPs. Neither
-    has a credential, so the credential ladder can never fix them — the only
-    lever is the egress. Both are served by the proxy pool, so rotating to a
-    fresh exit is the automatic rung.
+    Anonymous Copilot is geo-blocked from EU egresses (edge 460), so the
+    only lever is the exit IP and the early-return rotation rung is the
+    whole renewal. Perplexity USED to sit here too ("fraud_authwall_upsell
+    for datacenter IPs") — measured 2026-10 across direct AND several
+    rotated pool egresses, that wall is session-shaped, not egress-shaped:
+    no fresh IP ever lifted it, and the rotation early-return masked the
+    real fix. Perplexity now has a credential path (the NextAuth magic-link
+    signup rung), so it belongs to the credential ladder. Override with
+    I4F_EGRESS_ROTATE.
     """
-    raw = os.getenv('I4F_EGRESS_ROTATE', 'copilot,perplexity,duck')
+    raw = os.getenv('I4F_EGRESS_ROTATE', 'copilot,duck')
     return {p.strip().lower() for p in raw.split(',') if p.strip()}
 
 
