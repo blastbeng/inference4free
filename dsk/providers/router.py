@@ -84,6 +84,7 @@ PROVIDER_MODULES = (
     ('glm', '.glm_provider', 'GlmProvider'),
     ('duck', '.duck_provider', 'DuckProvider'),
     ('pollinations', '.pollinations_provider', 'PollinationsProvider'),
+    ('arena', '.arena_provider', 'ArenaProvider'),
 )
 
 OWNED_BY = {
@@ -100,6 +101,7 @@ OWNED_BY = {
     'glm': 'zai',
     'duck': 'duckduckgo',
     'pollinations': 'pollinations',
+    'arena': 'arena',
 }
 
 # Public model-id namespaces: every model surfaced via /v1/models and the
@@ -121,6 +123,7 @@ PUBLIC_PREFIX = {
     'glm': 'z.ai',
     'duck': 'duck',
     'pollinations': 'pollinations',
+    'arena': 'arena',
 }
 
 # Reverse of PUBLIC_PREFIX: 'z.ai' -> 'glm', used by resolve() so both the
@@ -346,7 +349,7 @@ AUTO_CATEGORIES: Dict[str, List[str]] = {
     'summarize':   ['chatgpt', 'gemini', 'glm', 'qwen', 'mistral', 'deepseek'],
     'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt'],
     'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral',
-                    'kimi', 'pollinations'],
+                    'kimi', 'pollinations', 'arena'],
 }
 
 _RE_CODE_FENCE = re.compile(

@@ -124,7 +124,8 @@ def _jar_path(name: str) -> Path:
              'copilot': 'copilot_cookies.json',
              'perplexity': 'perplexity_cookies.json', 'glm': 'glm_cookies.json',
              'duck': 'duck_cookies.json',
-             'pollinations': 'pollinations_cookies.json'}
+             'pollinations': 'pollinations_cookies.json',
+             'arena': 'arena_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -405,6 +406,16 @@ def _has_creds(name: str) -> bool:
         return bool(jar.get('token'))
     if name in ('copilot', 'perplexity', 'glm', 'duck', 'pollinations'):
         return True  # anonymous reverse-engineered modes always available
+    if name == 'arena':
+        # Dormant credential provider: the stream API answers 401 "User not
+        # found" without an authenticated session. Public disposable pools
+        # are domain-blocklisted and gmail aliases normalize to bot-squatted
+        # accounts, so the only viable path is an operator-provided cookie
+        # dump (or signup once I4F_MAIL_DOMAIN is configured). Any jar entry
+        # counts as provisioned — the 401 gate is enforced at request time.
+        if (os.getenv('ARENA_COOKIES', '') or '').strip():
+            return True
+        return bool(_load_jar('arena'))
     if name == 'mistral':
         token = (os.getenv('MISTRAL_SESSION_TOKEN', '').strip()
                  or (_load_jar('mistral') or {}).get('session_token') or '')
@@ -970,7 +981,12 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'mistral': refresh_mistral, 'copilot': _anonymous('copilot'),
            'perplexity': refresh_perplexity, 'glm': _anonymous('glm'),
            'duck': _anonymous('duck'),
-           'pollinations': _anonymous('pollinations')}
+           'pollinations': _anonymous('pollinations'),
+           'arena': _manual_only(
+               'arena',
+               'session cookie required (browser login → arena_cookies.json '
+               'or ARENA_COOKIES env); disposable-mail domains are '
+               'blocklisted — signup needs I4F_MAIL_DOMAIN')}
 
 
 # ------------------------------------------------------------------ IMAP OTP
@@ -3768,7 +3784,11 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'copilot': _anonymous('copilot'),
           'perplexity': signup_perplexity, 'glm': _anonymous('glm'),
           'duck': _anonymous('duck'),
-          'pollinations': _anonymous('pollinations')}
+          'pollinations': _anonymous('pollinations'),
+          'arena': _manual_only(
+              'arena',
+              'signup requires an allowlisted email domain '
+              '(I4F_MAIL_DOMAIN catch-all) and a browser login')}
 
 
 # ------------------------------------------------------------------ renew

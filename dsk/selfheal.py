@@ -90,6 +90,7 @@ HEALABLE: Dict[str, Path] = {
     'glm': _BASE / 'providers' / 'glm_provider.py',
     'duck': _BASE / 'providers' / 'duck_provider.py',
     'pollinations': _BASE / 'providers' / 'pollinations_provider.py',
+    'arena': _BASE / 'providers' / 'arena_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -106,6 +107,7 @@ _MODULE_NAMES = {
     'glm': 'dsk.providers.glm_provider',
     'duck': 'dsk.providers.duck_provider',
     'pollinations': 'dsk.providers.pollinations_provider',
+    'arena': 'dsk.providers.arena_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -122,6 +124,7 @@ _PROVIDER_MODULES = {
     'glm': 'dsk.providers.glm_provider',
     'duck': 'dsk.providers.duck_provider',
     'pollinations': 'dsk.providers.pollinations_provider',
+    'arena': 'dsk.providers.arena_provider',
 }
 
 # Provider class name inside each module (used by probe/configured).
@@ -139,6 +142,7 @@ _PROVIDER_CLASSES = {
     'glm': 'GlmProvider',
     'duck': 'DuckProvider',
     'pollinations': 'PollinationsProvider',
+    'arena': 'ArenaProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -171,6 +175,9 @@ _EVIDENCE_PATTERNS = {
     'pollinations': [r'text\.pollinations\.ai[A-Za-z0-9_/{}$.\-]{0,60}',
                      r'image\.pollinations\.ai', r'/prompt/',
                      r'input_modalities', r'output_modalities'],
+    'arena': [r'nextjs-api/[A-Za-z0-9_/{}$.\-]{0,60}', r'create-evaluation',
+              r'model-catalog', r'recaptchaV3Token', r'post-to-evaluation',
+              r'provisional_user_id'],
 }
 
 
@@ -448,7 +455,9 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'copilot': 'https://copilot.microsoft.com',
             'perplexity': 'https://www.perplexity.ai',
             'glm': 'https://chat.z.ai',
-            'duck': 'https://duck.ai'}.get(name, '')
+            'duck': 'https://duck.ai',
+            'pollinations': 'https://pollinations.ai',
+            'arena': 'https://arena.ai'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []
