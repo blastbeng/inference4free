@@ -317,8 +317,8 @@ def _tool_traffic_signal(pub: Optional[str], success: bool, soft: bool) -> None:
     (re-includes an excluded model instantly); a request answered without a
     call under ``tool_choice='required'`` is an unambiguous soft failure
     (K consecutive ones exclude the model). Best-effort: never raises."""
-    if not pub:
-        return
+    if not pub or pub == 'auto' or pub.endswith('/auto'):
+        return  # router entries are never probed/tracked individually
     try:
         from dsk import toolprobe
         if success:
@@ -890,8 +890,25 @@ async def health():
         refresher_summary = _refresher.status()
     except Exception:
         refresher_summary = 'unavailable'
+    try:
+        from dsk import toolprobe as _toolprobe
+        _snap = _toolprobe.status_snapshot()
+        _counts: Dict[str, int] = {'ok': 0, 'failed': 0, 'unknown': 0}
+        for _e in _snap.values():
+            _counts[str(_e.get('status') or 'unknown')] = \
+                _counts.get(str(_e.get('status') or 'unknown'), 0) + 1
+        toolprobe_summary = {
+            'enabled': _toolprobe.enabled(),
+            'hide_toolless': _toolprobe.hide_toolless(),
+            'interval_s': _toolprobe.interval(),
+            'budget_s': _toolprobe.provider_budget_s(),
+            'tracked': len(_snap), **_counts,
+        }
+    except Exception:
+        toolprobe_summary = 'unavailable'
     return {"status": "ok", "proxy": proxy_summary,
-            "selfheal": selfheal_summary, "refresher": refresher_summary}
+            "selfheal": selfheal_summary, "refresher": refresher_summary,
+            "toolprobe": toolprobe_summary}
 
 
 @app.get("/selfheal/status")
@@ -1329,6 +1346,20 @@ async def toolcall_reprobe(request: Request):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "missing 'model' (JSON body or query param)",
             "type": "invalid_request_error"}})
+    if model_id == 'auto' or model_id.endswith('/auto'):
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "router models are not probed directly — reprobe "
+                       "one of their leaf models instead",
+            "type": "invalid_request_error"}})
+    known = {public_model_id(r.provider_name, r.model_id)
+             for r in ROUTER.routes.values()
+             if r.provider_name != 'router'}
+    known |= {mid for mid, r in ROUTER.routes.items()
+              if r.provider_name != 'router'}
+    if model_id not in known:
+        raise HTTPException(status_code=404, detail={"error": {
+            "message": f"unknown model {model_id!r} (not in the registry)",
+            "type": "invalid_request_error"}})
     from dsk import toolprobe
     toolprobe.force_probe(model_id)
     return {"ok": True, "model": model_id,
@@ -1396,7 +1427,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     # The canary probe itself carries tools and targets possibly-excluded
     # models — it must reach them or an excluded model could never re-enter
     # (the gate's 400 would keep the probe at 'infra' forever).
-    _from_probe = (request.headers.get("x-i4f-toolprobe") == "1")
+    # Loopback-only: the canary calls itself from 127.0.0.1; a LAN client
+    # must not be able to forge the header and bypass the gate.
+    _client_host = (request.client.host if request.client else '')
+    _from_probe = (request.headers.get("x-i4f-toolprobe") == "1"
+                   and _client_host in ("127.0.0.1", "::1"))
     if use_tools and route.provider_name != 'router' and not _from_probe:
         # Dynamic tool-calling gate: a model the canary/traffic probe proved
         # incapable answers 400 with the tool-capable alternatives — it is

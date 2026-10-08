@@ -409,11 +409,11 @@ def annotate_models(data: List[Dict[str, Any]]
             statuses = [s for m, s in leaf_status.items()
                         if (m.split('/', 1)[0] == prefix) or not prefix]
             e['tools'] = (True if any(s != 'failed' for s in statuses)
-                          else (False if statuses else None))
+                          else (False if statuses else 'unknown'))
             out.append(e)
             continue
         st = leaf_status.get(mid, 'unknown')
-        e['tools'] = {'ok': True, 'failed': False}.get(st)
+        e['tools'] = {'ok': True, 'failed': False}.get(st, 'unknown')
         if hide and st == 'failed':
             continue
         out.append(e)
