@@ -256,8 +256,33 @@ def _probe_once(name: str) -> Tuple[str, str]:
             api = provider._get_api()
             if api is None:
                 return 'auth', 'no DeepSeek credentials configured'
-            api._get_pow_challenge()
-            return 'ok', 'pow challenge ok'
+            try:
+                api._get_pow_challenge()
+            except Exception as e:  # noqa: BLE001
+                return 'network', f'pow challenge failed: {e}'
+            # A muted account (biz_code=5, "user is muted") answers the POW
+            # challenge happily but never streams — validate with a tiny
+            # completion instead of trusting the challenge alone.
+            try:
+                sid = api.create_chat_session()
+                first = next(api.chat_completion(
+                    sid, 'ping', thinking_enabled=False,
+                    search_enabled=False), None)
+            except Exception as e:  # noqa: BLE001 — classify by message
+                msg = str(e) or type(e).__name__
+                low = msg.lower()
+                if any(k in low for k in ('mute', 'auth', 'token', '401',
+                                          'waf', 'cookie')):
+                    return 'auth', msg
+                if any(k in low for k in ('rate', '429')):
+                    return 'rate', msg
+                if any(k in low for k in ('network', 'timeout', 'html')):
+                    return 'network', msg
+                return 'structural', msg
+            if first is None:
+                return 'structural', 'completion produced no events ' \
+                                     '(muted account or WAF page?)'
+            return 'ok', 'completion responds'
         if name == 'qwen':
             # The model picker is anonymous, so listing models proves
             # nothing — validate the session token against /api/v1/auths.

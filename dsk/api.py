@@ -346,7 +346,13 @@ class DeepSeekAPI:
                 else:
                     raise APIError(f"API request failed: {error_text}", response.status_code)
 
+            first = True
             for chunk in response.iter_lines():
+                if first:
+                    first = False
+                    head_err = self._classify_completion_head(chunk)
+                    if head_err is not None:
+                        raise head_err
                 try:
                     parsed = self._parse_chunk(chunk)
                     # the initial snapshot can carry MULTIPLE fragments
@@ -363,6 +369,47 @@ class DeepSeekAPI:
 
         except requests.exceptions.RequestException as e:
             raise NetworkError(f"Network error occurred during streaming: {str(e)}")
+
+    def _classify_completion_head(self, chunk):
+        """Inspect the first line of a completion response.
+
+        Returns the exception to raise when the response is not a stream:
+        a muted/censored account (biz_code) or an HTML WAF/SPA page. None
+        means the line is a normal stream head (or parseable noise that
+        _parse_chunk handles). DeepSeek answers a muted account with
+        HTTP 200 + {"data":{"biz_code":5,"biz_msg":"user is muted"}} and a
+        failed WAF check with the SPA shell — both look like success to a
+        naive reader and previously surfaced as an empty stream.
+        """
+        if not chunk:
+            return None
+        head = chunk[:800] if isinstance(chunk, bytes) else \
+            str(chunk)[:800].encode('utf-8', 'ignore')
+        low = head.lstrip().lower()
+        if low.startswith((b'<!doctype', b'<html')):
+            try:
+                self._refresh_cookies()
+            except Exception:  # noqa: BLE001 — best-effort refresh
+                pass
+            return NetworkError('deepseek served an HTML page instead of the '
+                                'completion stream (WAF challenge) — '
+                                'cookies refreshed')
+        try:
+            peek = json.loads(head.decode('utf-8', 'ignore').strip() or 'null')
+        except Exception:  # noqa: BLE001 — SSE head, not a JSON verdict
+            return None
+        if not isinstance(peek, dict):
+            return None
+        data = peek.get('data') if isinstance(peek.get('data'), dict) else peek
+        biz_code = data.get('biz_code')
+        biz_msg = str(data.get('biz_msg') or '')
+        if biz_code not in (None, 0):
+            if data.get('is_muted') or 'mute' in biz_msg.lower():
+                return AuthenticationError(
+                    f'deepseek account muted (biz_code={biz_code}: {biz_msg})')
+            return APIError(f'deepseek rejected completion '
+                            f'(biz_code={biz_code}: {biz_msg})', 200)
+        return None
 
     def _parse_chunk(self, chunk: bytes) -> Optional[Dict[str, Any]]:
         """Parse a SSE chunk from the API response.
