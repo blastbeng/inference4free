@@ -405,9 +405,23 @@ def _has_creds(name: str) -> bool:
     if name in ('copilot', 'perplexity', 'glm', 'duck'):
         return True  # anonymous reverse-engineered modes always available
     if name == 'mistral':
-        if os.getenv('MISTRAL_SESSION_TOKEN', '').strip():
-            return True
-        return bool((_load_jar('mistral') or {}).get('session_token'))
+        token = (os.getenv('MISTRAL_SESSION_TOKEN', '').strip()
+                 or (_load_jar('mistral') or {}).get('session_token') or '')
+        if not token:
+            return False
+        # The Ory session dies server-side while the token string sits in
+        # the jar: presence proves nothing. A cheap authenticated GET is
+        # the real check — an expired session answers 401 and Mistral then
+        # serves every chat as ANONYMOUS quota (5 msgs/day, IP-bound).
+        try:
+            from curl_cffi import requests as _rq
+            r = _rq.get('https://chat.mistral.ai/api/v1/usage',
+                        headers={'Authorization': f'Bearer {token}',
+                                 'Cookie': f'ory_kratos_session={token}'},
+                        impersonate='chrome120', timeout=20)
+            return r.status_code == 200
+        except Exception:  # noqa: BLE001 — network error: treat as invalid
+            return False
     # gemini: a real session means a __Secure-1PSID cookie (env already
     # merged into the jar by _load_jar). Other google.com cookies alone
     # are not a usable session.
