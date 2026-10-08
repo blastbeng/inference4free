@@ -125,7 +125,8 @@ def _jar_path(name: str) -> Path:
              'perplexity': 'perplexity_cookies.json', 'glm': 'glm_cookies.json',
              'duck': 'duck_cookies.json',
              'pollinations': 'pollinations_cookies.json',
-             'arena': 'arena_cookies.json'}
+             'arena': 'arena_cookies.json',
+             'huggingchat': 'huggingchat_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -416,6 +417,13 @@ def _has_creds(name: str) -> bool:
         if (os.getenv('ARENA_COOKIES', '') or '').strip():
             return True
         return bool(_load_jar('arena'))
+    if name == 'huggingchat':
+        # Chat POSTs answer 401 "You have to be logged in." without an HF
+        # session; the model catalog is public. Any non-empty jar counts as
+        # provisioned — liveness is verified by the refresh rung (v2/user).
+        if (os.getenv('HUGGINGCHAT_COOKIES', '') or '').strip():
+            return True
+        return bool(_load_jar('huggingchat'))
     if name == 'mistral':
         token = (os.getenv('MISTRAL_SESSION_TOKEN', '').strip()
                  or (_load_jar('mistral') or {}).get('session_token') or '')
@@ -875,6 +883,36 @@ def refresh_kimi() -> Tuple[bool, str]:
     return True, f'session reachable (HTTP {resp.status_code})'
 
 
+def refresh_huggingchat() -> Tuple[bool, str]:
+    """Verify the HF session against /chat/api/v2/user.
+
+    The endpoint answers {"json": null} for anonymous visitors and the
+    profile object for a live session — a precise, cheap liveness probe.
+    """
+    if not _has_creds('huggingchat'):
+        return False, ('no huggingchat credentials — export cookies from '
+                       'huggingface.co/chat to huggingchat_cookies.json or '
+                       'set HUGGINGCHAT_COOKIES')
+    jar = _load_jar('huggingchat')
+    try:
+        resp = _http_get('https://huggingface.co/chat/api/v2/user', jar,
+                         headers={'Accept': 'application/json'})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (401, 403):
+        return False, 'session rejected — re-export cookies from huggingface.co'
+    if resp.status_code != 200:
+        return True, f'session reachable, user check inconclusive (HTTP {resp.status_code})'
+    try:
+        user = (resp.json() or {}).get('json')
+    except ValueError:
+        user = None
+    if user:
+        name = user.get('name') or user.get('username') or 'user'
+        return True, f'session live ({name})'
+    return False, 'cookies present but session is anonymous — re-export from a logged-in huggingface.co'
+
+
 def refresh_mistral() -> Tuple[bool, str]:
     """Best-effort token check: Ory Kratos whoami, lenient when unverifiable.
 
@@ -982,6 +1020,7 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'perplexity': refresh_perplexity, 'glm': _anonymous('glm'),
            'duck': _anonymous('duck'),
            'pollinations': _anonymous('pollinations'),
+           'huggingchat': refresh_huggingchat,
            'arena': _manual_only(
                'arena',
                'session cookie required (browser login → arena_cookies.json '
@@ -1504,7 +1543,8 @@ def _creds(name: str) -> Tuple[str, str]:
     prefix = {'deepseek': 'DEEPSEEK', 'chatgpt': 'CHATGPT', 'gemini': 'GEMINI',
               'claude': 'CLAUDE', 'grok': 'GROK', 'mistral': 'MISTRAL',
               'qwen': 'QWEN', 'kimi': 'KIMI', 'copilot': 'COPILOT',
-              'perplexity': 'PERPLEXITY', 'glm': 'GLM'}.get(name, name.upper())
+              'perplexity': 'PERPLEXITY', 'glm': 'GLM',
+              'huggingchat': 'HUGGINGCHAT'}.get(name, name.upper())
     email = os.getenv(f'{prefix}_LOGIN_EMAIL', '').strip()
     password = os.getenv(f'{prefix}_LOGIN_PASSWORD', '').strip()
     if email and password:
@@ -2638,6 +2678,78 @@ def signup_kimi() -> Tuple[bool, str]:
         return False, 'signup finished but no JWT found in localStorage'
     except Exception as e:  # noqa: BLE001
         return False, f'kimi signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
+def signup_huggingchat() -> Tuple[bool, str]:
+    """Create a huggingface.co account and save the chat session cookies.
+
+    Flow (browser): /join form (email + password + username) → HF emails a
+    verification link → open the link in the same session → the logged-in
+    cookie set (hf-chat + HF session) is dumped into the huggingchat jar.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://huggingface.co/join')
+        time.sleep(6)
+        probe_email = 'probe@example.invalid'
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, probe_email):
+            return False, 'huggingface join form not found (email field)'
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        password = session.get('password') or mailgen.gen_password()
+        username = (email.split('@')[0] or 'user') + str(int(time.time()) % 10000)
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _fill_first(page, _PASSWORD_SELECTORS, password)
+        if not _fill_first(page, ['css:input[name=username]',
+                                  '@placeholder:username',
+                                  'css:input[id=username]'], username):
+            logger.info('huggingchat: username field not found — continuing')
+        _click_any(page, ['Sign Up', 'Sign up', 'Create account',
+                          'Create Account', 'Continue'])
+        time.sleep(10)
+        # HF verifies by emailed magic link (fall back to an OTP code)
+        link = mailgen.fetch_magic_link(session, url_needle='huggingface',
+                                        max_wait_s=240)
+        code = None
+        if not link:
+            code = mailgen.fetch_otp(session, max_wait_s=60,
+                                     sender_needle='huggingface')
+        if not link and not code:
+            return False, 'huggingface verification email not found'
+        if link:
+            page.get(link)
+            time.sleep(8)
+        else:
+            if not _fill_first(page, ['css:input[name=code]',
+                                      'css:input[inputmode=numeric]',
+                                      'css:input[type=text]'], code):
+                return False, 'verification code field not found'
+            _click_any(page, ['Verify', 'Continue', 'Submit'])
+            time.sleep(8)
+        page.get('https://huggingface.co/chat/')
+        time.sleep(6)
+        # CDP dump (httpOnly included — page.cookies() hides those, and the
+        # HF session cookie IS httpOnly)
+        saved = _export_cookies(page, 'huggingchat',
+                                ('.huggingface.co', 'huggingface.co'))
+        if not saved:
+            return False, ('signup finished but no HF session cookies found '
+                           '(captcha or email-domain blocklist likely)')
+        _save_account('huggingchat', email, password,
+                      session.get('backend', ''))
+        return True, (f'account created, cookies saved '
+                      f'({session.get("backend")}: {email})')
+    except Exception as e:  # noqa: BLE001
+        return False, f'huggingchat signup failed: {type(e).__name__}: {e}'
     finally:
         if page is not None:
             _close_page(page)
@@ -3785,6 +3897,7 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'perplexity': signup_perplexity, 'glm': _anonymous('glm'),
           'duck': _anonymous('duck'),
           'pollinations': _anonymous('pollinations'),
+          'huggingchat': signup_huggingchat,
           'arena': _manual_only(
               'arena',
               'signup requires an allowlisted email domain '

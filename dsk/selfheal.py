@@ -91,6 +91,7 @@ HEALABLE: Dict[str, Path] = {
     'duck': _BASE / 'providers' / 'duck_provider.py',
     'pollinations': _BASE / 'providers' / 'pollinations_provider.py',
     'arena': _BASE / 'providers' / 'arena_provider.py',
+    'huggingchat': _BASE / 'providers' / 'huggingchat_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -125,6 +126,7 @@ _PROVIDER_MODULES = {
     'duck': 'dsk.providers.duck_provider',
     'pollinations': 'dsk.providers.pollinations_provider',
     'arena': 'dsk.providers.arena_provider',
+    'huggingchat': 'dsk.providers.huggingchat_provider',
 }
 
 # Provider class name inside each module (used by probe/configured).
@@ -143,6 +145,7 @@ _PROVIDER_CLASSES = {
     'duck': 'DuckProvider',
     'pollinations': 'PollinationsProvider',
     'arena': 'ArenaProvider',
+    'huggingchat': 'HuggingChatProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -178,6 +181,9 @@ _EVIDENCE_PATTERNS = {
     'arena': [r'nextjs-api/[A-Za-z0-9_/{}$.\-]{0,60}', r'create-evaluation',
               r'model-catalog', r'recaptchaV3Token', r'post-to-evaluation',
               r'provisional_user_id'],
+    'huggingchat': [r'api/v2/[A-Za-z0-9_/{}$.\\-]{0,60}',
+                    r'conversationId', r'hf-chat', r'finalAnswer',
+                    r'routerMetadata', r'huggingchat'],
 }
 
 
@@ -457,7 +463,8 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'glm': 'https://chat.z.ai',
             'duck': 'https://duck.ai',
             'pollinations': 'https://pollinations.ai',
-            'arena': 'https://arena.ai'}.get(name, '')
+            'arena': 'https://arena.ai',
+            'huggingchat': 'https://huggingface.co/chat'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []
