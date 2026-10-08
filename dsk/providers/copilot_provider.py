@@ -78,29 +78,17 @@ def _harvest_browser_cookies() -> Dict[str, str]:
         return {}
     try:
         import time as _time
-        from DrissionPage import ChromiumOptions, ChromiumPage
-        try:
-            from pyvirtualdisplay import Display
-        except ImportError:
-            Display = None
         import logging as _logging
+        from dsk import browser as _shared
 
         _log = _logging.getLogger('dsk.providers.copilot')
-        _log.info('copilot: harvesting anonymous identity with headless '
-                  'chromium')
-        display = None
-        if Display is not None and os.getenv('DISPLAY') is None:
-            display = Display(visible=False, size=(1366, 900))
-            display.start()
+        _log.info('copilot: harvesting anonymous identity with a tab of '
+                  'the shared chromium')
         page = None
         try:
-            opts = ChromiumOptions()
-            opts.set_browser_path('/usr/bin/chromium')
-            opts.set_argument('--no-sandbox')
-            opts.set_argument('--disable-gpu')
-            opts.set_argument('--disable-blink-features=AutomationControlled')
-            opts.set_argument('--window-size=1366,900')
-            page = ChromiumPage(addr_or_opts=opts)
+            # RAM rule: a tab of the shared Chromium, cookies wiped first —
+            # the harvest must mint a virgin anonymous identity.
+            page = _shared.acquire(fresh=True)
             page.get(f'{COPILOT_BASE_URL}/', retry=2, interval=3, timeout=90)
             deadline = _time.time() + 30
             anon = ''
@@ -141,12 +129,7 @@ def _harvest_browser_cookies() -> Dict[str, str]:
         finally:
             if page is not None:
                 try:
-                    page.quit()
-                except Exception:  # pragma: no cover
-                    pass
-            if display is not None:
-                try:
-                    display.stop()
+                    page.quit()  # closes only this tab of the shared browser
                 except Exception:  # pragma: no cover
                     pass
     except Exception as e:  # pragma: no cover - import failures

@@ -72,10 +72,17 @@ services:
       - GLM_REFRESH_TOKEN=${GLM_REFRESH_TOKEN:-}
       - GLM_COOKIES=${GLM_COOKIES:-}
       - I4F_PROVIDERS=${I4F_PROVIDERS:-}
-      # default false: the z.ai browser transport costs ~1.3 GB peak (chromium)
-      # and anonymous z.ai has no keyless HTTP path (Aliyun Captcha 2.0 wall)
-      - I4F_ZAI_BROWSER=${I4F_ZAI_BROWSER:-false}
+      # z.ai browser transport: re-enabled 2026-10-08 — with the shared
+      # browser manager it costs ONE TAB of the single shared Chromium
+      # (anonymous z.ai has no keyless HTTP path: Aliyun Captcha 2.0 wall)
+      - I4F_ZAI_BROWSER=${I4F_ZAI_BROWSER:-true}
       - I4F_ZAI_HEADLESS=${I4F_ZAI_HEADLESS:-false}
+      # Shared Chromium manager: ONE browser process for every consumer
+      # (relays, z.ai tabs, signup/refresh rungs, copilot harvest)
+      - I4F_BROWSER_PORT=${I4F_BROWSER_PORT:-9333}
+      - I4F_BROWSER_HEADLESS=${I4F_BROWSER_HEADLESS:-}
+      - I4F_BROWSER_IDLE_REAP=${I4F_BROWSER_IDLE_REAP:-300}
+      - I4F_BROWSER_FRESH_STEAL_AFTER=${I4F_BROWSER_FRESH_STEAL_AFTER:-1800}
       - I4F_ZAI_START_TIMEOUT=${I4F_ZAI_START_TIMEOUT:-90}
       - I4F_ZAI_IDLE_TIMEOUT=${I4F_ZAI_IDLE_TIMEOUT:-60}
       - I4F_ZAI_TOTAL_TIMEOUT=${I4F_ZAI_TOTAL_TIMEOUT:-300}
@@ -154,7 +161,7 @@ services:
       # Anonymous providers whose refusals are egress-shaped (Copilot geo-block,
       # Perplexity datacenter-IP authwall): the ladder rotates their proxy
       # assignment instead of running the credential ladder they don't have.
-      - I4F_EGRESS_ROTATE=${I4F_EGRESS_ROTATE:-copilot,perplexity}
+      - I4F_EGRESS_ROTATE=${I4F_EGRESS_ROTATE:-copilot,duck}
       - I4F_BREAKER_N=${I4F_BREAKER_N:-3}
       - I4F_BREAKER_COOLDOWN_S=${I4F_BREAKER_COOLDOWN_S:-1800}
       - I4F_SIGNUP_PROXY=${I4F_SIGNUP_PROXY:-}

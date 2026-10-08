@@ -4,13 +4,12 @@ import os
 from urllib.parse import urlparse
 
 from CloudflareBypasser import CloudflareBypasser
-from DrissionPage import ChromiumPage, ChromiumOptions
+from dsk.browser import SharedPage, acquire as shared_acquire
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from typing import Dict
 import argparse
 
-from pyvirtualdisplay import Display
 import uvicorn
 import atexit
 import time
@@ -62,7 +61,7 @@ def is_safe_url(url: str) -> bool:
 
 
 # Function to verify if the page has loaded properly
-def verify_page_loaded(driver: ChromiumPage) -> bool:
+def verify_page_loaded(driver: SharedPage) -> bool:
     """Verify if the page has loaded properly"""
     try:
         # Wait for body element to be present
@@ -74,24 +73,14 @@ def verify_page_loaded(driver: ChromiumPage) -> bool:
 
 
 # Function to bypass Cloudflare protection
-def bypass_cloudflare(url: str, retries: int, log: bool, proxy: str = None) -> ChromiumPage:
+def bypass_cloudflare(url: str, retries: int, log: bool,
+                      proxy: str = None) -> SharedPage:
     max_load_retries = 3
 
     for load_attempt in range(max_load_retries):
-        options = ChromiumOptions().auto_port()
-        if DOCKER_MODE:
-            options.set_argument("--auto-open-devtools-for-tabs", "true")
-            options.set_argument("--remote-debugging-port=9222")
-            options.set_argument("--no-sandbox")  # Necessary for Docker
-            options.set_argument("--disable-gpu")  # Optional, helps in some cases
-            options.set_paths(browser_path=browser_path).headless(False)
-        else:
-            options.set_paths(browser_path=browser_path).headless(False)
-
-        if proxy:
-            options.set_proxy(proxy)
-
-        driver = ChromiumPage(addr_or_opts=options)
+        # RAM rule: a tab of the shared Chromium (cookies wiped per run)
+        # instead of one Chromium per bypass request.
+        driver = shared_acquire(proxy=proxy or None, fresh=True)
         try:
             driver.get(url)
             # Wait for initial page load

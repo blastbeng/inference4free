@@ -413,7 +413,6 @@ class _ZaiBrowser:
 
     def __init__(self) -> None:
         self._page = None
-        self._display = None
         self._busy = _FifoTicket()
         self._last_used = 0.0
 
@@ -437,42 +436,23 @@ class _ZaiBrowser:
     def close(self) -> None:
         try:
             if self._page is not None:
+                # SharedPage.quit() closes ONLY this tab — the shared
+                # Chromium (and its profile) lives under the central reaper.
                 self._page.quit()
         except Exception:  # noqa: BLE001
             pass
         self._page = None
-        try:
-            if self._display is not None:
-                self._display.stop()
-        except Exception:  # noqa: BLE001
-            pass
-        self._display = None
 
     def _ensure(self) -> None:
         if self._alive():
             return
         self.close()
-        from DrissionPage import ChromiumPage, ChromiumOptions  # heavy import
-        if not os.environ.get('DISPLAY'):
-            try:
-                from pyvirtualdisplay import Display
-                self._display = Display(visible=False, size=(1440, 900))
-                self._display.start()
-            except Exception as exc:  # noqa: BLE001 — fall back to headless
-                logger.debug('z.ai Xvfb unavailable (%s); using headless', exc)
-                self._display = None
-        options = ChromiumOptions().auto_port()
-        options.set_argument('--no-sandbox')
-        options.set_argument('--disable-gpu')
-        options.set_argument('--disable-blink-features=AutomationControlled')
-        options.set_argument('--window-size=1440,900')
-        # Memory trim (8 GB SBC): no BFCache renderers held behind the active
-        # tab, no audio utility process — both showed up in RSS profiles.
-        options.set_argument('--disable-back-forward-cache')
-        options.set_argument('--mute-audio')
-        if ZAI_HEADLESS or not os.environ.get('DISPLAY'):
-            options.headless(True)
-        self._page = ChromiumPage(addr_or_opts=options)
+        # One shared Chromium serves every browser consumer (RAM rule:
+        # no per-session Chromium, no private Xvfb). This z.ai session is
+        # one tab inside it; headless mode is decided by the manager
+        # (I4F_BROWSER_HEADLESS, legacy fallback I4F_ZAI_HEADLESS).
+        from dsk import browser as _shared
+        self._page = _shared.acquire()
         self._get(ZAI_BASE_URL)
         self._wait_ready()
 

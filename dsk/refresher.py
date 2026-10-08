@@ -1059,131 +1059,32 @@ def _signup_proxy() -> Optional[str]:
     return None
 
 
-_DISPLAY = None  # pyvirtualdisplay handle kept alive for non-headless runs
-
-
 def _x_display_alive(number: int) -> bool:
-    """True when an X server is actually listening on display ``:number``.
-
-    A dead Xvfb leaves its /tmp/.X11-unix socket behind; trusting the
-    socket file made windowed Chromium fail with BrowserConnectError on
-    every renewal rung."""
-    import socket
-    import glob as _glob
-    for sock in _glob.glob(f'/tmp/.X11-unix/X{number}'):
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        probe.settimeout(1.0)
-        try:
-            probe.connect(sock)
-            return True
-        except OSError:
-            return False
-        finally:
-            probe.close()
-    return False
+    """True when an X server listens on display ``:number`` (delegated)."""
+    from dsk.browser import _x_display_alive as _impl
+    return _impl(number)
 
 
 def _ensure_display() -> bool:
-    """Best-effort X server for non-headless runs. Returns True when a
-    LIVE display is available (env, an existing server, or one we start)."""
-    global _DISPLAY
-    if _DISPLAY is not None:
-        # ours: trust it unless its display died
-        try:
-            num = str(_DISPLAY.display).lstrip(':').split('.')[0]
-            if not (num.isdigit() and _x_display_alive(int(num))):
-                _DISPLAY = None  # dead — start a fresh one below
-                return False
-        except Exception:  # noqa: BLE001
-            return True  # cannot verify — trust it
-        return True
-    disp = os.environ.get('DISPLAY', '')
-    if disp:
-        num = disp.lstrip(':').split('.')[0]
-        if num.isdigit() and _x_display_alive(int(num)):
-            return True
-        os.environ.pop('DISPLAY', None)  # dead socket — don't trust it
-    import glob as _glob
-    for sock in sorted(_glob.glob('/tmp/.X11-unix/X[0-9]*')):
-        try:
-            num = int(sock.rsplit('X', 1)[-1])
-        except ValueError:
-            continue
-        if _x_display_alive(num):
-            os.environ['DISPLAY'] = f':{num}'
-            return True
-    try:
-        from pyvirtualdisplay import Display
-        _DISPLAY = Display(visible=False, size=(1440, 900))
-        _DISPLAY.start()
-        os.environ['DISPLAY'] = _DISPLAY.new_display_var
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    """Best-effort X server for non-headless runs (delegated).
+
+    The shared-browser module owns the display so every consumer of the
+    ONE shared Chromium shares a single Xvfb."""
+    from dsk.browser import ensure_display
+    return ensure_display()
 
 
 def _reap_dead_children() -> None:
-    """Reap exited child processes (zombie chromium after failed launches).
-
-    DrissionPage spawns chromium through short-lived intermediates; when
-    the browser dies the zombie is reparented to PID 1 (this process),
-    which never wait()s — without reaping the container accumulates one
-    zombie pair per failed browser attempt."""
-    while True:
-        try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-        except (ChildProcessError, OSError):
-            return
-        if pid <= 0:
-            return
+    """Reap zombie children (delegated to the shared-browser module)."""
+    from dsk.browser import reap_dead_children
+    reap_dead_children()
 
 
 def _kill_stale_browsers(user_data_path: Optional[str] = None,
                          port: Optional[int] = None) -> int:
-    """Kill chromium processes wedged on a profile directory / debug port.
-
-    DrissionPage's ``quit()`` fails silently on a wedged tab, so the Chrome it
-    spawned stays alive. The next launch reuses the same ``--user-data-dir``,
-    and Chrome refuses the second owner ("the user folder does not conflict
-    with the open browser") — every retry leaked a whole browser process tree
-    (observed: 10+ live chromes on the chatgpt relay profile, 2h apart).
-    Only processes whose own command line names this profile/port are killed,
-    so unrelated browsers are untouched.
-    """
-    needles = []
-    if user_data_path:
-        needles.append(f'--user-data-dir={user_data_path}')
-    if port:
-        needles.append(f'--remote-debugging-port={port}')
-    if not needles:
-        return 0
-    killed = 0
-    try:
-        entries = os.listdir('/proc')
-    except OSError:
-        return 0
-    for entry in entries:
-        if not entry.isdigit() or int(entry) == os.getpid():
-            continue
-        try:
-            with open(f'/proc/{entry}/cmdline', 'rb') as fh:
-                cmd = fh.read().decode('utf-8', 'ignore')
-        except OSError:
-            continue
-        if 'chrom' not in cmd:
-            continue
-        if not any(needle in cmd for needle in needles):
-            continue
-        try:
-            os.kill(int(entry), signal.SIGKILL)
-            killed += 1
-        except OSError:
-            continue
-    if killed:
-        _reap_dead_children()
-        logger.info('reaped %d stale browser process(es) for %s',
-                    killed, needles[0])
-    return killed
+    """Kill chromium processes wedged on a profile/port (delegated)."""
+    from dsk.browser import kill_stale_browsers
+    return kill_stale_browsers(user_data_path, port)
 
 
 def _close_page(page) -> None:
@@ -1211,126 +1112,35 @@ def _close_page(page) -> None:
 
 
 def _profile_port(profile: str) -> int:
-    """Deterministic debug port for a persistent browser profile.
-
-    DrissionPage's ``set_user_data_path()`` clears ``auto_port`` while
-    leaving the address empty, so a later ``ChromiumPage()`` crashes on
-    ``''.split(':')`` ("not enough values to unpack (expected 2, got 1)")
-    — every profile-based launch must carry an explicit port. Deriving it
-    from the profile path keeps one stable port per profile: relaunches
-    adopt the running browser (the chatgpt login rung upgrades the relay
-    session in place) instead of racing a second Chrome onto the same
-    user-data dir.
-    """
-    digest = int(hashlib.sha1(
-        os.path.abspath(profile).encode('utf-8')).hexdigest(), 16)
-    return 19300 + digest % 40000  # 19300..59299, clear of auto_port picks
+    """Deterministic debug port for a persistent profile (delegated)."""
+    from dsk.browser import profile_port
+    return profile_port(profile)
 
 
 def _clear_profile_lock(profile: str) -> None:
-    """Remove Chrome singleton locks orphaned by a dead/foreign owner.
-
-    A container restart leaves the profile's SingletonLock pointing at the
-    old container's hostname+pid; every new Chrome then refuses the
-    profile ("appears to be in use by another Chromium process ... on
-    another computer") and starts WITHOUT binding the DevTools port, so
-    the launch reads as a random connect failure while a browser process
-    lingers. Called only after _kill_stale_browsers, which guarantees no
-    live local owner is holding the profile.
-    """
-    try:
-        p = Path(profile)
-        if not p.is_dir():
-            return
-        for name in ('SingletonLock', 'SingletonSocket', 'SingletonCookie'):
-            try:
-                (p / name).unlink()
-            except OSError:
-                continue
-    except Exception:  # noqa: BLE001
-        pass
+    """Remove orphaned Chrome singleton locks (delegated)."""
+    from dsk.browser import clear_profile_lock
+    clear_profile_lock(profile)
 
 
 def _browser(proxy: Optional[str] = None, headed: bool = False,
              user_data_path: Optional[str] = None,
              local_port: Optional[int] = None):
-    """Spawn a DrissionPage Chromium.
+    """Acquire a TAB of the shared Chromium (see dsk/browser.py).
 
-    ``user_data_path`` keeps one persistent profile (Cloudflare/Google score
-    returning browsers far higher, and logins/cookies must survive between
-    attempts); without it every spawn is an ephemeral profile as before.
+    Every browser consumer is a tab of ONE Chromium process per
+    (profile, proxy) key — the RAM rule (no more one-chromium-per-consumer).
+    Rungs without a persistent profile pass ``fresh=True``: the manager
+    wipes cookies+cache of the shared profile via CDP, reproducing the old
+    ephemeral auto-port profile semantics inside one process.
+    ``user_data_path`` keys a dedicated instance with a persistent profile
+    (Cloudflare/Google score returning browsers far higher, and
+    logins/cookies survive between attempts).
     """
-    from DrissionPage import ChromiumPage, ChromiumOptions
-    if local_port:
-        options = ChromiumOptions().set_local_port(int(local_port))
-    elif user_data_path:
-        # set_user_data_path() silently disables auto_port but leaves the
-        # address empty -> ChromiumPage crash; pin a deterministic port.
-        options = ChromiumOptions().set_local_port(
-            _profile_port(user_data_path))
-    else:
-        options = ChromiumOptions().auto_port()
-    if user_data_path:
-        Path(user_data_path).mkdir(parents=True, exist_ok=True)
-        options.set_user_data_path(user_data_path)
-    options.set_argument('--no-sandbox')
-    options.set_argument('--disable-gpu')
-    # Docker's default /dev/shm is 64MB: Chrome dies mid-navigation there
-    # (observed as "email field not found" style ladder misses — the page
-    # never renders because the renderer process is killed).
-    options.set_argument('--disable-dev-shm-usage')
-    # Aliyun's slider scores the client: hide automation and run windowed
-    # (real Chrome under Xvfb) whenever the rung asks for non-headless.
-    options.set_argument('--disable-blink-features=AutomationControlled')
-    options.set_argument('--window-size=1440,900')
-    if proxy:
-        if proxy.startswith('socks'):
-            # DrissionPage's set_proxy only speaks HTTP; chromium itself
-            # handles SOCKS via the command line. Chromium accepts the
-            # plain "socks5://" scheme only ("socks5h://" is a curl-ism
-            # and yields ERR_NO_SUPPORTED_PROXIES); DNS is forced through
-            # the proxy with a resolver rule so the exit stays consistent.
-            scheme, _, hostport = proxy.partition('://')
-            host = hostport.split('/')[0].split(':')[0]
-            options.set_argument(f'--proxy-server=socks5://{hostport}')
-            options.set_argument(
-                f'--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE {host}')
-        else:
-            options.set_proxy(proxy)
-    # headed=True forces a windowed real Chrome (anti-bot services score
-    # headless clients far lower — Aliyun slider, Cloudflare, Google) and
-    # degrades to headless only when no X server can be obtained.
-    headless = False
-    if headed:
-        if not _ensure_display():
-            options.headless(True)
-            headless = True
-    elif _env_bool('I4F_REFRESHER_HEADLESS', True):
-        options.headless(True)
-        headless = True
-    elif not _ensure_display():
-        options.headless(True)
-        headless = True
-    _reap_dead_children()
-    if user_data_path or local_port:
-        # A wedged Chrome still holding this profile makes the new launch
-        # fail in ways that look like a bot wall; clear it first.
-        _kill_stale_browsers(user_data_path, local_port)
-    if user_data_path:
-        # ...and clear the lock a killed/orphaned Chrome left behind, or
-        # Chrome refuses the profile and never binds the debug port.
-        _clear_profile_lock(user_data_path)
-    try:
-        return ChromiumPage(addr_or_opts=options)
-    except Exception:
-        _reap_dead_children()
-        if headed and not headless:
-            # windowed spawn failed (e.g. the X server died between the
-            # liveness check and the spawn) — degrade to headless instead
-            # of killing the whole renewal rung
-            options.headless(True)
-            return ChromiumPage(addr_or_opts=options)
-        raise
+    from dsk import browser as _shared
+    return _shared.acquire(
+        proxy=proxy, headed=headed, profile=user_data_path,
+        port=local_port, fresh=(user_data_path is None))
 
 
 def _fill_first(page, selectors: List[str], value: str,
