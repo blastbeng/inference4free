@@ -92,6 +92,7 @@ HEALABLE: Dict[str, Path] = {
     'pollinations': _BASE / 'providers' / 'pollinations_provider.py',
     'arena': _BASE / 'providers' / 'arena_provider.py',
     'huggingchat': _BASE / 'providers' / 'huggingchat_provider.py',
+    'groq': _BASE / 'providers' / 'groq_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -109,6 +110,8 @@ _MODULE_NAMES = {
     'duck': 'dsk.providers.duck_provider',
     'pollinations': 'dsk.providers.pollinations_provider',
     'arena': 'dsk.providers.arena_provider',
+    'huggingchat': 'dsk.providers.huggingchat_provider',
+    'groq': 'dsk.providers.groq_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -146,6 +149,7 @@ _PROVIDER_CLASSES = {
     'pollinations': 'PollinationsProvider',
     'arena': 'ArenaProvider',
     'huggingchat': 'HuggingChatProvider',
+    'groq': 'GroqProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -184,6 +188,9 @@ _EVIDENCE_PATTERNS = {
     'huggingchat': [r'api/v2/[A-Za-z0-9_/{}$.\\-]{0,60}',
                     r'conversationId', r'hf-chat', r'finalAnswer',
                     r'routerMetadata', r'huggingchat'],
+    'groq': [r'api\.groq\.com[A-Za-z0-9_/{}$.\\-]{0,60}',
+             r'gsk_[A-Za-z0-9]{10,}', r'invalid_api_key',
+             r'reasoning_format', r'rate_limit_exceeded'],
 }
 
 
@@ -464,7 +471,8 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'duck': 'https://duck.ai',
             'pollinations': 'https://pollinations.ai',
             'arena': 'https://arena.ai',
-            'huggingchat': 'https://huggingface.co/chat'}.get(name, '')
+            'huggingchat': 'https://huggingface.co/chat',
+            'groq': 'https://groq.com'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []
