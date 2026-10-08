@@ -392,8 +392,9 @@ def _build_prompt(messages: List[ChatMessage], protocol: str = 'json') -> str:
         elif role == "tool":
             # Explicit continuation cue: the model otherwise tends to re-issue
             # the same call instead of consuming the result.
-            rendered.append(f"[Tool result]\n{text}\n(Tool call completed successfully. "
-                            f"Use this result to continue the task. Do NOT repeat the call.)")
+            rendered.append(f"[Tool result]\n{text}\n(The tool call is DONE — its result is above. "
+                            f"Answer the user's question using this result in plain text now. "
+                            f"Do NOT emit any tool-call block again; repeating the call is forbidden.)")
         else:
             rendered.append(text)
     return "\n\n".join(rendered).strip()
@@ -714,7 +715,8 @@ def _parse_tool_call(text: str):
 
 
 def _render_tool_instructions(tools: List[Dict[str, Any]], tool_choice: Any,
-                              protocol: str = 'json') -> str:
+                              protocol: str = 'json',
+                              continuation: bool = False) -> str:
     """Builds the system block that teaches the model the tool-call protocol.
 
     Every provider is served through this taught protocol (no upstream here
@@ -781,12 +783,21 @@ def _render_tool_instructions(tools: List[Dict[str, Any]], tool_choice: Any,
             "- One block per tool call; multiple blocks in one reply = parallel",
             "  calls. Any text before the first block is your prose answer.",
         ]
+    if continuation:
+        lines += [
+            "- CONTINUATION TURN: a [Tool result] for an earlier call is already",
+            "  in this conversation. Consume it and answer the user's question in",
+            "  plain text. Re-issuing a call that was already made is forbidden.",
+        ]
+    else:
+        lines += [
+            "- Your own knowledge may be outdated and you have NO other way to reach",
+            "  real-time or external data: when a tool is relevant to the task, you",
+            "  MUST call it instead of answering from memory or making data up.",
+            "- The tool result arrives as a [Tool result] message; then continue the task.",
+            "- Never repeat a tool call that was already made with the same arguments.",
+        ]
     lines += [
-        "- Your own knowledge may be outdated and you have NO other way to reach",
-        "  real-time or external data: when a tool is relevant to the task, you",
-        "  MUST call it instead of answering from memory or making data up.",
-        "- The tool result arrives as a [Tool result] message; then continue the task.",
-        "- Never repeat a tool call that was already made with the same arguments.",
         "- If the task is complete or you have all the information you need, respond with",
         "  plain text and NO tool-call block.",
         "- As a shorthand you may instead answer with a single line:",
@@ -1309,20 +1320,31 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 },
             )
     use_tools = bool(body.tools) and body.tool_choice != "none"
+    # Continuation turn? Once a tool result is in the history, the "call the
+    # tool" instructions flip from helpful to harmful: models re-issue the
+    # same call (agent-loop repeat bug) instead of consuming the result. The
+    # system block and the tail reminder both switch to consume-mode then.
+    has_tool_result = any(
+        (getattr(m, 'role', '') == 'tool') for m in (trimmed_messages or []))
     if use_tools:
         # The protocol block is PREPENDED (not appended): if placed at the end
         # it becomes the most recent text the model reads and its "to call a
         # tool..." phrasing biases the model into re-issuing calls even after
         # a tool result was returned (agent-loop repeat-call bug).
-        prompt = (f"[System]\n{_render_tool_instructions(body.tools, body.tool_choice, protocol=tool_protocol)}"
+        prompt = (f"[System]\n{_render_tool_instructions(body.tools, body.tool_choice, protocol=tool_protocol, continuation=has_tool_result)}"
                   f"\n\n{prompt}")
         # Weak backends (consumer chat surfaces with their own system prompt)
         # weight the most recent text heavily: repeat the protocol in one
         # short conditional line so it is not buried under a long user turn.
-        prompt += ("\n\n[Reminder] If this task needs a listed tool, output the"
-                   " tool-call block exactly as specified above — never answer"
-                   " from memory. If a [Tool result] for the needed call is"
-                   " already above, use it and do NOT call again.")
+        if has_tool_result:
+            prompt += ("\n\n[Reminder] A [Tool result] is already provided above."
+                       " Use it to answer the user's question in plain text."
+                       " Do NOT emit a tool-call block — every needed call has"
+                       " already been made.")
+        else:
+            prompt += ("\n\n[Reminder] If this task needs a listed tool, output"
+                       " the tool-call block exactly as specified above — never"
+                       " answer from memory.")
     if not prompt:
         raise HTTPException(
             status_code=400,
