@@ -90,6 +90,11 @@
                           font-size: 12px; user-select: none; }
   details.think .body { padding: 6px 10px; color: var(--muted);
                         font-size: 13px; white-space: pre-wrap; }
+  /* generated / linked images inside assistant bubbles (full image support:
+     providers that emit ![…](url) — chatgpt, gemini, glm, pollinations…) */
+  .msg .body img.genimg { max-width: 100%; max-height: 480px; border-radius: 8px;
+                          border: 1px solid var(--border); margin: 6px 0;
+                          cursor: zoom-in; display: block; background: #0a0d12; }
   .msg pre { background: #0a0d12; border: 1px solid var(--border); border-radius: 6px;
              padding: 0; margin: 6px 0; overflow-x: auto; font-family: var(--mono); font-size: 13px; }
   .msg pre .lang { padding: 4px 10px; font-size: 10px; color: var(--muted); font-family: var(--mono);
@@ -451,6 +456,14 @@ function renderMd(text) {
     t = t.replace(/`([^`\n]+)`/g, '<code>$1</code>');
     t = t.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
     t = t.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, '$1<i>$2</i>');
+    // markdown IMAGES first (before the link rule would eat the "!") —
+    // image-gen providers answer with ![image](url); rendered as a real
+    // <img> that opens the full-size original on click.
+    t = t.replace(/!\[([^\]\n]*)\]\((https?:\/\/[^)\s]+)\)/g,
+      (m0, alt, u) =>
+        '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' +
+        '<img class="genimg" src="' + u + '" alt="' + alt + '" loading="lazy"' +
+        ' onerror="this.replaceWith(document.createTextNode(\'[image: \' + this.src + \']\'))"></a>');
     t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
     return t;
@@ -581,26 +594,31 @@ function renderModelList(data) {
     og.appendChild(opt);
     modelSel.appendChild(og);
   }
-  const groups = {};   // owned_by -> <optgroup> (API order is provider-grouped)
+  // providers (optgroups) sorted alphabetically, models sorted within each
+  // group — independent of whatever order the API returns them in.
+  const groups = {};   // owned_by -> [{...model}]
   for (const m of data.data || []) {
     if (m.id === 'auto') continue;
     modelInfo[m.id] = m;
-    const opt = document.createElement('option');
-    opt.value = m.id;
-    const bits = [];
-    if (m.thinking_enabled) bits.push('🧠');
-    if (m.search_enabled) bits.push('🔍');
-    if (m.vision) bits.push('📷');
-    if (m.image_gen) bits.push('🎨');
-    opt.textContent = m.id + (bits.length ? '  ' + bits.join(' ') : '');
     const owner = m.owned_by || 'other';
-    if (!groups[owner]) {
-      const og = document.createElement('optgroup');
-      og.label = owner;
-      groups[owner] = og;
-      modelSel.appendChild(og);
+    (groups[owner] = groups[owner] || []).push(m);
+  }
+  const owners = Object.keys(groups).sort((a, b) => a.localeCompare(b));
+  for (const owner of owners) {
+    const og = document.createElement('optgroup');
+    og.label = owner;
+    for (const m of groups[owner].sort((a, b) => a.id.localeCompare(b.id))) {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      const bits = [];
+      if (m.thinking_enabled) bits.push('🧠');
+      if (m.search_enabled) bits.push('🔍');
+      if (m.vision) bits.push('📷');
+      if (m.image_gen) bits.push('🎨');
+      opt.textContent = m.id + (bits.length ? '  ' + bits.join(' ') : '');
+      og.appendChild(opt);
     }
-    groups[owner].appendChild(opt);
+    modelSel.appendChild(og);
   }
   if (!modelSel.options.length) {
     modelSel.innerHTML = '<option value="">(no models available)</option>';
@@ -1480,7 +1498,8 @@ async function renderProviders() {
       (typeof body === 'object' ? JSON.stringify(body) : body)));
     return;
   }
-  const providers = (body && body.providers) || [];
+  const providers = ((body && body.providers) || [])
+    .slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
   if (!providers.length) {
     provList.append(provEl('div', 'prov', 'no providers configured'));
     return;
@@ -1502,7 +1521,7 @@ async function renderProviders() {
     head.append(kindB);
     if (provider.models && provider.models.length) {
       const mb = provEl('span', 'badge', provider.models.length + ' models');
-      mb.title = provider.models.join('\n');
+      mb.title = provider.models.slice().sort((a, b) => String(a).localeCompare(String(b))).join('\n');
       head.append(mb);
     }
     // last renewal/probe event (live from the refresher daemon state)
