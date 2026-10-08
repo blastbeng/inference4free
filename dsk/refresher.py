@@ -3830,6 +3830,7 @@ def signup_perplexity() -> Tuple[bool, str]:
     }
     last = 'not attempted'
     sent_ts = time.time()
+    accepted_body = ''
     http = None
     kw: Dict[str, Any] = {}
     for attempt in range(attempts):
@@ -3862,6 +3863,7 @@ def signup_perplexity() -> Tuple[bool, str]:
                                  'callbackUrl': 'https://www.perplexity.ai/'}),
                 headers={**ua, 'content-type': 'application/json'}, **kw)
             if resp.status_code in (200, 202):
+                accepted_body = resp.text[:160]
                 break
             if resp.status_code == 429:
                 last = f'signin rate-limited (429) via {egress or "direct"}'
@@ -3883,12 +3885,16 @@ def signup_perplexity() -> Tuple[bool, str]:
 
     magic, mail_body = mailgen.fetch_magic_link(
         session, url_needle='api/auth/callback/email',
-        sender_needle='perplexity', max_wait_s=300, after_ts=sent_ts,
-        with_body=True)
+        sender_needle='perplexity',
+        # 300s expired before emailnator's gmail forward actually
+        # delivered (claude precedent: observed ~4-5 min latency);
+        # 480s covers it without changing the poll cadence
+        max_wait_s=480, after_ts=sent_ts, with_body=True)
     if not magic:
         return False, (
             'perplexity magic-link email not found '
             f'({session.get("backend")}: @{email.rsplit("@", 1)[-1]}; '
+            f'signin replied: {accepted_body or last}; '
             f'inbox: {mailgen._inbox_digest(session)}; cand: '
             f'{mailgen.debug_magic_candidates(session, "api/auth/callback/email")})')
     # open the callback IN THE SAME HTTP SESSION — NextAuth binds the token
