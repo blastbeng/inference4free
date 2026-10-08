@@ -175,6 +175,41 @@ PROVIDER_STALL_COOLDOWN = max(0.0,
 # probed and recover on their own once the renewal bot fixes them.
 AUTO_DEMOTE_S = max(0.0, float(os.getenv('I4F_AUTO_DEMOTE_S', '300') or 300))
 AUTO_PROVE_S = max(0.0, float(os.getenv('I4F_AUTO_PROVE_S', '900') or 900))
+# First-token deadline for pure-HTTP providers (deepseek, mistral, copilot,
+# perplexity, kimi, glm…): their streams have no browser cold-start, so a
+# target silent this long is dead weight — paying the full browser-backed
+# deadline (FIRST_TOKEN_TIMEOUT, default 180s) per stalled HTTP model is what
+# let a single 'auto' request crawl for many minutes through a mostly-dead
+# chain. Browser-backed providers (chatgpt/qwen/gemini/zai) keep the full
+# deadline: their relay may legitimately spend ~90s cold-booting chromium
+# before the first token. 0 = use FIRST_TOKEN_TIMEOUT for everyone.
+HTTP_FIRST_TOKEN_TIMEOUT = max(
+    0.0, float(os.getenv('I4F_HTTP_FIRST_TOKEN_TIMEOUT', '60') or 60))
+BROWSER_PROVIDERS = frozenset({'chatgpt', 'qwen', 'gemini', 'zai'})
+# Provider-level cooldown after a rate-limit failure (seconds): anonymous
+# quotas are identity-wide, so every sibling model of that provider is
+# equally rate-limited and walking them all only re-pays the same 429
+# (measured: one request burned 174s retrying nine mistral models against
+# ONE exhausted quota). Affects only chain-walking — the provider keeps its
+# place in the healthy front for the next chain build. 0 disables.
+QUOTA_COOLDOWN = max(0.0, float(os.getenv('I4F_QUOTA_COOLDOWN_S', '120') or 120))
+# A known provider slower than this (EWMA first-token seconds) is not
+# "fast": unmeasured providers then get one lead slot per request until
+# measured. 0 disables probing.
+PROBE_UNKNOWN_ABOVE_S = max(
+    0.0, float(os.getenv('I4F_PROBE_UNKNOWN_ABOVE_S', '15') or 15))
+# Max silence BETWEEN stream chunks (seconds): after the first token a hung
+# proxy/upstream could otherwise hold the open request for the provider's
+# full HTTP read timeout (600s default) per silent gap. No real generation
+# pauses this long between tokens. 0 disables.
+STREAM_SILENCE_TIMEOUT = max(
+    0.0, float(os.getenv('I4F_STREAM_SILENCE_TIMEOUT', '180') or 180))
+# Total seconds ONE request may spend walking the fallback chain (trying new
+# targets — streaming from a target that already answered is never cut).
+# Caps the pathological all-providers-dead case: without it a 30-model chain
+# paying the per-target first-token deadline each could stall a request for
+# over an hour. The LAST chain target is always still tried. 0 disables.
+WALK_BUDGET = max(0.0, float(os.getenv('I4F_AUTO_WALK_BUDGET', '420') or 420))
 
 
 def _first_chunk(gen, timeout: float) -> Optional[Dict[str, Any]]:
@@ -211,6 +246,53 @@ def _first_chunk(gen, timeout: float) -> Optional[Dict[str, Any]]:
     if isinstance(item, BaseException):
         raise item
     return item
+
+
+_STREAM_DONE = object()
+
+
+def _silence_guard(gen, silence: float):
+    """Re-yield ``gen``'s remaining chunks, but raise FirstTokenTimeoutError
+    when the upstream stays silent for ``silence`` seconds BETWEEN chunks.
+
+    The first-token watchdog only protects the head of the stream: after the
+    first chunk the request was exposed to the provider's full HTTP read
+    timeout (default 600s) per silent gap — a hung proxy/upstream could hold
+    an open request for many minutes with the client staring at a frozen
+    answer. No real generation pauses that long between tokens; on deadline
+    the stream is abandoned (the worker thread stays blocked on the socket
+    until the read timeout — daemon, harmless) and the mid-stream failure
+    re-raises to the client exactly like any other post-first-token error.
+    Generator exceptions propagate unchanged.
+    """
+    box: queue.Queue = queue.Queue()
+
+    def _pull():
+        try:
+            for chunk in gen:
+                box.put(chunk)
+            box.put(_STREAM_DONE)
+        except BaseException as exc:  # noqa: BLE001 — re-raised in caller
+            box.put(exc)
+
+    threading.Thread(target=_pull, name='chunk-watchdog',
+                     daemon=True).start()
+    while True:
+        try:
+            item = box.get(timeout=silence)
+        except queue.Empty:
+            try:
+                gen.close()  # no-op when the frame is executing in the worker
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            raise FirstTokenTimeoutError(
+                f'stream silent for {silence:.0f}s mid-answer '
+                f'(hung upstream/proxy)')
+        if item is _STREAM_DONE:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
 
 
 def _csv_env(name: str, default: str) -> List[str]:
@@ -338,6 +420,12 @@ class Router:
         # provider -> epoch of its last successful first token: a provider that
         # just served is healthy even when its credential probe disagrees.
         self._rt_ok: Dict[str, float] = {}
+        # provider -> epoch until which its remaining chain models are skipped
+        # after a rate-limit failure (identity-wide quota: siblings share it)
+        self._quota_until: Dict[str, float] = {}
+        # provider -> EWMA of its first-token latency (seconds, success only);
+        # orders the healthy front so proven-fast providers lead the rotation
+        self._lat: Dict[str, float] = {}
         self._rt_lock = threading.Lock()
         self._lock = threading.Lock()
         # Serializes whole discovery runs; request paths must never wait on
@@ -617,15 +705,23 @@ class Router:
         # on different models of that provider.
         prov_order = list(dict.fromkeys(self.routes[mid].provider_name
                                         for mid in healthy))
-        prov_off = self._rr_next(f'auto:{category}', len(prov_order))
-        prov_order = prov_order[prov_off:] + prov_order[:prov_off]
+        prov_order = self._tier_order(prov_order, category)
         chain: List[str] = []
         for provider in prov_order:
             p_models = [mid for mid in healthy
                         if self.routes[mid].provider_name == provider]
+            # search-mode routes crawl the web before answering (measured:
+            # 'say OK' took ~6 min on deepseek-search through a slow proxy) —
+            # keep them at the BACK of their provider group so a plain prompt
+            # never lands on one by rotation luck. Explicit search requests
+            # were already filtered to search_enabled routes above.
+            plain = [m for m in p_models
+                     if not getattr(self.routes[m], 'search_enabled', False)]
+            searchy = [m for m in p_models
+                       if getattr(self.routes[m], 'search_enabled', False)]
             m_off = self._rr_next(f'auto:{category}:{provider}',
-                                  len(p_models))
-            chain.extend(p_models[m_off:] + p_models[:m_off])
+                                  len(plain) or 1)
+            chain.extend((plain[m_off:] + plain[:m_off]) + searchy)
         chain.extend(unhealthy)
         if category in ('vision', 'image_gen'):
             cap = 'image_gen' if category == 'image_gen' else 'vision'
@@ -687,6 +783,76 @@ class Router:
         if fresh:
             logger.info('%s demoted out of the auto chain front for %.0fs (%s)',
                         provider_name, AUTO_DEMOTE_S, reason or 'request failure')
+
+    def _note_latency(self, provider_name: str, seconds: float) -> None:
+        """Record a first-token success latency (EWMA, alpha 0.3)."""
+        if seconds <= 0:
+            return
+        with self._rt_lock:
+            old = self._lat.get(provider_name)
+            self._lat[provider_name] = (0.3 * seconds + 0.7 * old
+                                        if old else seconds)
+
+    def _note_stall_latency(self, provider_name: str, seconds: float) -> None:
+        """A first-token stall costs at least the deadline: sink the provider
+        below the proven-fast tier until a fresh success pulls it back up."""
+        with self._rt_lock:
+            old = self._lat.get(provider_name) or 0.0
+            self._lat[provider_name] = max(old, float(seconds))
+
+    def _tier_order(self, prov_order: List[str], category: str) -> List[str]:
+        """Order the healthy front by measured speed.
+
+        Round-robin alone put a browser-relay provider (60-90s cold boot per
+        stream) at the head of every Nth request — the user waits for EVERY
+        slow turn, and 'auto' is judged by its slowest pick. Providers whose
+        EWMA first-token latency is within 2.5x (+5s slack) of the fastest
+        healthy one form the fast tier and rotate for fairness; slower
+        providers follow in measured order and are still tried as fallbacks
+        (and still climb back via demote/probe when the fast ones fail).
+        """
+        if len(prov_order) <= 1:
+            return prov_order
+        with self._rt_lock:
+            lat = dict(self._lat)
+        known = [p for p in prov_order if p in lat]
+        unknown = [p for p in prov_order if p not in lat]
+        if not known:
+            off = self._rr_next(f'auto:{category}', len(prov_order))
+            return prov_order[off:] + prov_order[:off]
+        fastest = min(lat[p] for p in known)
+        tier = [p for p in known if lat[p] <= fastest * 2.5 + 5.0]
+        slow = [p for p in known if p not in tier]
+        # If the fastest KNOWN provider is not actually fast, let one
+        # unmeasured provider lead each request: otherwise a working-but-
+        # slow provider (measured 56s browser relay) serves EVERY call and
+        # the unknowns — possibly far faster — never get their first data
+        # point (they are only reached when the leader fails). Once a
+        # genuinely fast provider is measured, probing stops and unknowns
+        # are measured naturally as fallbacks, never taxing the fast path.
+        lead: List[str] = []
+        if unknown and fastest > PROBE_UNKNOWN_ABOVE_S:
+            off = self._rr_next('auto:probe', len(unknown))
+            unknown = unknown[off:] + unknown[:off]
+            lead = [unknown.pop(0)]
+        off = self._rr_next(f'auto:{category}', len(tier))
+        return (lead + tier[off:] + tier[:off] + unknown
+                + sorted(slow, key=lambda p: lat[p]))
+
+    def _quota_cooling(self, provider_name: str) -> bool:
+        """True while a recent rate-limit failure keeps this provider's
+        remaining chain models skipped (identity-wide quota)."""
+        if QUOTA_COOLDOWN <= 0:
+            return False
+        now = time.time()
+        with self._rt_lock:
+            return self._quota_until.get(provider_name, 0.0) > now
+
+    def _mark_quota(self, provider_name: str) -> None:
+        if QUOTA_COOLDOWN <= 0:
+            return
+        with self._rt_lock:
+            self._quota_until[provider_name] = time.time() + QUOTA_COOLDOWN
 
     def _demoted(self, provider_name: str) -> bool:
         """True while a recent failure keeps this provider out of the front."""
@@ -970,6 +1136,7 @@ class Router:
             chain = [route.model_id] + [f for f in route.fallbacks
                                         if f != route.model_id]
         last_error: Optional[ProviderError] = None
+        walk_start = time.time()
 
         if images or image_generation:
             # Vision/image-gen requests may only be served by capable targets.
@@ -1005,11 +1172,33 @@ class Router:
                     logger.info('skipping %s: stalled recently (cooldown)',
                                 served_by)
                     continue
+            if (position < len(chain) - 1
+                    and (self._demoted(target.provider_name)
+                         or self._quota_cooling(target.provider_name))):
+                # a sibling model of this provider already failed inside this
+                # request or a recent one: credentials, relay state and
+                # anonymous quotas are provider-wide, so re-trying the
+                # sibling only re-pays the same cold boot / auth wall /
+                # quota 429 / stall (measured: three qwen models each burned
+                # ~80s of browser-relay cold start, nine mistral models
+                # re-paid one exhausted quota for 174s — all in ONE request)
+                logger.info('skipping %s: provider %s is demoted/quota-cooling',
+                            served_by, target.provider_name)
+                continue
+            if (WALK_BUDGET > 0 and position < len(chain) - 1
+                    and time.time() - walk_start > WALK_BUDGET):
+                # hard cap on chain-walking: better a fast error the client
+                # can retry than a request that silently crawls for hours
+                logger.warning('walk budget %.0fs exhausted after %d targets '
+                               '— skipping the rest of the chain',
+                               WALK_BUDGET, position + 1)
+                break
             attempt = 0
             while True:
                 attempt += 1
                 emitted = False
                 try:
+                    t_target = time.time()
                     gen = provider.stream(
                         prompt, model=target.upstream_model,
                         thinking_enabled=thinking, search_enabled=search,
@@ -1018,21 +1207,31 @@ class Router:
                         no_proxy=no_proxy,
                         auth_key=auth_key,
                     )
-                    if FIRST_TOKEN_TIMEOUT > 0:
+                    first_deadline = (FIRST_TOKEN_TIMEOUT
+                                      if (target.provider_name in BROWSER_PROVIDERS
+                                          or HTTP_FIRST_TOKEN_TIMEOUT <= 0)
+                                      else HTTP_FIRST_TOKEN_TIMEOUT)
+                    first = None
+                    if FIRST_TOKEN_TIMEOUT > 0 and first_deadline > 0:
                         # stall watchdog: a provider that connects but never
                         # yields is retried/fallen back, never hung-up-on
-                        first = _first_chunk(gen, FIRST_TOKEN_TIMEOUT)
+                        first = _first_chunk(gen, first_deadline)
                         if first is not None:
                             emitted = True
                             try:
                                 self._stall_until.pop(stall_key, None)
                             except Exception:  # noqa: BLE001 — bookkeeping
                                 pass
+                            self._note_latency(target.provider_name,
+                                               time.time() - t_target)
                             self._mark_served(target.provider_name)
                             if isinstance(first, dict):
                                 first.setdefault('served_by', served_by)
                             yield first
-                    for chunk in gen:
+                    rest = (_silence_guard(gen, STREAM_SILENCE_TIMEOUT)
+                            if (first is not None
+                                and STREAM_SILENCE_TIMEOUT > 0) else gen)
+                    for chunk in rest:
                         if not emitted:  # first chunk: target recovered
                             emitted = True
                             try:
@@ -1048,19 +1247,23 @@ class Router:
                     last_error = e
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
-                    # Deliberately NOT demoted: a quota hit means "busy now", not
-                    # "broken", and the retry ladder plus the round-robin chain
-                    # already spread the load. Demoting here would starve the
-                    # providers that are actually healthy.
-                    if attempt <= MAX_RETRIES:
-                        wait = min(e.retry_after if e.retry_after
-                                   else RETRY_BACKOFF * (2 ** (attempt - 1)), RETRY_CAP)
+                    # Deliberately NOT demoted out of the healthy front: a
+                    # quota hit means "busy now", not "broken". But the
+                    # retry ladder is only worth it when the upstream names
+                    # a SHORT Retry-After — an anonymous-quota exhaustion
+                    # ("Message rate limit reached") will not recover within
+                    # seconds, and identity-wide means every sibling model
+                    # is equally limited: skip the ladder AND the siblings.
+                    if (attempt <= MAX_RETRIES and e.retry_after
+                            and e.retry_after <= RETRY_CAP):
+                        wait = min(e.retry_after, RETRY_CAP)
                         logger.warning('%s rate limited (attempt %d/%d), retrying in %.1fs: %s',
                                        served_by, attempt, MAX_RETRIES + 1, wait, e)
                         time.sleep(wait)
                         continue
-                    logger.warning('%s rate limited after %d attempts: %s',
-                                   served_by, attempt - 1, e)
+                    logger.warning('%s rate limited, skipping to fallback: %s',
+                                   served_by, e)
+                    self._mark_quota(target.provider_name)
                     break
                 except FirstTokenTimeoutError as e:
                     # a stalled upstream does not recover within seconds:
@@ -1075,6 +1278,8 @@ class Router:
                                                         + PROVIDER_STALL_COOLDOWN)
                     except Exception:  # noqa: BLE001 — bookkeeping only
                         pass
+                    self._note_stall_latency(target.provider_name,
+                                             first_deadline)
                     self._mark_failed(target.provider_name, 'first-token stall')
                     logger.warning('%s stalled without first token, skipping '
                                    'to fallback: %s', served_by, e)

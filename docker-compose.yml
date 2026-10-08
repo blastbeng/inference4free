@@ -141,6 +141,13 @@ services:
       # failures the rung sleeps 12h (not 30min) so a never-succeeding
       # signup cannot burn RAM all day
       - I4F_SIGNUP_BREAKER_COOLDOWN_S=${I4F_SIGNUP_BREAKER_COOLDOWN_S:-43200}
+      # auto-router latency bounds: HTTP providers must yield a first token
+      # within 60s (no browser cold-start to excuse them) and one request may
+      # walk the fallback chain for at most 7 minutes before failing fast
+      - I4F_HTTP_FIRST_TOKEN_TIMEOUT=${I4F_HTTP_FIRST_TOKEN_TIMEOUT:-60}
+      - I4F_AUTO_WALK_BUDGET=${I4F_AUTO_WALK_BUDGET:-420}
+      - I4F_STREAM_SILENCE_TIMEOUT=${I4F_STREAM_SILENCE_TIMEOUT:-180}
+      - I4F_QUOTA_COOLDOWN_S=${I4F_QUOTA_COOLDOWN_S:-120}
       - I4F_REFRESHER_LOGIN=${I4F_REFRESHER_LOGIN:-true}
       - I4F_REFRESHER_HEADLESS=${I4F_REFRESHER_HEADLESS:-true}
       - I4F_REFRESHER_AUTOSIGNUP=${I4F_REFRESHER_AUTOSIGNUP:-true}
