@@ -939,8 +939,8 @@ def refresh_perplexity() -> Tuple[bool, str]:
         except ValueError:
             user = {}
         if user.get('email') or user.get('id'):
-            return True, (f'session valid ({user.get("email")
-                          or user.get("id")})')
+            return True, (f'session valid '
+                          f'({user.get("email") or user.get("id")})')
         return False, 'session endpoint returned no user — expired, re-signup'
     return False, f'session check HTTP {resp.status_code} — re-signup'
 
