@@ -360,18 +360,25 @@ class CopilotProvider(Provider):
                                 'copilot provider (pip install '
                                 'websocket-client)') from e
 
-        # Egress ladder for the WS handshake: requested egress, then a FRESH
-        # pool draw (a dead or edge-blocked exit is cooled down first), then
-        # direct. Copilot's edge geo-blocks host/datacenter IPs (WS 460), so
-        # a working proxy exit is often required.
+        # Egress ladder for the WS handshake: requested egress, then FRESH
+        # pool draws (a dead, edge-blocked or TLS-MITMing exit is cooled
+        # down first), then direct. Copilot's edge geo-blocks host and EU
+        # IPs (WS 460), so a clean non-EU proxy exit is often required;
+        # several draws raise the odds of dodging the free-list proxies
+        # that selectively MITM Microsoft domains (SSL verify fails).
         ws = None
         last_auth: Optional[Exception] = None
         last_connect: Optional[Exception] = None
+        try:
+            draws = max(1, int(os.getenv('I4F_COPILOT_EGRESS_DRAWS', '3') or 3))
+        except ValueError:
+            draws = 3
         first = _egress_url(no_proxy)
         ladder: List[Optional[str]] = []
         if first:
             ladder.append(first)
-            ladder.append(_egress_url(no_proxy))  # fresh draw after a miss
+            for _ in range(draws - 1):
+                ladder.append(_egress_url(no_proxy))  # fresh draw after a miss
         ladder.append(None)  # direct last
         seen_eg: set = set()
         for proxy_url in ladder:

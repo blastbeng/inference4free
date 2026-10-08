@@ -72,18 +72,34 @@ from typing import Any, Dict, List, Optional, Tuple
 DIRECT = '__direct__'
 
 # (default_scheme_or_None, url) — None means the scheme is embedded per line
-# or JSON payload. All URLs verified live (2026-09); sources may vanish, the
-# aggregator tolerates that.
+# or JSON payload. All URLs verified live (2026-10); sources may vanish, the
+# aggregator tolerates that. proxyscrape's timeout=3000 asks the API for
+# proxies that answered within 3 s (server-side pre-filter); vakhov is
+# re-validated hourly upstream.
 BUILTIN_SOURCES: List[Tuple[Optional[str], str]] = [
     ('http', 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt'),
     ('socks5', 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt'),
     ('http', 'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt'),
     ('socks5', 'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt'),
     (None, 'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt'),
-    ('http', 'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000'),
+    ('http', 'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000'),
     ('http', 'https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt'),
+    ('http', 'https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt'),
     (None, 'https://proxylist.geonode.com/api/proxy-list?protocols=http%2Csocks5&limit=500&page=1&sort_by=lastChecked&sort_type=desc'),
+    # Country-pinned geonode slices: several upstreams (copilot's edge in
+    # particular) geo-block EU/hosting exits outright, so the pool must
+    # contain non-EU candidates or those providers can never leave direct.
+    (None, 'https://proxylist.geonode.com/api/proxy-list?protocols=http%2Csocks5&limit=100&page=1&sort_by=lastChecked&sort_type=desc&country=US'),
+    (None, 'https://proxylist.geonode.com/api/proxy-list?protocols=http%2Csocks5&limit=100&page=1&sort_by=lastChecked&sort_type=desc&country=IN'),
+    (None, 'https://proxylist.geonode.com/api/proxy-list?protocols=http%2Csocks5&limit=100&page=1&sort_by=lastChecked&sort_type=desc&country=BR'),
+    (None, 'https://proxylist.geonode.com/api/proxy-list?protocols=http%2Csocks5&limit=100&page=1&sort_by=lastChecked&sort_type=desc&country=JP'),
 ]
+
+# Quality gates applied to JSON sources that publish latency/uptime metadata
+# (currently geonode). Proxies the upstream measured slower than this, or
+# with less uptime, never enter the pool at all.
+_JSON_MAX_LATENCY_MS = 1200.0
+_JSON_MIN_UPTIME_PCT = 50.0
 
 _PROVIDER_HOSTS = (
     ('chat.deepseek.com', 'deepseek'),
@@ -145,11 +161,28 @@ def _parse_list(body: str, default_scheme: Optional[str] = None) -> List[str]:
 
 
 def _proxy_from_dict(item: Dict[str, Any]) -> Optional[str]:
-    """Map a JSON proxy entry ({ip,port[,protocol|protocols|proxy]}) to URL."""
+    """Map a JSON proxy entry ({ip,port[,protocol|protocols|proxy]}) to URL.
+
+    JSON sources that publish quality metadata (geonode: ``latency`` in ms,
+    ``upTime`` in %) are pre-filtered here so the pool sample isn't diluted
+    by entries the upstream already knows are slow or flaky.
+    """
     if 'proxy' in item and str(item['proxy']).strip():
         return _normalize(str(item['proxy']))
     if 'ip' not in item or 'port' not in item:
         return None
+    try:
+        lat = item.get('latency')
+        if lat is not None and float(lat) > _JSON_MAX_LATENCY_MS:
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        up = item.get('upTime')
+        if up is not None and float(up) < _JSON_MIN_UPTIME_PCT:
+            return None
+    except (TypeError, ValueError):
+        pass
     proto: Any = None
     if isinstance(item.get('protocols'), (list, tuple)) and item['protocols']:
         proto = item['protocols'][0]
@@ -268,11 +301,24 @@ def _refresh_pool() -> None:
 
     collected: List[str] = []
     errors: List[str] = []
+    # Stratified sampling: cap each source's contribution BEFORE the global
+    # sample. Without this, one giant raw list (proxifly ships ~52k entries,
+    # ~88% of total volume) swallows ~355 of the 400 pool slots and the
+    # small pre-validated sources (vakhov, proxyscrape-timeout3000, geonode,
+    # monosans) end up with 1-2 slots each — measured live as healthy=5/400.
+    try:
+        per_source = max(20, int(os.getenv('I4F_PROXY_PER_SOURCE_CAP', '150') or 150))
+    except ValueError:
+        per_source = 150
     for default_scheme, url in sources:
         try:
-            collected.extend(_parse_list(_fetch_direct(url), default_scheme))
+            parsed = _parse_list(_fetch_direct(url), default_scheme)
         except Exception as exc:
             errors.append(f"{url.split('//', 1)[-1][:60]}: {exc}")
+            continue
+        if len(parsed) > per_source:
+            parsed = random.sample(parsed, per_source)
+        collected.extend(parsed)
     # static proxies (env) always survive, even if every source fails
     collected.extend(_static_proxies())
 
@@ -310,8 +356,16 @@ def _refresh_pool() -> None:
 
 
 def _max_latency_ms() -> float:
-    """Fast-proxies-only budget: a proxy slower than this never gets traffic."""
-    return max(50.0, float(os.getenv('I4F_PROXY_MAX_LATENCY', '800') or 800))
+    """Fast-proxies-only budget: a proxy slower than this never gets traffic.
+
+    2000 ms (was 800) — measured live against the free lists: from a
+    residential line almost nothing answers a full HTTPS round-trip under
+    800 ms, so the pool starved to healthy=0 and every request went direct.
+    Chat budgets are minute-scale (first-token deadline 60 s), so a ~1.5 s
+    exit is acceptable when what it buys is IP diversity for ban-prone
+    providers. Override with I4F_PROXY_MAX_LATENCY.
+    """
+    return max(50.0, float(os.getenv('I4F_PROXY_MAX_LATENCY', '2000') or 2000))
 
 
 def _direct_rotation() -> bool:
@@ -345,7 +399,7 @@ def _run_check_pass() -> None:
     fast proxies only, slow exits never receive traffic."""
     url = os.getenv('I4F_PROXY_CHECK_URL',
                     'https://api.ipify.org?format=json').strip()
-    timeout = float(os.getenv('I4F_PROXY_CHECK_TIMEOUT', '4') or 4)
+    timeout = float(os.getenv('I4F_PROXY_CHECK_TIMEOUT', '8') or 8)
     workers = max(1, int(os.getenv('I4F_PROXY_CHECK_CONCURRENCY', '24') or 24))
     with _STATE.lock:
         pool = list(_STATE.pool)
@@ -364,15 +418,17 @@ def _run_check_pass() -> None:
                 if ok and ms <= cap}
         _STATE.healthy = fast
         _STATE.latency = {p: ms for p, (ok, ms) in results.items() if ok}
+    slow_ok = sum(1 for ok, _ in results.values() if ok) - len(fast)
     if fast:
         lats = sorted(_STATE.latency[p] for p in fast)
         median = lats[len(lats) // 2]
         print(f"[proxies] health pass: {len(fast)}/{len(pool)} fast "
-              f"(<= {cap:.0f} ms, median {median:.0f} ms)",
+              f"(<= {cap:.0f} ms, median {median:.0f} ms; {slow_ok} ok-but-slow)",
               file=__import__('sys').stderr)
     else:
-        print(f"[proxies] health pass: 0/{len(pool)} fast (<= {cap:.0f} ms) "
-              "— traffic rotates to direct", file=__import__('sys').stderr)
+        print(f"[proxies] health pass: 0/{len(pool)} fast (<= {cap:.0f} ms, "
+              f"{slow_ok} ok-but-slow) — traffic rotates to direct",
+              file=__import__('sys').stderr)
 
 
 def _controller_loop() -> None:

@@ -168,3 +168,4 @@ dsk/*_cookies.json
 data/
 .aider*
 .playwright-mcp/
+docker-compose.yml.bak-*

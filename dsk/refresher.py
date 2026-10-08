@@ -902,11 +902,54 @@ def refresh_mistral() -> Tuple[bool, str]:
                   'token unverified (validated at request time)')
 
 
+def refresh_perplexity() -> Tuple[bool, str]:
+    """Validate the signed-in perplexity jar against the NextAuth session.
+
+    The upstream hard-walls anonymous sessions (``fraud_authwall_upsell`` on
+    every answer, measured across direct AND rotated egress 2026-10), so the
+    jar must hold a live NextAuth session: GET ``/api/auth/session`` with the
+    jar cookies and require a user object. Unreachable endpoints read as
+    "unverified" (True — validated at request time) so a network hiccup never
+    churns identities; only a clear no-user/40x answer escalates to signup.
+    """
+    jar = _load_jar('perplexity')
+    if not jar:
+        return False, 'no perplexity jar — signup needed'
+    cookie = '; '.join(f'{k}={v}' for k, v in jar.items()
+                       if k != 'email' and v)
+    if not cookie:
+        return False, 'perplexity jar has no cookies — signup needed'
+    from curl_cffi import requests as cffi
+    try:
+        resp = cffi.get('https://www.perplexity.ai/api/auth/session',
+                        headers={'Cookie': cookie,
+                                 'Accept': 'application/json',
+                                 'User-Agent': (
+                                     'Mozilla/5.0 (X11; Linux x86_64) '
+                                     'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                     'Chrome/120.0.0.0 Safari/537.36')},
+                        impersonate='chrome120', timeout=20,
+                        **_proxies_kwargs('https://www.perplexity.ai'))
+    except Exception as e:  # noqa: BLE001 — network hiccup, unverified
+        return True, (f'session check unreachable ({type(e).__name__}) — '
+                      'jar unverified, validated at request time')
+    if resp.status_code == 200:
+        try:
+            user = (resp.json() or {}).get('user') or {}
+        except ValueError:
+            user = {}
+        if user.get('email') or user.get('id'):
+            return True, (f'session valid ({user.get("email")
+                          or user.get("id")})')
+        return False, 'session endpoint returned no user — expired, re-signup'
+    return False, f'session check HTTP {resp.status_code} — re-signup'
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
            'mistral': refresh_mistral, 'copilot': _anonymous('copilot'),
-           'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm'),
+           'perplexity': refresh_perplexity, 'glm': _anonymous('glm'),
            'duck': _anonymous('duck')}
 
 
@@ -3735,6 +3778,146 @@ def signup_qwen() -> Tuple[bool, str]:
     return False, last_error or 'all qwen signup egresses failed'
 
 
+def signup_perplexity() -> Tuple[bool, str]:
+    """Create a fresh perplexity.ai account via the NextAuth email magic link.
+
+    2026-10: anonymous ``/rest/sse/perplexity_ask`` sessions are hard-walled
+    (``fraud_authwall_upsell`` on every answer, on every IP — measured across
+    direct AND several rotated pool egresses), so the provider needs a
+    signed-in session. www.perplexity.ai runs NextAuth with a standard
+    ``email`` (magic link) provider, so the whole flow is plain HTTP — no
+    browser, same shape as the claude rung but without Chromium:
+
+      1. mailgen inbox (real gmail via emailnator),
+      2. POST ``/api/auth/signin/email`` ``{email, csrfToken}`` — the
+         endpoint is aggressively IP-rate-limited (429 RATE_LIMITED, and
+         free-proxy IPs arrive pre-flagged), so every attempt rides a fresh
+         pool egress and a 429 rotates + backs off instead of failing the
+         signup; the refresher simply retries next cycle,
+      3. the emailed ``/api/auth/callback/email?token=...`` link is fetched
+         from the same mailbox and opened IN THE SAME HTTP SESSION (NextAuth
+         binds the token to this session's pending csrf/callback cookies),
+      4. the resulting session cookies are saved to the perplexity jar.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    from curl_cffi import requests as cffi
+    from . import proxies as _px
+
+    session, err = mailgen.create_email()
+    if not session:
+        return False, f'autogen mailbox unavailable: {err}'
+    email = session['address']
+
+    try:
+        attempts = max(1, int(os.getenv('I4F_PERPLEXITY_SIGNUP_ATTEMPTS',
+                                        '4') or 4))
+    except ValueError:
+        attempts = 4
+    backoff = max(5.0, float(os.getenv('I4F_PERPLEXITY_SIGNUP_BACKOFF',
+                                       '20') or 20))
+    ua = {
+        'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.9',
+        'origin': 'https://www.perplexity.ai',
+        'referer': 'https://www.perplexity.ai/',
+        'user-agent': ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'),
+    }
+    last = 'not attempted'
+    sent_ts = time.time()
+    http = None
+    kw: Dict[str, Any] = {}
+    for attempt in range(attempts):
+        # proxies only: the host IP is usually already flagged by the
+        # auth endpoint, and the pool gives a fresh roll every attempt
+        egress = _px.get_proxy('perplexity', direct_ok=False)
+        kw = ({'proxies': {'http': egress, 'https': egress}}
+              if egress else {})
+        try:
+            http = cffi.Session(impersonate='chrome120', timeout=25)
+            # warm the CF/app cookies, then the NextAuth csrf handshake
+            http.get('https://www.perplexity.ai/', headers=ua, **kw)
+            csrf = ''
+            try:
+                csrf = str((http.get(
+                    'https://www.perplexity.ai/api/auth/csrf',
+                    headers={**ua, 'accept': 'application/json'},
+                    **kw).json() or {}).get('csrfToken') or '')
+            except ValueError:
+                pass
+            if not csrf:
+                last = 'csrf endpoint gave no token'
+                if egress:
+                    _px.mark_failure(egress)
+                continue
+            sent_ts = time.time()
+            resp = http.post(
+                'https://www.perplexity.ai/api/auth/signin/email',
+                data=json.dumps({'email': email, 'csrfToken': csrf,
+                                 'callbackUrl': 'https://www.perplexity.ai/'}),
+                headers={**ua, 'content-type': 'application/json'}, **kw)
+            if resp.status_code in (200, 202):
+                break
+            if resp.status_code == 429:
+                last = f'signin rate-limited (429) via {egress or "direct"}'
+                if egress:
+                    _px.mark_failure(egress)
+                time.sleep(backoff + random.uniform(0.0, backoff))
+                continue
+            last = f'signin HTTP {resp.status_code}: {resp.text[:120]}'
+            if egress:
+                _px.mark_failure(egress)
+        except Exception as e:  # noqa: BLE001 — rotate egress and retry
+            last = f'{type(e).__name__}: {e}'
+            if egress:
+                _px.mark_failure(egress)
+            http = None
+    if http is None:
+        return False, (f'perplexity signin never accepted '
+                       f'({attempts} tries): {last}')
+
+    magic, mail_body = mailgen.fetch_magic_link(
+        session, url_needle='api/auth/callback/email',
+        sender_needle='perplexity', max_wait_s=300, after_ts=sent_ts,
+        with_body=True)
+    if not magic:
+        return False, (
+            'perplexity magic-link email not found '
+            f'({session.get("backend")}: @{email.rsplit("@", 1)[-1]}; '
+            f'inbox: {mailgen._inbox_digest(session)}; cand: '
+            f'{mailgen.debug_magic_candidates(session, "api/auth/callback/email")})')
+    # open the callback IN THE SAME HTTP SESSION — NextAuth binds the token
+    # to this session's pending csrf/callback cookies, not to any IP
+    try:
+        cb = http.get(magic, headers=ua, **kw)
+        if cb.status_code >= 400:
+            return False, (f'perplexity callback HTTP {cb.status_code}: '
+                           f'{cb.text[:120]}')
+    except Exception as e:  # noqa: BLE001
+        return False, f'perplexity callback failed: {type(e).__name__}: {e}'
+    try:
+        ver = http.get('https://www.perplexity.ai/api/auth/session',
+                       headers={**ua, 'accept': 'application/json'}, **kw)
+        user = (ver.json() or {}).get('user') or {}
+    except Exception as e:  # noqa: BLE001
+        return False, f'perplexity session verify failed: {type(e).__name__}: {e}'
+    if not (user.get('email') or user.get('id')):
+        return False, (f'perplexity callback did not sign in '
+                       f'(HTTP {ver.status_code}, body {ver.text[:120]})')
+    try:
+        cookies = dict(http.cookies.get_dict())
+    except Exception:  # noqa: BLE001 — older curl_cffi fallback
+        cookies = {c.name: c.value for c in getattr(http.cookies, 'jar', [])}
+    cookies = {k: v for k, v in cookies.items() if k and v}
+    if not cookies:
+        return False, 'perplexity callback set no cookies'
+    _save_jar('perplexity', {**cookies, 'email': email})
+    egress_used = (kw.get('proxies') or {}).get('https', 'direct')
+    return True, (f'signed in {email} via {egress_used} '
+                  f'(user {user.get("email") or user.get("id")})')
+
+
 SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'gemini': signup_gemini,
           'claude': signup_claude,
@@ -3743,7 +3926,7 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'kimi': signup_kimi,
           'mistral': signup_mistral,
           'copilot': _anonymous('copilot'),
-          'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm'),
+          'perplexity': signup_perplexity, 'glm': _anonymous('glm'),
           'duck': _anonymous('duck')}
 
 
