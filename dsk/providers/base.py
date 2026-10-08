@@ -54,6 +54,32 @@ logger = logging.getLogger('dsk.providers.base')
 # OS-level connect can otherwise hang for minutes before the total timeout.
 HTTP_CONNECT_TIMEOUT = int(os.getenv('I4F_HTTP_CONNECT_TIMEOUT', '6'))
 
+# Gateway/timeout statuses that, seen THROUGH a pooled free proxy, usually
+# mean the dying exit rather than the origin being down (the same URL
+# answers fine direct): 502 bad gateway, 504 gateway timeout, and
+# Cloudflare's 522/523/524 (connection timed out / origin unreachable).
+_GATEWAY_SUSPECT_STATUSES = {502, 504, 522, 523, 524}
+
+# Read-phase cap for pooled-proxy attempts: a free proxy that connects and
+# then black-holes the request otherwise hangs until the FULL request
+# timeout — the router's first-token watchdog then kills the whole attempt
+# as a stall even though the direct route answers in under a second. The
+# cap must stay below the HTTP first-token watchdog (60s) so the direct
+# retry still fits inside it. Direct attempts keep the caller's full
+# budget. 0 disables.
+PROXY_READ_TIMEOUT = max(
+    0.0, float(os.getenv('I4F_PROXY_READ_TIMEOUT', '45')))
+
+
+def _eff_timeout(px: bool, timeout: int):
+    """Per-attempt (connect, read) timeout: pooled-proxy reads are capped
+    (see PROXY_READ_TIMEOUT), direct attempts get the caller's budget."""
+    if not px:
+        return timeout
+    if PROXY_READ_TIMEOUT > 0:
+        return (HTTP_CONNECT_TIMEOUT, min(float(timeout), PROXY_READ_TIMEOUT))
+    return (HTTP_CONNECT_TIMEOUT, timeout)
+
 
 def provider_enabled(name: str) -> bool:
     """I4F_PROVIDERS allowlist (comma-separated provider names).
@@ -92,9 +118,12 @@ def _resilient_request(url: str, extra: Dict[str, Any], do_request,
 
     When a pool-assigned proxy fails at the transport level it is put on
     cooldown (``proxies.mark_failure``) and the request is retried once
-    DIRECT.  Persistent transport failures are re-raised as
-    ProviderUnavailableError so the router can fall back instead of leaking
-    an unhandled 500 (curl_cffi RequestException escaped as 500 before).
+    DIRECT.  The same applies when the proxy relays a gateway/timeout
+    status (502/504/522/523/524): dying free proxies produce those far
+    more often than the origin does.  Persistent transport failures are
+    re-raised as ProviderUnavailableError so the router can fall back
+    instead of leaking an unhandled 500 (curl_cffi RequestException
+    escaped as 500 before).
     """
     proxy = None
     px = extra.get('proxies') or {}
@@ -104,6 +133,25 @@ def _resilient_request(url: str, extra: Dict[str, Any], do_request,
     try:
         resp = do_request(extra)
         if proxy and pooled:
+            status = getattr(resp, 'status_code', None)
+            if status in _GATEWAY_SUSPECT_STATUSES:
+                # a gateway/timeout status through a pooled free proxy is far
+                # more likely the dying exit than the origin (which answers
+                # fine direct): cooldown the proxy and retry DIRECT once,
+                # instead of surfacing a stall that eats the watchdog budget
+                try:
+                    _proxies.mark_failure(proxy)
+                except Exception:  # noqa: BLE001 — cooldown is best-effort
+                    pass
+                logger.warning('pool proxy %s answered HTTP %s; retrying direct',
+                               proxy, status)
+                try:
+                    return do_request({})
+                except Exception as exc2:  # noqa: BLE001
+                    if not _looks_like_network_error(exc2):
+                        raise
+                    raise ProviderUnavailableError(
+                        f'upstream unreachable via proxy and direct: {exc2}') from exc2
             # runtime latency feedback: the proxy pool demotes exits that
             # answer real payloads slower than the health-pass budget
             try:
@@ -242,7 +290,7 @@ def http_post_stream(url: str, headers: Optional[Dict[str, str]] = None,
 
     def _do(kwargs: Dict[str, Any]):
         px = bool(kwargs.get('proxies'))
-        eff = (HTTP_CONNECT_TIMEOUT, timeout) if px else timeout
+        eff = _eff_timeout(px, timeout)
         if cffi_requests is not None:
             return cffi_requests.post(
                 url, headers=headers or {}, json=json_body,
@@ -273,7 +321,7 @@ def http_get(url: str, headers: Optional[Dict[str, str]] = None,
 
     def _do(kwargs: Dict[str, Any]):
         px = bool(kwargs.get('proxies'))
-        eff = (HTTP_CONNECT_TIMEOUT, timeout) if px else timeout
+        eff = _eff_timeout(px, timeout)
         if cffi_requests is not None:
             return cffi_requests.get(
                 url, headers=headers or {}, cookies=cookies or None,
@@ -363,7 +411,7 @@ def http_post_raw(url: str, data: bytes, headers: Optional[Dict[str, str]] = Non
 
     def _do(kwargs: Dict[str, Any]):
         px = bool(kwargs.get('proxies'))
-        eff = (HTTP_CONNECT_TIMEOUT, timeout) if px else timeout
+        eff = _eff_timeout(px, timeout)
         if cffi_requests is not None:
             return cffi_requests.post(url, headers=headers or {}, data=data,
                                       impersonate='chrome120', timeout=eff,
@@ -383,7 +431,7 @@ def http_put_raw(url: str, data: bytes, headers: Optional[Dict[str, str]] = None
 
     def _do(kwargs: Dict[str, Any]):
         px = bool(kwargs.get('proxies'))
-        eff = (HTTP_CONNECT_TIMEOUT, timeout) if px else timeout
+        eff = _eff_timeout(px, timeout)
         if cffi_requests is not None:
             return cffi_requests.put(url, headers=headers or {}, data=data,
                                      impersonate='chrome120', timeout=eff,

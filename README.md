@@ -2,7 +2,7 @@
 
 **Free access to DeepSeek, Gemini (Web) and ChatGPT (Web) through their own web APIs — exposed as a standard OpenAI-compatible server, packaged in Docker, and built for agent coding.**
 
-This project talks directly to the chat web apps — `chat.deepseek.com`, `gemini.google.com`, `chatgpt.com`, `claude.ai`, `grok.com`, `chat.mistral.ai`, `chat.qwen.ai`, `kimi.com`, `copilot.microsoft.com`, `perplexity.ai` and `chat.z.ai` (GLM) — instead of any official paid API, then re-exposes them behind the familiar OpenAI endpoints (`/v1/chat/completions`, `/v1/models`). That means any tool that speaks the OpenAI API — [aider](https://aider.chat) / **AiderDesk agent mode**, OpenWebUI, LiteLLM, LibreChat, the `openai` SDK, anything else — can use these models for free.
+This project talks directly to the chat web apps — `chat.deepseek.com`, `gemini.google.com`, `chatgpt.com`, `claude.ai`, `grok.com`, `chat.mistral.ai`, `chat.qwen.ai`, `kimi.com`, `copilot.microsoft.com`, `perplexity.ai`, `chat.z.ai` (GLM) and `pollinations.ai` (anonymous keyless tier: text chat + image generation) — instead of any official paid API, then re-exposes them behind the familiar OpenAI endpoints (`/v1/chat/completions`, `/v1/models`, `/v1/images/generations`). That means any tool that speaks the OpenAI API — [aider](https://aider.chat) / **AiderDesk agent mode**, OpenWebUI, LiteLLM, LibreChat, the `openai` SDK, anything else — can use these models for free.
 
 **Zero-credential operation:** a background credential bot *creates every account itself* (auto-signup with auto-generated mailboxes, verification OTPs read automatically), stores the sessions in `./data/` and renews them automatically. Nothing to paste, nothing to maintain.
 
@@ -30,7 +30,7 @@ This project talks directly to the chat web apps — `chat.deepseek.com`, `gemin
 > - **autonomous credential bot** (`dsk/refresher.py`): creates accounts with auto-generated
 >   mailboxes (catch-all IMAP or mail.tm throwaways), reads the verification OTPs, stores the
 >   sessions in `./data/` and renews them automatically (refresh → re-login → fresh signup)
-> - **11-provider router** with dynamic model discovery, fallback chains and a
+> - **13-provider router** (incl. the anonymous keyless `duck` and `pollinations` tiers) with dynamic model discovery, fallback chains and a
 >   `I4F_PROVIDERS` allowlist; **self-healing** provider patches (`dsk/selfheal.py`)
 > - **llmtrim** request stage (`dsk/llmtrim.py`): LLM CALL → llmtrim → proxy rotator → LLM response
 > - **fast-only proxy rotation** with the no-proxy route as a first-class candidate
@@ -50,7 +50,7 @@ DeepSeek's web app authenticates every request with a bearer `userToken`; the ot
 2. **headless-Chromium re-login** with the accounts the bot created itself (`data/accounts.json`);
 3. **fully automatic signup**: a throwaway mailbox is generated (catch-all IMAP domain via `I4F_MAIL_DOMAIN`, or a mail.tm temp account with zero configuration), the signup form is filled in a real browser, the verification OTP is read from that mailbox and the fresh account is stored.
 
-Credentials therefore live exclusively in the `./data` volume — the `.env` file contains **no LLM credentials at all** (the server still honours a `userToken` sent as the client's API key, and legacy env vars if present, but nothing requires them). Providers whose web apps have no signup flow (claude, grok, qwen, kimi, mistral) stay dormant until one of their tokens exists in `data/`; they never block the other providers, and `I4F_PROVIDERS` can hide them entirely.
+Credentials therefore live exclusively in the `./data` volume — the `.env` file contains **no LLM credentials at all** (the server still honours a `userToken` sent as the client's API key, and legacy env vars if present, but nothing requires them). Providers whose web apps have no signup flow (claude, grok, qwen, kimi, mistral) stay dormant until one of their tokens exists in `data/`; `duck` and `pollinations` need no credentials at all (anonymous, keyless); none of them ever block the other providers, and `I4F_PROVIDERS` can hide any of them entirely.
 
 ### 2. Cloudflare bypass (`dsk/bypass.py`, `dsk/CloudflareBypasser.py`)
 
@@ -94,7 +94,7 @@ This is the main addition of this fork. A FastAPI server translates between the 
 - **Streaming** — the synchronous DeepSeek generator runs in a worker thread and is bridged into an async SSE response. `thinking` chunks are re-emitted as OpenAI `reasoning_content` deltas; `text` chunks become normal `delta.content` deltas; the stream ends with a proper `finish_reason` chunk and `data: [DONE]`.
 - **Tool-calling emulation** — see the next section.
 - **Compatibility** — standard OpenAI parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `frequency_penalty`, `presence_penalty`, `response_format`, `stream_options.include_usage`, …) are accepted; the ones DeepSeek cannot honour are tolerated and ignored, so exotic clients never get validation errors.
-- **Vision & image generation** — models whose provider supports them accept OpenAI-style multimodal `content` parts (`{"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}}`) and are advertised in `/v1/models` via `vision: true` / `image_gen: true` capability flags. Vision-capable models also power `POST /v1/images/generations` (OpenAI Images API shape, `b64_json` responses). DeepSeek web chat is text-only — sending images to it returns `400 model_does_not_support_vision`; Gemini-web and ChatGPT-web models support both when configured.
+- **Vision & image generation** — models whose provider supports them accept OpenAI-style multimodal `content` parts (`{"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}}`) and are advertised in `/v1/models` via `vision: true` / `image_gen: true` capability flags. Vision-capable models also power `POST /v1/images/generations` (OpenAI Images API shape, `b64_json` responses). DeepSeek web chat is text-only — sending images to it returns `400 model_does_not_support_vision`; Gemini-web and ChatGPT-web models support both when configured; Pollinations adds keyless image generation (`pollinations/sana` on `/v1/images/generations` and in-chat via markdown images) plus vision on whatever models its anonymous tier currently advertises as image-input capable. The playground renders generated/linked images inline (click to open the full-size original) and the `🎨 image gen` badge marks capable models.
 - **Per-request direct connection** — non-standard `disable_proxy: true` (top level of the request body, chat and image-generation endpoints) forces the request to skip the rotating proxy pool and connect directly. Handy for low-latency testing when you don't want a random free proxy in the path.
 
 ### 6. Tool calling (agent coding)

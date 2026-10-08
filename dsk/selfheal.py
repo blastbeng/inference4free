@@ -89,6 +89,7 @@ HEALABLE: Dict[str, Path] = {
     'perplexity': _BASE / 'providers' / 'perplexity_provider.py',
     'glm': _BASE / 'providers' / 'glm_provider.py',
     'duck': _BASE / 'providers' / 'duck_provider.py',
+    'pollinations': _BASE / 'providers' / 'pollinations_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -104,6 +105,7 @@ _MODULE_NAMES = {
     'perplexity': 'dsk.providers.perplexity_provider',
     'glm': 'dsk.providers.glm_provider',
     'duck': 'dsk.providers.duck_provider',
+    'pollinations': 'dsk.providers.pollinations_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -119,6 +121,7 @@ _PROVIDER_MODULES = {
     'perplexity': 'dsk.providers.perplexity_provider',
     'glm': 'dsk.providers.glm_provider',
     'duck': 'dsk.providers.duck_provider',
+    'pollinations': 'dsk.providers.pollinations_provider',
 }
 
 # Provider class name inside each module (used by probe/configured).
@@ -135,6 +138,7 @@ _PROVIDER_CLASSES = {
     'perplexity': 'PerplexityProvider',
     'glm': 'GlmProvider',
     'duck': 'DuckProvider',
+    'pollinations': 'PollinationsProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -164,6 +168,9 @@ _EVIDENCE_PATTERNS = {
             r'chatglm', r'delta_content'],
     'duck': [r'duckchat/v[12][A-Za-z0-9_/{}$.\-]{0,60}', r'x-vqd-[a-z0-9]+',
              r'x-fe-version', r'ERR_CHALLENGE', r'reasoningEffort'],
+    'pollinations': [r'text\.pollinations\.ai[A-Za-z0-9_/{}$.\-]{0,60}',
+                     r'image\.pollinations\.ai', r'/prompt/',
+                     r'input_modalities', r'output_modalities'],
 }
 
 

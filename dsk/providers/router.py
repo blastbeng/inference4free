@@ -83,6 +83,7 @@ PROVIDER_MODULES = (
     ('perplexity', '.perplexity_provider', 'PerplexityProvider'),
     ('glm', '.glm_provider', 'GlmProvider'),
     ('duck', '.duck_provider', 'DuckProvider'),
+    ('pollinations', '.pollinations_provider', 'PollinationsProvider'),
 )
 
 OWNED_BY = {
@@ -98,6 +99,7 @@ OWNED_BY = {
     'perplexity': 'perplexity',
     'glm': 'zai',
     'duck': 'duckduckgo',
+    'pollinations': 'pollinations',
 }
 
 # Public model-id namespaces: every model surfaced via /v1/models and the
@@ -118,6 +120,7 @@ PUBLIC_PREFIX = {
     'perplexity': 'perplexity',
     'glm': 'z.ai',
     'duck': 'duck',
+    'pollinations': 'pollinations',
 }
 
 # Reverse of PUBLIC_PREFIX: 'z.ai' -> 'glm', used by resolve() so both the
@@ -188,6 +191,11 @@ AUTO_PROVE_S = max(0.0, float(os.getenv('I4F_AUTO_PROVE_S', '900') or 900))
 # before the first token. 0 = use FIRST_TOKEN_TIMEOUT for everyone.
 HTTP_FIRST_TOKEN_TIMEOUT = max(
     0.0, float(os.getenv('I4F_HTTP_FIRST_TOKEN_TIMEOUT', '60') or 60))
+# First-token deadline for image-generation targets: the render completes
+# BEFORE the first chunk is yielded, so the stall watchdog must cover a whole
+# upstream render (queues can run past a minute), not a stream stall.
+IMAGE_FIRST_TOKEN_TIMEOUT = max(
+    0.0, float(os.getenv('I4F_IMAGE_FIRST_TOKEN_TIMEOUT', '180') or 180))
 BROWSER_PROVIDERS = frozenset({'chatgpt', 'qwen', 'gemini', 'zai'})
 # Provider-level cooldown after a rate-limit failure (seconds): anonymous
 # quotas are identity-wide, so every sibling model of that provider is
@@ -331,13 +339,14 @@ def _parse_fallbacks() -> Dict[str, List[str]]:
 AUTO_MODEL_ID = 'auto'
 
 AUTO_CATEGORIES: Dict[str, List[str]] = {
-    'image_gen':   ['chatgpt', 'gemini', 'glm'],
-    'vision':      ['chatgpt', 'gemini', 'glm'],
+    # pollinations leads image_gen: keyless + fast, burns no account quota
+    'image_gen':   ['pollinations', 'chatgpt', 'gemini', 'glm'],
+    'vision':      ['chatgpt', 'gemini', 'glm', 'pollinations'],
     'translation': ['gemini', 'chatgpt', 'deepseek', 'glm', 'qwen', 'mistral'],
     'summarize':   ['chatgpt', 'gemini', 'glm', 'qwen', 'mistral', 'deepseek'],
     'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt'],
     'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral',
-                    'kimi'],
+                    'kimi', 'pollinations'],
 }
 
 _RE_CODE_FENCE = re.compile(
@@ -1256,10 +1265,15 @@ class Router:
                         no_proxy=no_proxy,
                         auth_key=auth_key,
                     )
-                    first_deadline = (FIRST_TOKEN_TIMEOUT
-                                      if (target.provider_name in BROWSER_PROVIDERS
-                                          or HTTP_FIRST_TOKEN_TIMEOUT <= 0)
-                                      else HTTP_FIRST_TOKEN_TIMEOUT)
+                    if (target.provider_name in BROWSER_PROVIDERS
+                            or HTTP_FIRST_TOKEN_TIMEOUT <= 0):
+                        first_deadline = FIRST_TOKEN_TIMEOUT
+                    elif image_generation or getattr(target, 'image_gen', False):
+                        # image renders complete before the first chunk — the
+                        # watchdog must allow a full render, not a stream stall
+                        first_deadline = IMAGE_FIRST_TOKEN_TIMEOUT
+                    else:
+                        first_deadline = HTTP_FIRST_TOKEN_TIMEOUT
                     first = None
                     if FIRST_TOKEN_TIMEOUT > 0 and first_deadline > 0:
                         # stall watchdog: a provider that connects but never

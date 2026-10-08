@@ -123,7 +123,8 @@ def _jar_path(name: str) -> Path:
              'qwen': 'qwen_cookies.json', 'kimi': 'kimi_cookies.json',
              'copilot': 'copilot_cookies.json',
              'perplexity': 'perplexity_cookies.json', 'glm': 'glm_cookies.json',
-             'duck': 'duck_cookies.json'}
+             'duck': 'duck_cookies.json',
+             'pollinations': 'pollinations_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -402,7 +403,7 @@ def _has_creds(name: str) -> bool:
         if name == 'kimi':
             return bool(jar.get('token') or jar.get('jwt'))
         return bool(jar.get('token'))
-    if name in ('copilot', 'perplexity', 'glm', 'duck'):
+    if name in ('copilot', 'perplexity', 'glm', 'duck', 'pollinations'):
         return True  # anonymous reverse-engineered modes always available
     if name == 'mistral':
         token = (os.getenv('MISTRAL_SESSION_TOKEN', '').strip()
@@ -968,7 +969,8 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
            'mistral': refresh_mistral, 'copilot': _anonymous('copilot'),
            'perplexity': refresh_perplexity, 'glm': _anonymous('glm'),
-           'duck': _anonymous('duck')}
+           'duck': _anonymous('duck'),
+           'pollinations': _anonymous('pollinations')}
 
 
 # ------------------------------------------------------------------ IMAP OTP
@@ -3765,7 +3767,8 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'mistral': signup_mistral,
           'copilot': _anonymous('copilot'),
           'perplexity': signup_perplexity, 'glm': _anonymous('glm'),
-          'duck': _anonymous('duck')}
+          'duck': _anonymous('duck'),
+          'pollinations': _anonymous('pollinations')}
 
 
 # ------------------------------------------------------------------ renew
