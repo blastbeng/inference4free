@@ -127,19 +127,30 @@ class PerplexityProvider(Provider):
         """Upstream model_preference values (validated live via ask).
 
         ``pplx_pro`` / partner models require a free signed-in session;
-        anonymous visitors effectively get ``turbo``.
+        anonymous visitors effectively get ``turbo``. No discovery endpoint
+        upstream — the picker is env-overridable via ``PERPLEXITY_MODELS``
+        (comma-separated upstream slugs) so renames need no code change.
         """
-        return [{
-            'id': entry['id'],
-            'upstream_model': entry['upstream'],
-            'thinking_enabled': entry['thinking'],
-            'search_enabled': True,   # every answer is web-grounded
-            'vision': False,
-            'image_gen': False,
-            'context_length': PERPLEXITY_CONTEXT_LENGTH,
-            'max_output_tokens': PERPLEXITY_MAX_OUTPUT,
-            'extra': {'model_preference': entry['upstream']},
-        } for entry in PERPLEXITY_MODELS]
+        known = {entry['upstream']: entry for entry in PERPLEXITY_MODELS}
+        raw = (os.getenv('PERPLEXITY_MODELS', '') or '').strip()
+        slugs = ([s.strip() for s in raw.split(',') if s.strip()]
+                 if raw else list(known))
+        entries: List[Dict[str, Any]] = []
+        for upstream in slugs:
+            meta = known.get(upstream) or {}
+            slug = upstream.replace('_', '').replace('-', '')
+            entries.append({
+                'id': meta.get('id') or f'perplexity-{slug}',
+                'upstream_model': upstream,
+                'thinking_enabled': bool(meta.get('thinking', False)),
+                'search_enabled': True,   # every answer is web-grounded
+                'vision': False,
+                'image_gen': False,
+                'context_length': PERPLEXITY_CONTEXT_LENGTH,
+                'max_output_tokens': PERPLEXITY_MAX_OUTPUT,
+                'extra': {'model_preference': upstream},
+            })
+        return entries
 
     def stream(self, prompt: str, *, model: str, thinking_enabled: bool = False,
                search_enabled: bool = False, temperature: Optional[float] = None,

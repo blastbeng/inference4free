@@ -122,7 +122,8 @@ def _jar_path(name: str) -> Path:
              'grok': 'grok_cookies.json', 'mistral': 'mistral_cookies.json',
              'qwen': 'qwen_cookies.json', 'kimi': 'kimi_cookies.json',
              'copilot': 'copilot_cookies.json',
-             'perplexity': 'perplexity_cookies.json', 'glm': 'glm_cookies.json'}
+             'perplexity': 'perplexity_cookies.json', 'glm': 'glm_cookies.json',
+             'duck': 'duck_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -401,7 +402,7 @@ def _has_creds(name: str) -> bool:
         if name == 'kimi':
             return bool(jar.get('token') or jar.get('jwt'))
         return bool(jar.get('token'))
-    if name in ('copilot', 'perplexity', 'glm'):
+    if name in ('copilot', 'perplexity', 'glm', 'duck'):
         return True  # anonymous reverse-engineered modes always available
     if name == 'mistral':
         if os.getenv('MISTRAL_SESSION_TOKEN', '').strip():
@@ -602,7 +603,7 @@ def _egress_rotate_providers() -> set:
     lever is the egress. Both are served by the proxy pool, so rotating to a
     fresh exit is the automatic rung.
     """
-    raw = os.getenv('I4F_EGRESS_ROTATE', 'copilot,perplexity')
+    raw = os.getenv('I4F_EGRESS_ROTATE', 'copilot,perplexity,duck')
     return {p.strip().lower() for p in raw.split(',') if p.strip()}
 
 
@@ -905,7 +906,8 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
            'mistral': refresh_mistral, 'copilot': _anonymous('copilot'),
-           'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm')}
+           'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm'),
+           'duck': _anonymous('duck')}
 
 
 # ------------------------------------------------------------------ IMAP OTP
@@ -3741,7 +3743,8 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'kimi': signup_kimi,
           'mistral': signup_mistral,
           'copilot': _anonymous('copilot'),
-          'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm')}
+          'perplexity': _anonymous('perplexity'), 'glm': _anonymous('glm'),
+          'duck': _anonymous('duck')}
 
 
 # ------------------------------------------------------------------ renew

@@ -66,6 +66,25 @@ CLAUDE_MODELS: List[Dict[str, Any]] = [
 ]
 
 
+def _model_table() -> Dict[str, Dict[str, Any]]:
+    """Env-overridable picker: ``CLAUDE_MODELS=id1,id2`` (claude.ai ships no
+    model-discovery endpoint and the picker ids are resolved at runtime from
+    authenticated config, so renames/retirements can't be scraped). Known ids
+    keep their flags; unknown ones assume opus/sonnet classes think."""
+    raw = (os.getenv('CLAUDE_MODELS', '') or '').strip()
+    if not raw:
+        return {entry['id']: dict(entry) for entry in CLAUDE_MODELS}
+    table: Dict[str, Dict[str, Any]] = {}
+    for mid in [m.strip() for m in raw.split(',') if m.strip()]:
+        known = next((e for e in CLAUDE_MODELS if e['id'] == mid), None)
+        table[mid] = dict(known or {
+            'id': mid,
+            'thinking': 'opus' in mid or 'sonnet' in mid,
+            'vision': False,
+        })
+    return table
+
+
 def _session_key() -> str:
     raw = (os.getenv('CLAUDE_SESSION_KEY', '') or '').strip()
     if raw:
@@ -128,7 +147,8 @@ class ClaudeWebProvider(Provider):
         return bool(_session_key())
 
     def list_models(self, auth_key: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Web-app model picker (fixed set; validated live via the org lookup)."""
+        """Web-app picker (no discovery endpoint upstream; env-overridable via
+        ``CLAUDE_MODELS``), validated live via the org lookup."""
         if not _session_key():
             raise ProviderAuthError('no claude.ai sessionKey configured')
         self._organization_id()  # validates the session cheaply
@@ -142,7 +162,7 @@ class ClaudeWebProvider(Provider):
             'context_length': CLAUDE_CONTEXT_LENGTH,
             'max_output_tokens': CLAUDE_MAX_OUTPUT,
             'extra': {'title': entry['id']},
-        } for entry in CLAUDE_MODELS]
+        } for entry in _model_table().values()]
 
     def stream(self, prompt: str, *, model: str, thinking_enabled: bool = False,
                search_enabled: bool = False, temperature: Optional[float] = None,

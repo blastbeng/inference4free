@@ -57,6 +57,25 @@ GROK_MODELS: List[Dict[str, Any]] = [
 ]
 
 
+def _model_table() -> List[Dict[str, Any]]:
+    """Env-overridable picker: ``GROK_MODELS=id1,id2`` (grok.com exposes no
+    model-discovery endpoint). Known ids keep their mode flags; unknown ones
+    route through the default ``auto`` mode, 'reasoning'/'heavy' in the id
+    assumes thinking."""
+    raw = (os.getenv('GROK_MODELS', '') or '').strip()
+    if not raw:
+        return list(GROK_MODELS)
+    out: List[Dict[str, Any]] = []
+    for mid in [m.strip() for m in raw.split(',') if m.strip()]:
+        known = next((e for e in GROK_MODELS if e['id'] == mid), None)
+        out.append(dict(known or {
+            'id': mid,
+            'mode': 'auto',
+            'thinking': 'reasoning' in mid or 'heavy' in mid,
+        }))
+    return out
+
+
 def _sso() -> str:
     raw = (os.getenv('GROK_SSO', '') or '').strip()
     if raw:
@@ -119,7 +138,7 @@ class GrokProvider(Provider):
             'context_length': GROK_CONTEXT_LENGTH,
             'max_output_tokens': GROK_MAX_OUTPUT,
             'extra': {'modeId': entry['mode']},
-        } for entry in GROK_MODELS]
+        } for entry in _model_table()]
 
     def stream(self, prompt: str, *, model: str, thinking_enabled: bool = False,
                search_enabled: bool = False, temperature: Optional[float] = None,

@@ -88,6 +88,7 @@ HEALABLE: Dict[str, Path] = {
     'copilot': _BASE / 'providers' / 'copilot_provider.py',
     'perplexity': _BASE / 'providers' / 'perplexity_provider.py',
     'glm': _BASE / 'providers' / 'glm_provider.py',
+    'duck': _BASE / 'providers' / 'duck_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -102,6 +103,7 @@ _MODULE_NAMES = {
     'copilot': 'dsk.providers.copilot_provider',
     'perplexity': 'dsk.providers.perplexity_provider',
     'glm': 'dsk.providers.glm_provider',
+    'duck': 'dsk.providers.duck_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -116,6 +118,7 @@ _PROVIDER_MODULES = {
     'copilot': 'dsk.providers.copilot_provider',
     'perplexity': 'dsk.providers.perplexity_provider',
     'glm': 'dsk.providers.glm_provider',
+    'duck': 'dsk.providers.duck_provider',
 }
 
 # Provider class name inside each module (used by probe/configured).
@@ -131,6 +134,7 @@ _PROVIDER_CLASSES = {
     'copilot': 'CopilotProvider',
     'perplexity': 'PerplexityProvider',
     'glm': 'GlmProvider',
+    'duck': 'DuckProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -158,6 +162,8 @@ _EVIDENCE_PATTERNS = {
                    r'ask_text', r'markdown_block'],
     'glm': [r'api/chat/completions', r'assistant/stream', r'refresh_token',
             r'chatglm', r'delta_content'],
+    'duck': [r'duckchat/v[12][A-Za-z0-9_/{}$.\-]{0,60}', r'x-vqd-[a-z0-9]+',
+             r'x-fe-version', r'ERR_CHALLENGE', r'reasoningEffort'],
 }
 
 
@@ -409,7 +415,8 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'kimi': 'https://www.kimi.com',
             'copilot': 'https://copilot.microsoft.com',
             'perplexity': 'https://www.perplexity.ai',
-            'glm': 'https://chat.z.ai'}.get(name, '')
+            'glm': 'https://chat.z.ai',
+            'duck': 'https://duck.ai'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []

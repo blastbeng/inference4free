@@ -82,6 +82,7 @@ PROVIDER_MODULES = (
     ('copilot', '.copilot_provider', 'CopilotProvider'),
     ('perplexity', '.perplexity_provider', 'PerplexityProvider'),
     ('glm', '.glm_provider', 'GlmProvider'),
+    ('duck', '.duck_provider', 'DuckProvider'),
 )
 
 OWNED_BY = {
@@ -96,6 +97,7 @@ OWNED_BY = {
     'copilot': 'microsoft',
     'perplexity': 'perplexity',
     'glm': 'zai',
+    'duck': 'duckduckgo',
 }
 
 # Public model-id namespaces: every model surfaced via /v1/models and the
@@ -115,6 +117,7 @@ PUBLIC_PREFIX = {
     'copilot': 'microsoft',
     'perplexity': 'perplexity',
     'glm': 'z.ai',
+    'duck': 'duck',
 }
 
 # Reverse of PUBLIC_PREFIX: 'z.ai' -> 'glm', used by resolve() so both the
@@ -810,6 +813,10 @@ class Router:
         healthy one form the fast tier and rotate for fairness; slower
         providers follow in measured order and are still tried as fallbacks
         (and still climb back via demote/probe when the fast ones fail).
+        Unmeasured providers rotate with the fast tier until they earn a
+        first data point — parked behind a measured leader they would never
+        be reached while it stays healthy, and 'auto' would answer with one
+        provider only.
         """
         if len(prov_order) <= 1:
             return prov_order
@@ -827,17 +834,26 @@ class Router:
         # unmeasured provider lead each request: otherwise a working-but-
         # slow provider (measured 56s browser relay) serves EVERY call and
         # the unknowns — possibly far faster — never get their first data
-        # point (they are only reached when the leader fails). Once a
-        # genuinely fast provider is measured, probing stops and unknowns
-        # are measured naturally as fallbacks, never taxing the fast path.
+        # point (they are only reached when the leader fails).
         lead: List[str] = []
         if unknown and fastest > PROBE_UNKNOWN_ABOVE_S:
             off = self._rr_next('auto:probe', len(unknown))
             unknown = unknown[off:] + unknown[:off]
             lead = [unknown.pop(0)]
-        off = self._rr_next(f'auto:{category}', len(tier))
-        return (lead + tier[off:] + tier[:off] + unknown
-                + sorted(slow, key=lambda p: lat[p]))
+            off = self._rr_next(f'auto:{category}', len(tier))
+            return (lead + tier[off:] + tier[:off] + unknown
+                    + sorted(slow, key=lambda p: lat[p]))
+        # Fast leader: unmeasured providers rotate WITH the fast tier until
+        # they earn a first data point. Unmeasured, they might be just as
+        # fast — and parking them behind the measured leader starves them:
+        # they are only ever reached when the leader FAILS, so a healthy
+        # fast leader serves every call (reported as "auto only ever
+        # answers glm"). One measured turn classifies them for good:
+        # fast -> they join the tier rotation, slow -> they sink to the
+        # measured-slow tail and stop taxing the fast path.
+        rot = tier + unknown
+        off = self._rr_next(f'auto:{category}', len(rot))
+        return rot[off:] + rot[:off] + sorted(slow, key=lambda p: lat[p])
 
     def _quota_cooling(self, provider_name: str) -> bool:
         """True while a recent rate-limit failure keeps this provider's
