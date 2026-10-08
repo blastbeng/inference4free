@@ -3815,9 +3815,9 @@ def signup_perplexity() -> Tuple[bool, str]:
 
     try:
         attempts = max(1, int(os.getenv('I4F_PERPLEXITY_SIGNUP_ATTEMPTS',
-                                        '4') or 4))
+                                        '6') or 6))
     except ValueError:
-        attempts = 4
+        attempts = 6
     backoff = max(5.0, float(os.getenv('I4F_PERPLEXITY_SIGNUP_BACKOFF',
                                        '20') or 20))
     ua = {
@@ -3835,8 +3835,12 @@ def signup_perplexity() -> Tuple[bool, str]:
     kw: Dict[str, Any] = {}
     for attempt in range(attempts):
         # proxies only: the host IP is usually already flagged by the
-        # auth endpoint, and the pool gives a fresh roll every attempt
-        egress = _px.get_proxy('perplexity', direct_ok=False)
+        # auth endpoint, and the pool gives a fresh roll every attempt —
+        # except the FINAL attempt falls back to direct (429 flags decay,
+        # and a direct roll beats skipping the cycle when the pool draws
+        # only dead exits, which happens)
+        egress = (None if attempt == attempts - 1
+                  else _px.get_proxy('perplexity', direct_ok=False))
         kw = ({'proxies': {'http': egress, 'https': egress}}
               if egress else {})
         try:
