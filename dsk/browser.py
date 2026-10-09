@@ -371,6 +371,16 @@ class _SharedBrowser:
         # active tab, no audio utility process — both showed up in RSS.
         options.set_argument('--disable-back-forward-cache')
         options.set_argument('--mute-audio')
+        # Signup rungs click ENGLISH button texts ('Continue', 'Sign in',
+        # 'Verify'): a page that follows the host IP's locale (observed:
+        # dash.llm7.io rendered Italian for an IT egress) matches none of
+        # them and the rung stalls before the form is ever submitted.
+        # Pin the UI language so the English click lists stay valid.
+        options.set_argument('--lang=en-US')
+        try:
+            options.set_pref('intl.accept_languages', 'en-US,en')
+        except Exception:  # noqa: BLE001 - pref API drift; --lang still
+            pass           # covers navigator.language
         if self.proxy:
             if self.proxy.startswith('socks'):
                 # Chromium accepts the plain "socks5://" scheme only
@@ -409,15 +419,36 @@ class _SharedBrowser:
         try:
             self._browser = Chromium(options)
         except Exception:
+            # Slow boot / half-open CDP (observed on a loaded SBC: the
+            # previous chromium was still dying when the new one bound the
+            # port, and DrissionPage's handshake answered 404 mid-boot).
+            # Reap, wait for the port to actually close, retry once — only
+            # then degrade the window, which would mask a real bot-wall
+            # signal if done prematurely.
+            import socket
             reap_dead_children()
-            if not headless:
-                # windowed spawn failed (e.g. the X server died between the
-                # liveness check and the spawn) — degrade to headless
-                options.headless(True)
-                self._headless = True
+            kill_stale_browsers(self.profile, self.port)
+            clear_profile_lock(self.profile)
+            for _ in range(12):
+                s = socket.socket()
+                s.settimeout(0.3)
+                busy = self.port is not None and \
+                    s.connect_ex(('127.0.0.1', self.port)) == 0
+                s.close()
+                if not busy:
+                    break
+                time.sleep(1)
+            try:
                 self._browser = Chromium(options)
-            else:
-                raise
+            except Exception:
+                if not headless:
+                    # windowed spawn failed (e.g. the X server died between
+                    # the liveness check and the spawn) — degrade to headless
+                    options.headless(True)
+                    self._headless = True
+                    self._browser = Chromium(options)
+                else:
+                    raise
         logger.info('shared browser %s: chromium ready on port %d '
                     '(profile=%s, proxy=%s, headless=%s)',
                     self.key, self.port, self.profile or 'default',

@@ -24,6 +24,14 @@ How it works
 3. An Ory Kratos session token (``MISTRAL_SESSION_TOKEN``) is required:
    anonymous access now returns an account upsell instead of model output.
 4. Quota (error code 6200): rotate the stable UUID and retry once.
+
+Chunk parsing is per-chunk and per-field (see ``_parse_line``): every text-ish
+field of every ``contentChunks`` entry is diffed against what was already
+emitted for that exact path, so snapshots, ``add`` of a new chunk and string
+appends all yield deltas only — never a re-send, never a dropped chunk. Fields
+that carry reasoning (``reasoning``/``thinking``/``summary``/``plan``, or a
+chunk typed as such) are emitted as ``type: 'thinking'`` so the OpenAI shim
+sends them as ``delta.reasoning_content`` and NOT as the message body.
 """
 
 import codecs
@@ -54,6 +62,27 @@ logger = logging.getLogger('dsk.providers.mistral')
 # parse time and surface it as an auth failure so the router falls back and
 # selfheal classifies the provider as needing credentials.
 _AUTH_WALL_RE = re.compile(r'account is now required', re.IGNORECASE)
+
+# contentChunk types that are plumbing, not prose: tool/plugin traffic,
+# citations and generated images must never enter the text stream.
+_SKIP_CHUNK_TYPES = frozenset((
+    'tool', 'tool_call', 'tool_result', 'function', 'plugin', 'connector',
+    'citation', 'source', 'artifact', 'image', 'image_generation',
+))
+# Fields (and chunk types) that carry the model's REASONING. The Work/Vibe
+# harness streams a summary of the chain of thought alongside the answer;
+# sending it as ``text`` puts it in the message body, which is what clients
+# (OpenWebUI and friends) then read as "the reply is only the thinking".
+_REASON_KEYS = ('reasoning', 'thinking', 'thought', 'summary', 'plan')
+# Fields that carry prose.
+_TEXT_KEYS = ('text', 'markdown', 'content')
+
+
+def _kind_for(field: str, chunk_type: str) -> str:
+    """'thinking' when the field name or the chunk type says reasoning."""
+    blob = f"{field} {chunk_type}".lower()
+    return 'thinking' if any(k in blob for k in _REASON_KEYS) else 'text'
+
 
 MISTRAL_BASE_URL = 'https://chat.mistral.ai'
 MISTRAL_AUTH_URL = 'https://auth.mistral.ai'
@@ -371,16 +400,21 @@ class MistralProvider(Provider):
         chars have been matched against the login-wall regex — holding (not
         just checking) is required, otherwise the deltas emitted before the
         phrase completes leak to the router and pollute the fallback answer.
+
+        ``emitted``/``counters`` live here, not on the instance: one stream is
+        one conversation turn, and its diff state must not leak into the next.
         """
         decoder = codecs.getincrementaldecoder('utf-8')('replace')
         buffer = ''
         prefix = ''                       # accumulated text head
         held: List[Dict[str, Any]] = []   # pieces buffered during the window
+        emitted: Dict[str, int] = {}      # chars already sent, per chunk field
+        counters: Dict[str, int] = {}     # '/-' JSON-Pointer appends -> index
         for chunk in response.iter_content(chunk_size=None):
             buffer += decoder.decode(chunk or b'')
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
-                for piece in self._parse_line(line.strip()):
+                for piece in self._parse_line(line.strip(), emitted, counters):
                     if len(prefix) < 300:
                         head = piece.get('content') \
                             if piece.get('type') == 'text' else None
@@ -397,7 +431,7 @@ class MistralProvider(Provider):
                     yield piece
         buffer += decoder.decode(b'', final=True)
         if buffer.strip():
-            for piece in self._parse_line(buffer.strip()):
+            for piece in self._parse_line(buffer.strip(), emitted, counters):
                 while held:
                     yield held.pop(0)
                 yield piece
@@ -405,7 +439,44 @@ class MistralProvider(Provider):
             yield held.pop(0)
         yield {'content': '', 'type': 'text', 'finish_reason': 'stop'}
 
-    def _parse_line(self, line: str) -> List[Dict[str, Any]]:
+    def _wall_check(self, text: str) -> None:
+        """The account upsell is an auth failure, not an answer."""
+        if text and _AUTH_WALL_RE.search(text):
+            raise ProviderAuthError(
+                'mistral anonymous access disabled (account upsell): '
+                f'{text[:120]}')
+
+    def _chunk_pieces(self, chunk: Dict[str, Any], key: str,
+                      emitted: Dict[str, int]) -> List[Dict[str, Any]]:
+        """Diff one contentChunk object against what was sent for ``key``.
+
+        Snapshots (``replace`` with the full chunk list, ``add`` of a new
+        chunk) carry the WHOLE text of the chunk, so the tail is what is
+        emitted; appends on ``…/text`` are true deltas and are counted into
+        the same key, which is what keeps the two paths from double-sending.
+        """
+        ctype = str(chunk.get('type') or '').lower()
+        if ctype in _SKIP_CHUNK_TYPES:
+            return []
+        out: List[Dict[str, Any]] = []
+        for field in _TEXT_KEYS + _REASON_KEYS:
+            value = chunk.get(field)
+            if not isinstance(value, str) or not value:
+                continue
+            self._wall_check(value)
+            ck = f"{key}/{field}"
+            done = emitted.get(ck, 0)
+            if len(value) <= done:
+                continue
+            emitted[ck] = len(value)
+            out.append({'content': value[done:], 'type': _kind_for(field, ctype),
+                        'finish_reason': None})
+        return out
+
+    def _parse_line(self, line: str,
+                    emitted: Optional[Dict[str, int]] = None,
+                    counters: Optional[Dict[str, int]] = None
+                    ) -> List[Dict[str, Any]]:
         if not line or ':' not in line:
             return []
         colon = line.index(':')
@@ -439,31 +510,55 @@ class MistralProvider(Provider):
         msg_type = j.get('type')
         if msg_type != 'message':
             return []
+        # Callers that pass no state get stateless (append-semantics) parsing.
+        sent = emitted if emitted is not None else {}
+        counts = counters if counters is not None else {}
         out: List[Dict[str, Any]] = []
         for patch in j.get('patches', []):
-            op = patch.get('op')
-            path = patch.get('path', '')
+            if not isinstance(patch, dict):
+                continue
+            op = str(patch.get('op') or '')
+            path = str(patch.get('path') or '')
             value = patch.get('value')
             if path == '/' or '/contentChunks' not in path:
                 continue
-            if op == 'replace' and isinstance(value, list):
-                # Full snapshot of the chunk list — emit only the tail (the
-                # web client replaces, we diff to avoid re-emitting text).
-                texts = [c.get('text', '') for c in value
-                         if isinstance(c, dict) and c.get('type') == 'text']
-                if texts:
-                    if _AUTH_WALL_RE.search(texts[-1][:300]):
-                        raise ProviderAuthError(
-                            'mistral anonymous access disabled (account '
-                            f'upsell): {texts[-1][:120]}')
-                    out.append({'content': texts[-1], 'type': 'text',
+            if path.endswith('/-'):
+                # JSON Pointer "append to array": give it a real index so the
+                # later appends on /contentChunks/N/text diff against it.
+                base = path[:-1]
+                idx = counts.get(base, 0)
+                counts[base] = idx + 1
+                path = f"{base}{idx}"
+            if isinstance(value, str):
+                if not value:
+                    continue
+                self._wall_check(value)
+                field = path.rsplit('/', 1)[-1]
+                kind = _kind_for(field, '')
+                done = sent.get(path, 0)
+                if op == 'append':
+                    sent[path] = done + len(value)
+                    out.append({'content': value, 'type': kind,
                                 'finish_reason': None})
-            elif op == 'append' and isinstance(value, str) and value:
-                # Delta append — e.g. path ``/contentChunks/0/text``.
-                if _AUTH_WALL_RE.search(value[:300]):
-                    raise ProviderAuthError(
-                        'mistral anonymous access disabled (account '
-                        f'upsell): {value[:120]}')
-                out.append({'content': value, 'type': 'text',
-                            'finish_reason': None})
+                elif len(value) > done:
+                    sent[path] = len(value)
+                    out.append({'content': value[done:], 'type': kind,
+                                'finish_reason': None})
+                continue
+            if isinstance(value, list):
+                for i, entry in enumerate(value):
+                    if isinstance(entry, dict):
+                        out.extend(self._chunk_pieces(
+                            entry, f"{path}/{i}", sent))
+                    elif isinstance(entry, str) and entry:
+                        self._wall_check(entry)
+                        ck = f"{path}/{i}/text"
+                        done = sent.get(ck, 0)
+                        if len(entry) > done:
+                            sent[ck] = len(entry)
+                            out.append({'content': entry[done:], 'type': 'text',
+                                        'finish_reason': None})
+                continue
+            if isinstance(value, dict):
+                out.extend(self._chunk_pieces(value, path, sent))
         return out

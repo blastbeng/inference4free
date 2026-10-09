@@ -1704,14 +1704,115 @@ def _browser(proxy: Optional[str] = None, headed: bool = False,
         port=local_port, fresh=(user_data_path is None))
 
 
+def _ele_value(ele) -> str:
+    for get in (lambda: ele.value, lambda: ele.attr('value')):
+        try:
+            return str(get() or '')
+        except Exception:  # noqa: BLE001
+            continue
+    return ''
+
+
+def _css_from_dp(sel: str) -> str:
+    """Best-effort translation of a DrissionPage selector to plain CSS.
+
+    ``_fill_react`` runs ``document.querySelector``, which speaks CSS only:
+    DrissionPage's prefixed forms (``css:``, ``tag:``, ``@attr:value``) must
+    be translated or the JS silently misses the field.
+    """
+    if sel.startswith('css:'):
+        return sel[4:]
+    if sel.startswith('tag:'):
+        return sel[4:]
+    if sel.startswith('@'):
+        attr, _, val = sel[1:].partition(':')
+        return f'[{attr}="{val}"]'
+    return ''  # xpath / index selectors have no CSS equivalent
+
+
 def _fill_first(page, selectors: List[str], value: str,
                 timeout: float = 5.0) -> bool:
+    """Fill the first matching field and VERIFY the value stuck.
+
+    A consent overlay or a re-rendering SPA can swallow the typed
+    value while ``input()`` still reports success (observed on
+    dash.llm7.io: fill=True, field value empty -> the verification
+    email was never sent). Read the value back and retry, so a
+    silent no-op fill surfaces as a False instead of a phantom.
+    """
     for sel in selectors:
         try:
             ele = page.ele(sel, timeout=timeout)
-            if ele:
+            if not ele:
+                continue
+            for _ in range(2):
+                try:
+                    ele.clear()
+                    ele.input(value)
+                except Exception:  # noqa: BLE001
+                    continue
+                if _ele_value(ele).strip() == value.strip():
+                    return True
+            # last resort: focus the field and type again
+            try:
+                ele.click()
                 ele.clear()
                 ele.input(value)
+                if _ele_value(ele).strip() == value.strip():
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            # React-controlled fields ignore both typing paths (observed on
+            # dash.llm7.io: visible, enabled, yet typing never lands):
+            # write through the native value setter so onChange fires and
+            # the component state really updates.
+            css = _css_from_dp(sel)
+            if css:
+                try:
+                    if _fill_react(page, css, value) and \
+                            _ele_value(ele).strip() == value.strip():
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _dismiss_consents(page, rounds: int = 3) -> None:
+    """Best-effort dismissal of cookie/privacy consent overlays.
+
+    EU CMP walls (llm7's 'privacy choices', OneTrust/Cookiebot banners)
+    sit on top of the signup form and swallow the first fill: the
+    rung types into a covered field, the value never lands and the
+    verification email is never sent. Decline buttons come first
+    (least tracking); accept buttons are the fallback that still
+    clears the overlay.
+    """
+    texts = ['No thanks', 'No, thanks', 'Reject all', 'Rifiuta tutto',
+             'Rifiuta', 'Save preferences', 'Save Preferences',
+             'Accept all', 'Accept All', 'Accetta tutto', 'Accetta',
+             'Accept', 'Consenti', 'Decline', 'Got it', '×']
+    for _ in range(rounds):
+        if not _click_any(page, texts):
+            break
+        time.sleep(2)
+
+
+def _has_field(page, selectors: List[str], timeout: float = 5.0) -> bool:
+    """Existence-only probe for a form field (no typing).
+
+    The signup rungs probe the form BEFORE spending a disposable
+    mailbox on an OAuth-only wall. Probing through _fill_first typed
+    a dummy address into the live form; SPA forms re-render on
+    validation and the later real fill then found no field (observed
+    on dash.llm7.io). Checking without mutating keeps the cheap wall
+    detection and leaves the form pristine for the real fill.
+    """
+    for sel in selectors:
+        try:
+            if page.ele(sel, timeout=timeout):
                 return True
         except Exception:  # noqa: BLE001
             continue
@@ -2390,6 +2491,7 @@ def signup_deepseek() -> Tuple[bool, str]:
             # through; fall back to the direct document GET only if the
             # SPA entry point is missing.
             page.get('https://chat.deepseek.com/')
+            _dismiss_consents(page)
             _net_log_install(page)  # record the send-code API verdict
             time.sleep(6)
             root_head = ((page.title or '') + ' ' + _body_head(page)).lower()
@@ -2522,6 +2624,7 @@ def signup_chatgpt() -> Tuple[bool, str]:
     try:
         page.get('https://chatgpt.com/auth/login')
         time.sleep(6)
+        _dismiss_consents(page)
         _click_any(page, ['Reject non-essential', 'Accept all'])
         time.sleep(1)
         # hook installed after navigation: it lives on the page's window and
@@ -2808,6 +2911,7 @@ def signup_gemini() -> Tuple[bool, str]:
         deadline = time.time() + 120
         while time.time() < deadline:
             page.get('https://gemini.google.com/app')
+            _dismiss_consents(page)
             for _ in range(8):
                 time.sleep(5)
                 if _has_psid():
@@ -2920,6 +3024,7 @@ def signup_claude() -> Tuple[bool, str]:
         while time.time() < deadline and not email_filled:
             page.get('https://claude.ai/login')
             time.sleep(5)
+            _dismiss_consents(page)
             _click_any(page, ['Reject all cookies', 'Accept all cookies'])
             time.sleep(1)
             # hook re-installed after every navigation: it lives on the
@@ -3045,11 +3150,11 @@ def signup_grok() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://accounts.x.ai/sign-up')
         time.sleep(6)
-        probe_email = 'probe@example.invalid'
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, probe_email):
+        _dismiss_consents(page)
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             _click_any(page, ['Sign up', 'Create account', 'Sign in'])
             time.sleep(4)
-            if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, probe_email):
+            if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
                 return False, ('grok signup is OAuth-only (X account required) — '
                                'set GROK_SSO or grok_cookies.json manually')
         session, err = mailgen.create_email()
@@ -3115,14 +3220,14 @@ def signup_kimi() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://www.kimi.com/')
         time.sleep(6)
+        _dismiss_consents(page)
         if not _click_any(page, ['Sign up', 'Sign Up', '注册', 'Log in', '登录']):
             return False, 'kimi auth entry not found'
         time.sleep(4)
         # prefer email/password over phone (no phone wall for email)
         _click_any(page, ['Email', '邮箱', 'Password login', '密码登录'])
         time.sleep(2)
-        probe_email = 'probe@example.invalid'
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, probe_email):
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, ('kimi signup is phone(+86)/WeChat/SSO-only — '
                            'set KIMI_TOKEN or kimi_cookies.json manually')
         session, err = mailgen.create_email()
@@ -3187,8 +3292,8 @@ def signup_huggingchat() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://huggingface.co/join')
         time.sleep(6)
-        probe_email = 'probe@example.invalid'
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, probe_email):
+        _dismiss_consents(page)
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, 'huggingface join form not found (email field)'
         session, err = mailgen.create_email()
         if not session:
@@ -3260,9 +3365,9 @@ def signup_groq() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://console.groq.com/login')
         time.sleep(8)
+        _dismiss_consents(page)
         # probe the form before spending a disposable mailbox
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
-                           'probe@example.invalid'):
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, ('groq login form not found (email field) - '
                            'create a key in console.groq.com/keys and set '
                            'GROQ_API_KEY manually')
@@ -3336,9 +3441,9 @@ def signup_cerebras() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://cloud.cerebras.ai')
         time.sleep(8)
+        _dismiss_consents(page)
         # probe the form before spending a disposable mailbox
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
-                           'probe@example.invalid'):
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, ('cerebras login form not found (email field) - '
                            'create a key in cloud.cerebras.ai/platform/'
                            'apikeys and set CEREBRAS_API_KEY manually')
@@ -3414,9 +3519,9 @@ def signup_modelscope() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://modelscope.cn/signUp')
         time.sleep(8)
+        _dismiss_consents(page)
         # probe the form before spending a disposable mailbox
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
-                           'probe@example.invalid'):
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, ('modelscope signup form not found (email field, '
                            'phone wall likely) - create a token in '
                            'modelscope.cn/my/myaccesstoken and set '
@@ -3496,9 +3601,9 @@ def signup_mistral_api() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://console.mistral.ai/sign-up')
         time.sleep(8)
+        _dismiss_consents(page)
         # probe the form before spending a disposable mailbox
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
-                           'probe@example.invalid'):
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, ('mistral signup form not found (email '
                            'field, phone/SSO wall likely) - create a '
                            'free key in console.mistral.ai/api-keys '
@@ -3579,9 +3684,9 @@ def signup_openrouter() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://openrouter.ai/settings/keys')
         time.sleep(8)
+        _dismiss_consents(page)
         # probe the sign-in form before spending a disposable mailbox
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
-                           'probe@example.invalid'):
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, ('openrouter sign-in form not found '
                            '(OAuth-only wall likely) - create a free '
                            'key at openrouter.ai/settings/keys and set '
@@ -3670,9 +3775,9 @@ def signup_llm7() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://dash.llm7.io/#/api-keys')
         time.sleep(8)
+        _dismiss_consents(page)
         # probe the sign-in form before spending a disposable mailbox
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
-                           'probe@example.invalid'):
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, ('llm7 sign-in form not found (OAuth-only '
                            'wall likely) - create a free key at '
                            'dash.llm7.io/#/api-keys and set '
@@ -3683,7 +3788,9 @@ def signup_llm7() -> Tuple[bool, str]:
         email = session['address']
         if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
             return False, 'email field not found'
-        _click_any(page, ['Continue', 'Sign in', 'Log in', 'Sign up',
+        _click_any(page, ['Continue with email', 'Continue', 'Sign in',
+                          'Log in', 'Sign up', 'Continua con email',
+                          'Continua', 'Prosegui', 'Accedi', 'Iscriviti',
                           '\u6ce8\u518c', '\u767b\u5f55'])
         # LLM7 verifies by emailed magic link or OTP code
         link = mailgen.fetch_magic_link(session,
@@ -3705,14 +3812,15 @@ def signup_llm7() -> Tuple[bool, str]:
                                       'css:input[type=tel]',
                                       'css:input[type=text]'], code):
                 return False, 'code field not found'
-            _click_any(page, ['Verify', 'Continue', 'Submit',
-                              '\u9a8c\u8bc1'])
+            _click_any(page, ['Verify', 'Continue', 'Submit', 'Verifica',
+                              'Conferma', 'Prosegui', '\u9a8c\u8bc1'])
         time.sleep(10)
         page.get('https://dash.llm7.io/#/api-keys')
         time.sleep(6)
         if not _click_any(page, ['Create key', 'Create API key',
-                                 'New key', 'Create new key',
-                                 'Generate']):
+                                 'New key', 'Create new key', 'Generate',
+                                 'Crea chiave', 'Crea nuova chiave',
+                                 'Crea']):
             return False, ('create-key button not found on '
                            'dash.llm7.io/#/api-keys')
         time.sleep(4)
@@ -3765,6 +3873,7 @@ def signup_google_ai_studio() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://aistudio.google.com/apikey')
         time.sleep(8)
+        _dismiss_consents(page)
         # Google sign-in wall: log in when credentials are available
         if _fill_first(page, _GEMINI_EMAIL_SELECTORS,
                        email or 'probe@example.invalid'):
@@ -3863,9 +3972,9 @@ def signup_cohere() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://dashboard.cohere.com/welcome/register')
         time.sleep(8)
+        _dismiss_consents(page)
         # probe the registration form before spending a disposable mailbox
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
-                           'probe@example.invalid'):
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, ('cohere registration form not found (SSO-'
                            'only wall likely) - create a free trial '
                            'key at dashboard.cohere.com/api-keys and '
@@ -3974,6 +4083,7 @@ def signup_cloudflare() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://dash.cloudflare.com/login')
         time.sleep(8)
+        _dismiss_consents(page)
         if not _fill_first(page, _GEMINI_EMAIL_SELECTORS, email):
             return False, 'cloudflare login email field not found'
         _click_any(page, ['Continue', 'Next', 'Log in', 'Sign in'])
@@ -4393,6 +4503,7 @@ def signup_mistral() -> Tuple[bool, str]:
         page = _browser(headed=True)
         page.get('https://auth.mistral.ai/ui/registration')
         time.sleep(6)
+        _dismiss_consents(page)
         if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
             return False, 'email field not found (bot wall?)'
         _fill_first(page, _PASSWORD_SELECTORS, password)
@@ -4896,6 +5007,7 @@ def signup_qwen() -> Tuple[bool, str]:
             try:
                 page.get('https://chat.qwen.ai/')
                 time.sleep(random.uniform(6, 10))
+                _dismiss_consents(page)
                 ac = page.actions
                 for _ in range(random.randint(2, 4)):
                     ac.move(random.randint(150, 900),

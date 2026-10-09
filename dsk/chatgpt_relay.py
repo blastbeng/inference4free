@@ -14,6 +14,10 @@ drives the real UI:
    the reply is read from ``document.body.innerText``: the text after the
    last ``ChatGPT said:`` marker, cut at the first footer/UI line, diffed
    into deltas as it grows.
+3. The collapsed chain-of-thought panel ("Thought · 3s" + summary + blank
+   line) is split out of that region and streamed as ``type: 'thinking'``,
+   so the summary reaches the client as ``reasoning_content`` and the
+   message body stays the answer.
 
 The surface is unauthenticated, so generation never depends on the renewal
 ladder; the refresher keeps working account cookies for status/limits only.
@@ -27,7 +31,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +49,21 @@ REPLY_TERMINATORS = (
     'Email address',
     'New chat',
     'Report content',
+    # Rendered inside the reply region as the model's own disclaimer.
+    'ChatGPT is AI and can make mistakes.',
 )
 MARKER = 'ChatGPT said:'
 # Shown in the reply region while the model is still working.
 PLACEHOLDER = 'Thinking'
+# Header line of the collapsed chain-of-thought panel ("Thought · 3s",
+# "Thought for 12 seconds", "Thinking"). The summary under it is NOT the
+# answer: emitting it as text puts it in the message body, and clients read
+# the thinking as the whole reply.
+THOUGHT_HEAD_RE = re.compile(
+    r'^(thought|reasoning|thinking)\s*(·|:|\bfor\b)?\s*[\d.]*\s*'
+    r'(ms|s|sec|secs|second|seconds|min|mins|minutes)?\s*[.…]*$',
+    re.IGNORECASE)
+
 # Error surfaces checked only while no reply has started yet.
 ERROR_LINES = (
     'Something went wrong',
@@ -61,6 +76,27 @@ ERROR_LINES = (
 
 class RelayBlocked(RuntimeError):
     """Challenge/interstitial or dead UI swallowed the reply — rebuild."""
+
+
+# DrissionPage names a dead (or mid-reload) tab several ways: ContextLostError,
+# PageDisconnectedError, and the bare "The connection to the page has been
+# disconnected." text. For the relay they all mean the same thing — the tab is
+# gone, so the session must be rebuilt and the request retried. Surfacing it
+# instead is what makes ONE flaky reload cost a failed answer: the client gets
+# an api_error for a request that succeeds on the next attempt.
+_PAGE_DEATH_NAMES = ('ContextLost', 'PageDisconnected', 'TargetClosed',
+                     'SessionDisconnected', 'BrowserDisconnected')
+_PAGE_DEATH_TEXTS = ('connection to the page has been disconnected',
+                     'was refreshed', 'no such window', 'target closed',
+                     'session deleted because of page crash')
+
+
+def _is_page_death(e: BaseException) -> bool:
+    """True when an exception means "the tab died", i.e. it is retryable."""
+    name = type(e).__name__
+    blob = str(e).lower()
+    return any(n in name for n in _PAGE_DEATH_NAMES) \
+        or any(t in blob for t in _PAGE_DEATH_TEXTS)
 
 
 def norm_model(model: str) -> str:
@@ -82,6 +118,110 @@ def _reply_of(text: str) -> str:
     while kept and kept[0].strip() in ('', PLACEHOLDER):
         kept.pop(0)
     return '\n'.join(kept).strip()
+
+
+def _strip_headers(region: str) -> str:
+    """Region with the panel chrome (blank lines + "Thought …" headers)
+    removed from its head.
+
+    Used when the panel cannot be separated from the answer: the header is UI
+    chrome, never prose, so it must not reach the message body."""
+    lines = region.split('\n')
+    i = 0
+    while i < len(lines) and (not lines[i].strip() or
+                              THOUGHT_HEAD_RE.match(lines[i].strip())):
+        i += 1
+    return '\n'.join(lines[i:]).strip()
+
+
+def _split_thinking(region: str) -> Tuple[str, str]:
+    """Split the reply region into ``(thinking, text)``.
+
+    The panel is only treated as reasoning when the UI really separated it
+    from the answer: a "Thought …" header, a summary block, a blank line, and
+    content after that blank line. The blank line is the requirement that
+    matters — without it the summary and the answer are one undivided block,
+    and guessing where the panel ends would hide the answer inside the
+    thinking panel, so the whole region stays prose.
+
+    The gap between header and summary is skipped: block elements make
+    ``innerText`` emit "Thought · 3s\\n\\n<summary>", and treating that blank
+    line as the separator is what put the summary in the message body.
+    """
+    if not region:
+        return '', ''
+    lines = region.split('\n')
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines) or not THOUGHT_HEAD_RE.match(lines[i].strip()):
+        return '', _strip_headers(region)
+    k = i + 1
+    while k < len(lines) and not lines[k].strip():
+        k += 1                      # blank gap between header and summary
+    if k >= len(lines):
+        return '', ''              # header only: the model is still working
+    j = k
+    while j < len(lines) and lines[j].strip():
+        j += 1                     # end of the summary block
+    answer = '\n'.join(lines[j:]).strip()
+    if j >= len(lines) or not answer:
+        # Nothing after the summary block: the answer has not started, and
+        # where it will begin is not knowable yet — keep it all as prose.
+        return '', _strip_headers(region)
+    return '\n'.join(lines[k:j]).strip(), answer
+
+
+def _thinking_only(region: str) -> bool:
+    """True while the region holds nothing but the placeholder and/or the
+    panel header ("Thinking", "Thought · 3s") — the answer has not started."""
+    if region in ('', PLACEHOLDER):
+        return True
+    lines = [ln.strip() for ln in region.split('\n') if ln.strip()]
+    return bool(lines) and all(THOUGHT_HEAD_RE.match(ln) for ln in lines)
+
+
+def _region_delta(cur: str, base: str) -> str:
+    """Text to send for a region that grew (or was rewritten) since ``base``.
+
+    The UI rewrites the region when the thinking panel collapses and the
+    answer replaces it. Re-basing on the new text without emitting it is how
+    an answer disappears, so a rewrite emits everything past the common
+    prefix instead of nothing."""
+    if not cur or cur == base:
+        return ''
+    if cur.startswith(base):
+        return cur[len(base):]
+    n = 0
+    for a, b in zip(base, cur):
+        if a != b:
+            break
+        n += 1
+    return cur[n:]
+
+
+# Shortest span considered "already delivered": a summary is a sentence, so
+# suppression only ever fires on real prose, never on a one-word answer that
+# happens to be quoted inside the summary.
+_MIN_RECLASS_SPAN = 20
+
+
+def _new_delta(cur: str, base: str, other_sent: str) -> str:
+    """Delta for ``cur``, skipping what the OTHER region already delivered.
+
+    The split is a judgement made on a snapshot, and the judgement can arrive
+    late: the UI first shows "Thought · 3s\\n\\n<summary>" (no separator after
+    the summary, so the summary is prose and goes out as ``text``), then the
+    answer appears and the same summary is re-read as the thinking panel.
+    Diffing per region would then re-send it — the client sees the reasoning
+    twice, once in the body and once in ``reasoning_content``.
+    """
+    delta = _region_delta(cur, base)
+    if not delta:
+        return ''
+    if len(delta) >= _MIN_RECLASS_SPAN and delta in other_sent:
+        return ''
+    return delta
 
 
 class ChatGPTRelay:
@@ -171,8 +311,7 @@ class ChatGPTRelay:
             try:
                 return self._page.run_js(script)
             except Exception as e:  # noqa: BLE001
-                if 'ContextLost' not in type(e).__name__ \
-                        and 'refreshed' not in str(e):
+                if not _is_page_death(e):
                     raise
                 last = e
                 logger.warning('chatgpt relay: page reloaded mid-stream — '
@@ -461,8 +600,17 @@ class ChatGPTRelay:
             return ''
 
     def _drain_reply(self) -> Generator[Dict[str, Any], None, None]:
-        """Diff the reply region as it grows and yield text deltas."""
-        sent = ''
+        """Diff the reply region as it grows and yield text/thinking deltas.
+
+        The reasoning panel and the answer are diffed as SEPARATE regions: the
+        summary goes out as ``type: 'thinking'`` (the OpenAI shim turns it into
+        ``delta.reasoning_content``) and only the answer becomes ``content``.
+        Each region is diffed against its own baseline, so a rewrite of one
+        cannot swallow the other, and a span the other region already
+        delivered is not sent twice (see ``_new_delta``).
+        """
+        sent_text = ''
+        sent_think = ''
         t0 = time.time()
         first_mark_at: Optional[float] = None
         content_at: Optional[float] = None
@@ -482,30 +630,42 @@ class ChatGPTRelay:
                         f'chatgpt relay: no reply started'
                         f'{f" (UI says: {err!r})" if err else ""}')
                 continue
-            if rep in ('', PLACEHOLDER):
+            if _thinking_only(rep):
+                # Panel header (or the bare placeholder) and nothing else:
+                # the model is still working — no answer has started.
                 if content_at is None and \
                         time.time() - first_mark_at > self.THINKING_TIMEOUT:
                     raise RelayBlocked('chatgpt relay: stuck in thinking '
                                        'placeholder')
                 continue
-            if content_at is None:
-                content_at = time.time()
+            think, body = _split_thinking(rep)
+            grew = False
+            for kind, cur, base in (('thinking', think, sent_think),
+                                    ('text', body, sent_text)):
+                other = sent_text if kind == 'thinking' else sent_think
+                delta = _new_delta(cur, base, other)
+                if len(cur) < len(base):
+                    logger.info('chatgpt relay: %s region rewritten; emitting '
+                                'everything past the common prefix', kind)
+                # Re-base on every snapshot, delta or not: the baseline is
+                # what we have SEEN, so a late reclassification diffs the
+                # next snapshot against it instead of re-sending it whole.
+                if kind == 'thinking':
+                    sent_think = cur
+                else:
+                    sent_text = cur
+                if not delta:
+                    continue
+                grew = True
+                yield {'content': delta, 'type': kind, 'finish_reason': None}
+            if grew:
                 stall_since = time.time()
-            if rep.startswith(sent) and len(rep) > len(sent):
-                delta = rep[len(sent):]
-                sent = rep
-                stall_since = time.time()
-                yield {'content': delta, 'type': 'text', 'finish_reason': None}
-            elif not rep.startswith(sent) and rep:
-                # The region was rewritten under us (rare): restart the diff.
-                logger.warning('chatgpt relay: reply region rewritten; '
-                               're-diffing from the new text')
-                sent = rep
-                stall_since = time.time()
-            if sent and stall_since is not None and \
+                if content_at is None:
+                    content_at = time.time()
+            if (sent_text or sent_think) and stall_since is not None and \
                     time.time() - stall_since > self.REPLY_STALL_TIMEOUT:
                 break
-        if not sent:
+        if not (sent_text or sent_think):
             raise RelayBlocked('chatgpt relay: no reply text within the '
                                'stream window')
         yield {'content': '', 'type': 'text', 'finish_reason': 'stop'}
@@ -527,6 +687,7 @@ class ChatGPTRelay:
             with self._lock:
                 self._ensure()
             for attempt in (1, 2):
+                emitted = 0
                 try:
                     with self._lock:
                         self._reset_chat()
@@ -537,7 +698,9 @@ class ChatGPTRelay:
                                 f'{", ".join(self._offered) or self._default_title or "?"})')
                         self._type_and_send(prompt)
                         self._resend_if_swallowed(prompt)
-                    yield from self._drain_reply()
+                    for chunk in self._drain_reply():
+                        emitted += 1
+                        yield chunk
                     return
                 except RelayBlocked:
                     logger.warning('chatgpt relay: stream blocked; rebuilding '
@@ -549,10 +712,14 @@ class ChatGPTRelay:
                         logger.warning('chatgpt relay rebuild failed: %s', e)
                     raise
                 except Exception as e:  # noqa: BLE001
-                    if attempt == 2 or 'ContextLost' not in type(e).__name__:
+                    # A dead tab is retryable, but ONLY pre-stream: once
+                    # chunks reached the client, replaying the prompt would
+                    # duplicate the answer (the router has the same rule for
+                    # provider fallbacks).
+                    if attempt == 2 or emitted or not _is_page_death(e):
                         raise
-                    logger.warning('chatgpt relay: context lost pre-stream; '
-                                   'rebuilding and retrying once')
+                    logger.warning('chatgpt relay: %s pre-stream; rebuilding '
+                                   'and retrying once', type(e).__name__)
                     try:
                         with self._lock:
                             self._build()

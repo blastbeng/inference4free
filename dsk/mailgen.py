@@ -5,7 +5,7 @@ is configured: a throwaway mailbox is created on the fly, the verification
 e-mail is fetched from it and the OTP is extracted — so the renewal ladder
 stays fully unmanned with zero mail configuration.
 
-Four backends, tried in order (first that is *configured* wins, then the
+Seven backends, tried in order (first that is *configured* wins, then the
 first that *works*):
 
 1. IMAP catch-all (``I4F_MAIL_IMAP_HOST`` + ``I4F_MAIL_DOMAIN``):
@@ -25,7 +25,23 @@ first that *works*):
    disposable pools against domain blocklists. No signup; the inbox is
    addressed by an opaque token stored in the session.
 
-4. mail.tm / mail.gw (https://mail.tm, free public API, no key): a real
+4. tempmail.plus (https://tempmail.plus, free public API, no key):
+   an implicit inbox on @mailto.plus — any local part has a mailbox, the
+   listing API needs no session. Semi-known domain: fewer blocklists than
+   mail.tm, more than tempmail.lol's rotating pool.
+
+5. temp-mail.io (https://temp-mail.io, free public API, no key): a mailbox
+   on another rotating pool of obscure domains; the listing carries the
+   body inline. Opaque token kept in the session for diagnostics.
+
+6. Guerrilla Mail (https://guerrillamail.com, free public API, no key):
+   the long-standing session-addressed inbox. A fresh random user is
+   claimed per mailbox and the @sharklasers.com alias of the SAME inbox
+   is handed out (every guerrilla domain delivers to one inbox, and
+   sharklasers.com sits in far fewer disposable-domain blocklists than
+   guerrillamailblock.com).
+
+7. mail.tm / mail.gw (https://mail.tm, free public API, no key): a real
    throwaway account is created on a public temp-mail domain and its
    inbox is polled over HTTPS. Works out of the box, but public domains
    are often rejected by signup forms (DeepSeek silently drops them)
@@ -487,6 +503,264 @@ def _imap_fetch_otp(session: Dict[str, Any], sender_needle: str,
                               to_needle=session['address'])
 
 
+# --------------------------------------- tempmail.plus (implicit inbox)
+TEMPMAILPLUS_API = 'https://tempmail.plus/api/mails/'
+_TEMPMAILPLUS_DOMAIN = 'mailto.plus'
+
+
+def _tempmailplus_create() -> Optional[Dict[str, Any]]:
+    """Mint an inbox on tempmail.plus (@mailto.plus).
+
+    The mailbox is implicit — any local part on the service's domain has an
+    inbox — so creation is a reachability check of the listing API for the
+    exact address being handed out (no account, no session token).
+    """
+    address = f'{_gen_local_part()}@{_TEMPMAILPLUS_DOMAIN}'
+    code, body = _http('GET', f'{TEMPMAILPLUS_API}?email='
+                       f'{urllib.parse.quote(address)}&first_id=0')
+    if code == 200 and isinstance(body, dict) and body.get('result'):
+        return {'backend': 'tempmail.plus', 'address': address}
+    return None
+
+
+def _tempmailplus_messages(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """List the tempmail.plus inbox in the common message shape.
+
+    The listing carries text/html inline, so the body cache is filled here
+    and ``_backend_body`` serves both OTP and magic-link flows. The display
+    ``time`` field has no reliable timezone — emit timestamp None (the
+    fresh random local part makes stale-mail cuts unnecessary).
+    """
+    address = session.get('address') or ''
+    code, body = _http('GET', f'{TEMPMAILPLUS_API}?email='
+                       f'{urllib.parse.quote(address)}&first_id=0')
+    if code != 200 or not isinstance(body, dict):
+        return []
+    cache = _BODY_CACHE.setdefault(address, {})
+    while len(_BODY_CACHE) > 32:  # throwaway mailboxes: bound the cache
+        _BODY_CACHE.pop(next(iter(_BODY_CACHE)), None)
+    out: List[Dict[str, Any]] = []
+    for msg in body.get('mail_list') or []:
+        if not isinstance(msg, dict):
+            continue
+        mid = str(msg.get('mail_id') or '')
+        if not mid:
+            continue
+        cache[mid] = '\n'.join(str(msg.get(k) or '')
+                                for k in ('text', 'html', 'subject'))
+        out.append({'id': mid, 'from': msg.get('from') or '',
+                    'subject': msg.get('subject') or '',
+                    'timestamp': None, 'locked': False})
+    return out
+
+
+# ------------------------------------------------ temp-mail.io (v3 API)
+TEMPMAILIO_API = 'https://api.internal.temp-mail.io/api/v3'
+
+
+def _tempmailio_create() -> Optional[Dict[str, Any]]:
+    """Mint a mailbox on temp-mail.io (rotating obscure-domain pool)."""
+    code, body = _http('POST', f'{TEMPMAILIO_API}/email/new',
+                       {'min_name_length': 10, 'max_name_length': 10})
+    if code == 200 and isinstance(body, dict):
+        address = str(body.get('email') or '').strip()
+        if address:
+            return {'backend': 'temp-mail.io', 'address': address,
+                    'token': str(body.get('token') or '')}
+    return None
+
+
+def _tempmailio_messages(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """List the temp-mail.io inbox in the common message shape.
+
+    GET /email/{email}/messages returns every message with the body inline
+    ('body_text'/'body_html') and an ISO-8601 'created_at'.
+    """
+    address = session.get('address') or ''
+    code, body = _http('GET', f'{TEMPMAILIO_API}/email/'
+                       f'{urllib.parse.quote(address)}/messages')
+    if code != 200 or not isinstance(body, list):
+        return []
+    cache = _BODY_CACHE.setdefault(address, {})
+    while len(_BODY_CACHE) > 32:  # throwaway mailboxes: bound the cache
+        _BODY_CACHE.pop(next(iter(_BODY_CACHE)), None)
+    out: List[Dict[str, Any]] = []
+    for msg in body:
+        if not isinstance(msg, dict):
+            continue
+        mid = str(msg.get('id') or '')
+        if not mid:
+            continue
+        cache[mid] = '\n'.join(str(msg.get(k) or '')
+                                for k in ('body_text', 'body_html', 'subject'))
+        age = _iso_age_min(msg.get('created_at'))
+        frm = msg.get('from')
+        sender = (frm.get('address') or '') if isinstance(frm, dict) \
+            else str(frm or '')
+        out.append({'id': mid, 'from': sender,
+                    'subject': msg.get('subject') or '',
+                    'timestamp': (time.time() - age * 60.0)
+                    if age is not None else None,
+                    'locked': False})
+    return out
+
+
+# ---------------------------------------------------- Guerrilla Mail API
+GUERRILLA_API = 'https://api.guerrillamail.com/ajax.php'
+
+
+def _guerrillamail_create() -> Optional[Dict[str, Any]]:
+    """Mint a Guerrilla Mail inbox (session-addressed via sid_token).
+
+    A fresh random user is claimed through ``set_email_user`` so the
+    mailbox is not the shared default, and the ``@sharklasers.com`` alias
+    of the SAME inbox is handed out: every guerrilla domain delivers to
+    one inbox and sharklasers.com sits in far fewer disposable-domain
+    blocklists than the default guerrillamailblock.com.
+    """
+    code, body = _http('GET', f'{GUERRILLA_API}?f=get_email_address&lang=en')
+    if code != 200 or not isinstance(body, dict):
+        return None
+    sid = str(body.get('sid_token') or '')
+    if not sid:
+        return None
+    local = _gen_local_part().replace('-', '')  # guerrilla users: alnum only
+    code2, body2 = _http('GET', f'{GUERRILLA_API}?f=set_email_user'
+                         f'&email_user={local}&lang=en&sid_token={sid}')
+    address = ''
+    if code2 == 200 and isinstance(body2, dict):
+        address = str(body2.get('email_addr') or '')
+    if not address:
+        address = str(body.get('email_addr') or '')
+    if not address:
+        return None
+    aliased = f"{address.split('@', 1)[0]}@sharklasers.com"
+    return {'backend': 'guerrillamail', 'address': aliased,
+            'address_native': address, 'sid': sid}
+
+
+def _guerrillamail_messages(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """List the Guerrilla Mail inbox in the common message shape."""
+    sid = session.get('sid') or ''
+    if not sid:
+        return []
+    code, body = _http('GET', f'{GUERRILLA_API}?f=get_email_list'
+                       f'&offset=0&sid_token={sid}')
+    if code != 200 or not isinstance(body, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for msg in body.get('list') or []:
+        if not isinstance(msg, dict):
+            continue
+        mid = str(msg.get('mail_id') or '')
+        if not mid:
+            continue
+        ts = None
+        try:
+            cand = float(msg.get('mail_timestamp'))
+            ts = cand if cand > 1_000_000_000 else None
+        except (TypeError, ValueError):
+            ts = None
+        if ts is None:
+            md = str(msg.get('mail_date') or '').strip()
+            if re.fullmatch(r'\d{2}:\d{2}:\d{2}', md):
+                # today's mail carries a time-only stamp (guerrilla puts a
+                # full date only on older mail); the clock is UTC. A stamp
+                # that lands a hair in the future (clock skew) is harmless:
+                # a negative age passes the max-age cut and after_ts never
+                # cuts mail newer than the request.
+                from datetime import datetime, timedelta, timezone
+                hh, mm, ss = (int(x) for x in md.split(':'))
+                now = datetime.now(timezone.utc)
+                midnight = now.replace(hour=0, minute=0, second=0,
+                                       microsecond=0)
+                ts = (midnight + timedelta(hours=hh, minutes=mm,
+                                           seconds=ss)).timestamp()
+            else:
+                age = _iso_age_min(md)
+                ts = (time.time() - age * 60.0) if age is not None else None
+        out.append({'id': mid, 'from': str(msg.get('mail_from') or ''),
+                    'subject': str(msg.get('mail_subject') or ''),
+                    'timestamp': ts, 'locked': False})
+    return out
+
+
+def _guerrillamail_body(session: Dict[str, Any], mid: str) -> str:
+    """Fetch one guerrilla message body (lazy, cached like the others)."""
+    cache = _BODY_CACHE.setdefault(session.get('address') or '', {})
+    while len(_BODY_CACHE) > 32:  # throwaway mailboxes: bound the cache
+        _BODY_CACHE.pop(next(iter(_BODY_CACHE)), None)
+    if mid in cache:
+        return cache[mid]
+    sid = session.get('sid') or ''
+    if not sid:
+        return ''
+    code, body = _http('GET', f'{GUERRILLA_API}?f=fetch_email'
+                       f'&email_id={urllib.parse.quote(mid, safe="")}'
+                       f'&sid_token={sid}')
+    if code != 200 or not isinstance(body, dict):
+        return ''
+    subject = ''
+    for msg in _guerrillamail_messages(session):
+        if str(msg.get('id') or '') == mid:
+            subject = str(msg.get('subject') or '')
+            break
+    text = '\n'.join(x for x in (subject, str(body.get('mail_body') or ''))
+                     if x)
+    cache[mid] = text
+    return text
+
+
+# ------------------------------------------- common OTP fetch (new pools)
+def _common_fetch_otp(session: Dict[str, Any], sender_needle: str,
+                      code_re: re.Pattern, max_age_min: float,
+                      deadline: float, seen_ids: set,
+                      after_ts: Optional[float] = None) -> Optional[str]:
+    """Backend-agnostic OTP poll over the common message shape.
+
+    Serves every backend whose listing/body flows through
+    ``_backend_messages``/``_backend_body`` (tempmail.plus, temp-mail.io,
+    guerrillamail). Same shared-inbox hygiene as the emailnator fetcher:
+    skip locked messages, honour ``after_ts`` so a previous request's
+    already-spent code is never reused, sender/subject needle, max-age
+    cut, and a transient empty body fetch leaves the message unblacklisted
+    so the next pass retries it.
+    """
+    while time.time() < deadline:
+        try:
+            msgs = _backend_messages(session)
+        except Exception:  # noqa: BLE001
+            msgs = []
+        for msg in msgs:
+            mid = str(msg.get('id') or '')
+            if not mid or mid in seen_ids or msg.get('locked'):
+                continue
+            ts = _msg_ts(msg)
+            if after_ts is not None and ts is not None \
+                    and ts <= after_ts - _AFTER_TS_GRACE_S:
+                continue  # stale email: its code was already invalidated
+            sender = str(msg.get('from') or '').lower()
+            subject = str(msg.get('subject') or '').lower()
+            if sender_needle and sender_needle not in sender \
+                    and sender_needle not in subject:
+                continue
+            age = ((time.time() - ts) / 60.0) if ts is not None else None
+            if age is not None and age > max_age_min:
+                continue
+            body = _backend_body(session, mid)
+            if not body:
+                # transient empty fetch (backend hiccup): leave the message
+                # unblacklisted so the next pass retries it — a one-off
+                # failure must not silence the inbox for the whole window
+                continue
+            seen_ids.add(mid)
+            match = code_re.search(body)
+            if match:
+                return match.group(1) or match.group(0)
+        time.sleep(6)
+    return None
+
+
 # -------------------------------------------------------------------- public
 def available() -> bool:
     """True when at least one backend is plausibly configured."""
@@ -521,7 +795,8 @@ def create_email(domain_suffixes: Optional[Tuple[str, ...]] = None,
     if not autogen_enabled():
         return None, 'I4F_MAIL_AUTOGEN disabled'
     backends = (_imap_catchall_create, _emailnator_create,
-                _tempmail_create, _mailtm_create)
+                _tempmail_create, _tempmailplus_create, _tempmailio_create,
+                _guerrillamail_create, _mailtm_create)
     if no_gmail:
         # the emailnator pool is gmail-only: Google's signup treats a gmail
         # address as a username claim ("That username is taken") and rejects
@@ -592,7 +867,10 @@ def fetch_otp(session: Dict[str, Any], max_wait_s: int = 180,
     max_age_min = float(os.getenv('I4F_MAIL_OTP_MAX_AGE', str(max_age_min)) or max_age_min)
     fetcher = {'imap-catchall': _imap_fetch_otp,
                'emailnator-gmail': _emailnator_fetch_otp,
-               'tempmail.lol': _tempmail_fetch_otp}.get(session['backend']) \
+               'tempmail.lol': _tempmail_fetch_otp,
+               'tempmail.plus': _common_fetch_otp,
+               'temp-mail.io': _common_fetch_otp,
+               'guerrillamail': _common_fetch_otp}.get(session['backend']) \
         or _mailtm_fetch_otp
     try:
         return fetcher(session, sender_needle, code_re, max_age_min,
@@ -711,6 +989,12 @@ def _backend_messages(session: Dict[str, Any]) -> List[Dict[str, Any]]:
             return _EMAILNATOR.messages(session.get('address') or '')
         if backend == 'tempmail.lol':
             return _tempmail_messages(session)
+        if backend == 'tempmail.plus':
+            return _tempmailplus_messages(session)
+        if backend == 'temp-mail.io':
+            return _tempmailio_messages(session)
+        if backend == 'guerrillamail':
+            return _guerrillamail_messages(session)
         if backend in ('mail.tm', 'mail.gw'):
             return _mailtm_messages(session)
     except Exception:  # noqa: BLE001
@@ -722,6 +1006,11 @@ def _backend_body(session: Dict[str, Any], mid: str) -> str:
     if session.get('backend') == 'emailnator-gmail':
         try:
             return _EMAILNATOR.message_body(mid)
+        except Exception:  # noqa: BLE001
+            return ''
+    if session.get('backend') == 'guerrillamail':
+        try:
+            return _guerrillamail_body(session, mid)
         except Exception:  # noqa: BLE001
             return ''
     return (_BODY_CACHE.get(session.get('address') or '') or {}).get(
