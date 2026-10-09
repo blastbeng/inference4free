@@ -96,6 +96,7 @@ HEALABLE: Dict[str, Path] = {
     'cerebras': _BASE / 'providers' / 'cerebras_provider.py',
     'modelscope': _BASE / 'providers' / 'modelscope_provider.py',
     'mistral_api': _BASE / 'providers' / 'mistral_api_provider.py',
+    'openrouter': _BASE / 'providers' / 'openrouter_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -118,6 +119,7 @@ _MODULE_NAMES = {
     'cerebras': 'dsk.providers.cerebras_provider',
     'modelscope': 'dsk.providers.modelscope_provider',
     'mistral_api': 'dsk.providers.mistral_api_provider',
+    'openrouter': 'dsk.providers.openrouter_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -159,6 +161,7 @@ _PROVIDER_CLASSES = {
     'cerebras': 'CerebrasProvider',
     'modelscope': 'ModelScopeProvider',
     'mistral_api': 'MistralApiProvider',
+    'openrouter': 'OpenRouterProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -209,6 +212,9 @@ _EVIDENCE_PATTERNS = {
     'mistral_api': [r'api\.mistral\.ai[A-Za-z0-9_/{}$.\\-]{0,60}',
                     r'Invalid API Key', r'max_context_length',
                     r'console\.mistral\.ai'],
+    'openrouter': [r'api\.openrouter\.ai[A-Za-z0-9_/{}$.\\-]{0,60}',
+                   r'sk-or-v1-[A-Za-z0-9]{10,}',
+                   r'No cookie auth credentials', r':free'],
 }
 
 
@@ -493,7 +499,8 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'groq': 'https://groq.com',
             'cerebras': 'https://cerebras.ai',
             'modelscope': 'https://modelscope.cn',
-            'mistral_api': 'https://mistral.ai'}.get(name, '')
+            'mistral_api': 'https://mistral.ai',
+            'openrouter': 'https://openrouter.ai'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []

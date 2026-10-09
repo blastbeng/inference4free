@@ -130,7 +130,8 @@ def _jar_path(name: str) -> Path:
              'groq': 'groq_cookies.json',
              'cerebras': 'cerebras_cookies.json',
              'modelscope': 'modelscope_cookies.json',
-             'mistral_api': 'mistral_api_cookies.json'}
+             'mistral_api': 'mistral_api_cookies.json',
+             'openrouter': 'openrouter_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -278,7 +279,8 @@ def _load_jar(name: str) -> Dict[str, str]:
                    'groq': ('api_key', 'GROQ_API_KEY'),
                    'cerebras': ('api_key', 'CEREBRAS_API_KEY'),
                    'modelscope': ('api_key', 'MODELSCOPE_API_KEY'),
-                   'mistral_api': ('api_key', 'MISTRAL_API_KEY')}.get(name)
+                   'mistral_api': ('api_key', 'MISTRAL_API_KEY'),
+                   'openrouter': ('api_key', 'OPENROUTER_API_KEY')}.get(name)
         if primary:
             jar.setdefault(primary[0], (os.getenv(primary[1], '') or '').strip())
     return {k: v for k, v in jar.items() if k and v and k != 'cookies'}
@@ -470,6 +472,17 @@ def _has_creds(name: str) -> bool:
         if os.getenv('MISTRAL_API_KEY', '').strip():
             return True
         jar = _load_jar('mistral_api')
+        return bool(jar.get('api_key') or jar.get('key')
+                    or jar.get('token'))
+    if name == 'openrouter':
+        # Free-pool API key (sk-or-v1-...) from openrouter.ai. The
+        # env var merges into the jar under api_key (see _load_jar);
+        # any accepted key name counts as provisioned - liveness is
+        # checked by the refresh rung (Bearer /key, NOT the public
+        # /models catalog).
+        if os.getenv('OPENROUTER_API_KEY', '').strip():
+            return True
+        jar = _load_jar('openrouter')
         return bool(jar.get('api_key') or jar.get('key')
                     or jar.get('token'))
     if name == 'mistral':
@@ -1207,6 +1220,42 @@ def refresh_mistral_api() -> Tuple[bool, str]:
     return True, f'API key valid ({n} models visible)'
 
 
+def refresh_openrouter() -> Tuple[bool, str]:
+    """Validate the OpenRouter key against GET /api/v1/key.
+
+    The /models catalog is PUBLIC and proves nothing about the key -
+    liveness runs against the authenticated /key endpoint: 200
+    returns the per-key usage/limit record, 401
+    {"error":{"message":"No cookie auth credentials found",
+    "code":401}} means rejected. A 429 still proves the key is
+    accepted (auth runs before rate limiting), so it reads as
+    alive; any other status is inconclusive - the authoritative
+    check runs at request time.
+    """
+    if not _has_creds('openrouter'):
+        return False, ('no openrouter credentials - set '
+                       'OPENROUTER_API_KEY or create a free key at '
+                       'openrouter.ai/settings/keys '
+                       '(openrouter_cookies.json)')
+    key = (_load_jar('openrouter').get('api_key')
+           or os.getenv('OPENROUTER_API_KEY', '')).strip()
+    try:
+        resp = _http_get('https://openrouter.ai/api/v1/key', {},
+                         headers={'Authorization': f'Bearer {key}',
+                                  'Accept': 'application/json'})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (401, 403):
+        return False, ('API key rejected - create a new free key at '
+                       'openrouter.ai/settings/keys')
+    if resp.status_code == 429:
+        return True, 'rate limited but key accepted (HTTP 429)'
+    if resp.status_code != 200:
+        return True, (f'key reachable, liveness inconclusive (HTTP '
+                      f'{resp.status_code}) - validated at request time')
+    return True, 'API key valid (usage/limit record returned)'
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
@@ -1219,6 +1268,7 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'cerebras': refresh_cerebras,
            'modelscope': refresh_modelscope,
            'mistral_api': refresh_mistral_api,
+           'openrouter': refresh_openrouter,
            'arena': _manual_only(
                'arena',
                'session cookie required (browser login → arena_cookies.json '
@@ -3270,6 +3320,96 @@ def signup_mistral_api() -> Tuple[bool, str]:
             _close_page(page)
 
 
+def signup_openrouter() -> Tuple[bool, str]:
+    """Create an openrouter.ai account and harvest a free :free key.
+
+    Flow (browser): openrouter.ai/settings/keys -> sign-in wall probed
+    for an email form (OAuth-only walls are reported honestly) ->
+    email login (magic link or OTP) -> /settings/keys -> "Create
+    key" -> the sk-or-v1-... token is displayed once -> scrape it
+    and store it in the openrouter jar under api_key (the exact key
+    the provider reads).
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://openrouter.ai/settings/keys')
+        time.sleep(8)
+        # probe the sign-in form before spending a disposable mailbox
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
+                           'probe@example.invalid'):
+            return False, ('openrouter sign-in form not found '
+                           '(OAuth-only wall likely) - create a free '
+                           'key at openrouter.ai/settings/keys and set '
+                           'OPENROUTER_API_KEY manually')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _click_any(page, ['Continue', 'Sign in', 'Log in', 'Sign up',
+                          '注册', '登录'])
+        # OpenRouter verifies by emailed magic link or OTP code
+        link = mailgen.fetch_magic_link(session,
+                                        url_needle='openrouter',
+                                        max_wait_s=240)
+        code = None
+        if not link:
+            code = mailgen.fetch_otp(session, max_wait_s=60,
+                                     sender_needle='openrouter')
+        if not link and not code:
+            return False, 'openrouter verification email not found'
+        if link:
+            page.get(link)
+            time.sleep(8)
+        else:
+            if not _fill_first(page, ['css:input[name=code]',
+                                      '@placeholder:code',
+                                      'css:input[inputmode=numeric]',
+                                      'css:input[type=tel]',
+                                      'css:input[type=text]'], code):
+                return False, 'code field not found'
+            _click_any(page, ['Verify', 'Continue', 'Submit', '验证'])
+        time.sleep(10)
+        page.get('https://openrouter.ai/settings/keys')
+        time.sleep(6)
+        if not _click_any(page, ['Create key', 'Create API key',
+                                 'New key', 'Create new key']):
+            return False, ('create-key button not found on '
+                           'openrouter.ai/settings/keys')
+        time.sleep(4)
+        key = ''
+        try:
+            key = str(page.run_js(
+                'let hit="";'
+                'for (const el of document.querySelectorAll('
+                '"input,textarea,code,pre,div,span")) {'
+                'const t = el.value || el.textContent || "";'
+                'const m = t.match(/sk-or-v1-[A-Za-z0-9]{20,}/);'
+                'if (m) { hit = m[0]; break; } }'
+                'return hit;') or '')
+        except Exception:  # noqa: BLE001
+            pass
+        if not key:
+            return False, ('signup finished but no sk-or-v1- key '
+                           'found (captcha or verification wall '
+                           'likely) - create a key at '
+                           'openrouter.ai/settings/keys and set '
+                           'OPENROUTER_API_KEY manually')
+        _save_jar('openrouter', {'api_key': key, 'email': email})
+        _save_account('openrouter', email, '', session.get('backend', ''))
+        return True, (f'account created, API key saved '
+                      f'({session.get("backend")}: {email})')
+    except Exception as e:  # noqa: BLE001
+        return False, f'openrouter signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
 _MISTRAL_AUTH = 'https://auth.mistral.ai'
 
 
@@ -4417,6 +4557,7 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'cerebras': signup_cerebras,
           'modelscope': signup_modelscope,
           'mistral_api': signup_mistral_api,
+          'openrouter': signup_openrouter,
           'arena': _manual_only(
               'arena',
               'signup requires an allowlisted email domain '
