@@ -91,6 +91,7 @@ PROVIDER_MODULES = (
     ('modelscope', '.modelscope_provider', 'ModelScopeProvider'),
     ('mistral_api', '.mistral_api_provider', 'MistralApiProvider'),
     ('openrouter', '.openrouter_provider', 'OpenRouterProvider'),
+    ('llm7', '.llm7_provider', 'Llm7Provider'),
 )
 
 OWNED_BY = {
@@ -114,6 +115,7 @@ OWNED_BY = {
     'modelscope': 'modelscope',
     'mistral_api': 'mistral',
     'openrouter': 'openrouter',
+    'llm7': 'llm7',
 }
 
 # Public model-id namespaces: every model surfaced via /v1/models and the
@@ -142,6 +144,7 @@ PUBLIC_PREFIX = {
     'modelscope': 'modelscope',
     'mistral_api': 'mistral-api',
     'openrouter': 'openrouter',
+    'llm7': 'llm7',
 }
 
 # Reverse of PUBLIC_PREFIX: 'z.ai' -> 'glm', used by resolve() so both the
@@ -368,7 +371,7 @@ AUTO_CATEGORIES: Dict[str, List[str]] = {
     'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt'],
     'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral',
                     'kimi', 'pollinations', 'huggingchat', 'arena', 'groq', 'cerebras', 'modelscope',
-                   'mistral_api', 'openrouter'],
+                   'mistral_api', 'openrouter', 'llm7'],
 }
 
 _RE_CODE_FENCE = re.compile(

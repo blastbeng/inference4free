@@ -97,6 +97,7 @@ HEALABLE: Dict[str, Path] = {
     'modelscope': _BASE / 'providers' / 'modelscope_provider.py',
     'mistral_api': _BASE / 'providers' / 'mistral_api_provider.py',
     'openrouter': _BASE / 'providers' / 'openrouter_provider.py',
+    'llm7': _BASE / 'providers' / 'llm7_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -120,6 +121,7 @@ _MODULE_NAMES = {
     'modelscope': 'dsk.providers.modelscope_provider',
     'mistral_api': 'dsk.providers.mistral_api_provider',
     'openrouter': 'dsk.providers.openrouter_provider',
+    'llm7': 'dsk.providers.llm7_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -162,6 +164,7 @@ _PROVIDER_CLASSES = {
     'modelscope': 'ModelScopeProvider',
     'mistral_api': 'MistralApiProvider',
     'openrouter': 'OpenRouterProvider',
+    'llm7': 'Llm7Provider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -215,6 +218,8 @@ _EVIDENCE_PATTERNS = {
     'openrouter': [r'api\.openrouter\.ai[A-Za-z0-9_/{}$.\\-]{0,60}',
                    r'sk-or-v1-[A-Za-z0-9]{10,}',
                    r'No cookie auth credentials', r':free'],
+    'llm7': [r'api\.llm7\.io[A-Za-z0-9_/{}$.\\-]{0,60}',
+             r'missing_api_key', r'invalid_api_key', r'dash\.llm7\.io'],
 }
 
 
@@ -500,7 +505,8 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'cerebras': 'https://cerebras.ai',
             'modelscope': 'https://modelscope.cn',
             'mistral_api': 'https://mistral.ai',
-            'openrouter': 'https://openrouter.ai'}.get(name, '')
+            'openrouter': 'https://openrouter.ai',
+            'llm7': 'https://llm7.io'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []
