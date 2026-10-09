@@ -133,7 +133,8 @@ def _jar_path(name: str) -> Path:
              'mistral_api': 'mistral_api_cookies.json',
              'openrouter': 'openrouter_cookies.json',
              'llm7': 'llm7_cookies.json',
-             'google_ai_studio': 'google_ai_studio_cookies.json'}
+             'google_ai_studio': 'google_ai_studio_cookies.json',
+             'cohere': 'cohere_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -284,7 +285,8 @@ def _load_jar(name: str) -> Dict[str, str]:
                    'mistral_api': ('api_key', 'MISTRAL_API_KEY'),
                    'openrouter': ('api_key', 'OPENROUTER_API_KEY'),
                    'llm7': ('api_key', 'LLM7_API_KEY'),
-                   'google_ai_studio': ('api_key', 'GOOGLE_AI_STUDIO_API_KEY')}.get(name)
+                   'google_ai_studio': ('api_key', 'GOOGLE_AI_STUDIO_API_KEY'),
+                   'cohere': ('api_key', 'COHERE_API_KEY')}.get(name)
         if primary:
             jar.setdefault(primary[0], (os.getenv(primary[1], '') or '').strip())
     return {k: v for k, v in jar.items() if k and v and k != 'cookies'}
@@ -510,6 +512,16 @@ def _has_creds(name: str) -> bool:
                 or os.getenv('GEMINI_API_KEY', '').strip()):
             return True
         jar = _load_jar('google_ai_studio')
+        return bool(jar.get('api_key') or jar.get('key')
+                    or jar.get('token'))
+    if name == 'cohere':
+        # Free trial key from dashboard.cohere.com/api-keys. The env
+        # var merges into the jar under api_key (see _load_jar); any
+        # accepted key name counts as provisioned - liveness is
+        # checked by the refresh rung (Bearer /v1/models).
+        if os.getenv('COHERE_API_KEY', '').strip():
+            return True
+        jar = _load_jar('cohere')
         return bool(jar.get('api_key') or jar.get('key')
                     or jar.get('token'))
     if name == 'mistral':
@@ -1369,6 +1381,43 @@ def refresh_google_ai_studio() -> Tuple[bool, str]:
     return True, f'API key valid ({len(models)} models visible)'
 
 
+def refresh_cohere() -> Tuple[bool, str]:
+    """Validate the Cohere trial key against GET /v1/models.
+
+    The native catalog needs the bearer (401 {"message":"no api key
+    supplied"} without one); 200 returns the first page of the model
+    catalog without burning any trial quota. 401 "Incorrect API key
+    provided" -> rejected - create a new trial key at
+    dashboard.cohere.com/api-keys. A 429 still proves the key is
+    accepted (auth runs before rate limiting), so it reads as alive.
+    """
+    if not _has_creds('cohere'):
+        return False, ('no cohere credentials - create a free trial '
+                       'key at dashboard.cohere.com/api-keys and set '
+                       'COHERE_API_KEY or cohere_cookies.json')
+    key = (_load_jar('cohere').get('api_key')
+           or os.getenv('COHERE_API_KEY', '')).strip()
+    try:
+        resp = _http_get('https://api.cohere.com/v1/models', {},
+                         headers={'Authorization': f'Bearer {key}',
+                                  'Accept': 'application/json'})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (401, 403):
+        return False, ('API key rejected - create a new trial key at '
+                       'dashboard.cohere.com/api-keys')
+    if resp.status_code == 429:
+        return True, 'rate limited but key accepted (HTTP 429)'
+    if resp.status_code != 200:
+        return True, (f'key reachable, liveness inconclusive (HTTP '
+                      f'{resp.status_code}) - validated at request time')
+    try:
+        models = ((resp.json() or {}).get('models') or [])
+    except Exception:  # noqa: BLE001
+        models = []
+    return True, f'API key valid ({len(models)} models visible)'
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
@@ -1384,6 +1433,7 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'openrouter': refresh_openrouter,
            'llm7': refresh_llm7,
            'google_ai_studio': refresh_google_ai_studio,
+           'cohere': refresh_cohere,
            'arena': _manual_only(
                'arena',
                'session cookie required (browser login → arena_cookies.json '
@@ -3719,6 +3769,107 @@ def signup_google_ai_studio() -> Tuple[bool, str]:
             _close_page(page)
 
 
+def signup_cohere() -> Tuple[bool, str]:
+    """Create a Cohere account and harvest a free trial API key.
+
+    Flow (browser): dashboard.cohere.com/welcome/register -> email
+    form probed (SSO-only walls are reported honestly) -> emailed
+    verification code (magic-link fallback) -> dashboard.cohere.com/
+    api-keys -> "Create key" -> the trial key is displayed -> scrape
+    it and store it in the cohere jar under api_key (the exact key the
+    provider reads). Trial keys are free, no credit card.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://dashboard.cohere.com/welcome/register')
+        time.sleep(8)
+        # probe the registration form before spending a disposable mailbox
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
+                           'probe@example.invalid'):
+            return False, ('cohere registration form not found (SSO-'
+                           'only wall likely) - create a free trial '
+                           'key at dashboard.cohere.com/api-keys and '
+                           'set COHERE_API_KEY manually')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _click_any(page, ['Continue', 'Sign up', 'Next', 'Register',
+                          '注册', '登录'])
+        # Cohere verifies by emailed code (magic-link fallback)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='cohere')
+        link = None
+        if not code:
+            link = mailgen.fetch_magic_link(session,
+                                            url_needle='cohere',
+                                            max_wait_s=240)
+        if not code and not link:
+            return False, 'cohere verification email not found'
+        if code:
+            if not _fill_first(page, ['css:input[name=code]',
+                                      '@placeholder:code',
+                                      'css:input[inputmode=numeric]',
+                                      'css:input[type=tel]',
+                                      'css:input[type=text]'], code):
+                return False, 'code field not found'
+            _click_any(page, ['Verify', 'Continue', 'Submit', '验证'])
+        else:
+            page.get(link)
+        time.sleep(10)
+        page.get('https://dashboard.cohere.com/api-keys')
+        time.sleep(6)
+        if not _click_any(page, ['Create key', 'Create API key',
+                                 'New key', 'Generate API key']):
+            return False, ('create-key button not found on '
+                           'dashboard.cohere.com/api-keys')
+        time.sleep(3)
+        # optional key-name field in the creation dialog
+        _fill_first(page, ['css:input[type=text]', '@placeholder:name',
+                           '@placeholder:key name'], 'i4f-auto')
+        _click_any(page, ['Generate', 'Create', 'Create key', 'Save'])
+        time.sleep(4)
+        key = ''
+        try:
+            key = str(page.run_js(
+                'let hit="";'
+                'for (const el of document.querySelectorAll('
+                '"input,textarea")) {'
+                'const t = (el.value || "").trim();'
+                'const m = t.match(/^[A-Za-z0-9]{32,45}$/);'
+                'if (m) { hit = m[0]; break; } }'
+                'if (!hit) {'
+                'for (const el of document.querySelectorAll('
+                '"code,pre,div,span")) {'
+                'const t = el.value || el.textContent || "";'
+                'const m = t.match(/(?:^|[^A-Za-z0-9])'
+                '([A-Za-z0-9]{32,45})(?:[^A-Za-z0-9]|$)/);'
+                'if (m && m[1]) { hit = m[1]; break; } } }'
+                'return hit;') or '')
+        except Exception:  # noqa: BLE001
+            pass
+        if not key:
+            return False, ('signup finished but no trial key found '
+                           '(captcha or verification wall likely) - '
+                           'create a key at '
+                           'dashboard.cohere.com/api-keys and set '
+                           'COHERE_API_KEY manually')
+        _save_jar('cohere', {'api_key': key, 'email': email})
+        _save_account('cohere', email, '', session.get('backend', ''))
+        return True, (f'account created, trial key saved '
+                      f'({session.get("backend")}: {email})')
+    except Exception as e:  # noqa: BLE001
+        return False, f'cohere signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
 _MISTRAL_AUTH = 'https://auth.mistral.ai'
 
 
@@ -4869,6 +5020,7 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'openrouter': signup_openrouter,
           'llm7': signup_llm7,
           'google_ai_studio': signup_google_ai_studio,
+          'cohere': signup_cohere,
           'arena': _manual_only(
               'arena',
               'signup requires an allowlisted email domain '

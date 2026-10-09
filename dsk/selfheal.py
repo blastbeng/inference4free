@@ -99,6 +99,7 @@ HEALABLE: Dict[str, Path] = {
     'openrouter': _BASE / 'providers' / 'openrouter_provider.py',
     'llm7': _BASE / 'providers' / 'llm7_provider.py',
     'google_ai_studio': _BASE / 'providers' / 'google_ai_studio_provider.py',
+    'cohere': _BASE / 'providers' / 'cohere_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -124,6 +125,7 @@ _MODULE_NAMES = {
     'openrouter': 'dsk.providers.openrouter_provider',
     'llm7': 'dsk.providers.llm7_provider',
     'google_ai_studio': 'dsk.providers.google_ai_studio_provider',
+    'cohere': 'dsk.providers.cohere_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -168,6 +170,7 @@ _PROVIDER_CLASSES = {
     'openrouter': 'OpenRouterProvider',
     'llm7': 'Llm7Provider',
     'google_ai_studio': 'GoogleAiStudioProvider',
+    'cohere': 'CohereProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -226,6 +229,9 @@ _EVIDENCE_PATTERNS = {
     'google_ai_studio': [r'generativelanguage\.googleapis\.com[A-Za-z0-9_/{}$.\\-]{0,60}',
                          r'API key not valid', r'PERMISSION_DENIED',
                          r'aistudio\.google\.com'],
+    'cohere': [r'api\.cohere\.(?:com|ai)[A-Za-z0-9_/{}$.\\-]{0,60}',
+               r'no api key supplied', r'Incorrect API key provided',
+               r'dashboard\.cohere\.com'],
 }
 
 
@@ -513,7 +519,8 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'mistral_api': 'https://mistral.ai',
             'openrouter': 'https://openrouter.ai',
             'llm7': 'https://llm7.io',
-            'google_ai_studio': 'https://ai.google.dev'}.get(name, '')
+            'google_ai_studio': 'https://ai.google.dev',
+            'cohere': 'https://cohere.com'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []
