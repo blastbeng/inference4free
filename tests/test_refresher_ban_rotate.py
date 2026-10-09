@@ -21,6 +21,9 @@ Covered here:
     address, mail session carried); no creds + autogen -> fresh mailbox;
     no creds + autogen off -> the explicit misconfiguration error;
     create_email failure -> the backend error, empty creds
+  - _captcha_verdict_blocked / _await_captcha_token: the Turnstile refusal
+    is recognised from the API verdict, a success body never trips it, and
+    the token wait is bounded (no widget -> immediate, page error -> '')
 
 No network, no browser: mailgen and the selfheal probe are faked.
 
@@ -30,6 +33,7 @@ import contextlib
 import os
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if not os.path.isdir(os.path.join(ROOT, 'dsk')):
@@ -176,6 +180,75 @@ def test_mailgen_failure_surfaces_backend_error():
             email, pw, session, generated, err = R._deepseek_signup_creds()
         assert email == ''
         assert 'all backends down' in err
+
+
+# ------------------------------------------------------------- captcha gate
+#
+# Measured live 2026-10-09: deepseek's send-code endpoint answers
+# {"biz_code":2,"biz_msg":"RECAPTCHA_VERIFY_FAILED"} when the Cloudflare
+# Turnstile token is absent (datacenter egress). The SPA never paints that
+# message, so the old flow read a clean page, clicked Send Code, and then
+# burned 180 s in fetch_otp before reporting "no OTP arrived — configure
+# IMAP", blaming a mailbox that was never asked to send anything.
+
+SEND_BLOCKED = ('POST https://api.deepseek.com/user/create_email_'
+                'verification_code -> {"biz_code":2,'
+                '"biz_msg":"RECAPTCHA_VERIFY_FAILED"}')
+SEND_OK = ('POST https://api.deepseek.com/user/create_email_'
+           'verification_code -> {"biz_code":0,"biz_msg":"success"}')
+
+
+def test_captcha_verdict_detects_the_real_refusal():
+    assert R._captcha_verdict_blocked(SEND_BLOCKED) is True
+
+
+def test_captcha_verdict_ignores_a_success_body():
+    # The request URL contains 'verification' — a success body must not trip
+    # the gate, or every working signup would be reported as captcha-gated.
+    assert R._captcha_verdict_blocked(SEND_OK) is False
+
+
+def test_captcha_verdict_on_nothing_is_not_blocked():
+    assert R._captcha_verdict_blocked('') is False
+    assert R._captcha_verdict_blocked(None) is False
+
+
+class _Page:
+    """Minimal stand-in for the browser page the helper polls."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = 0
+
+    def run_js(self, js):
+        self.calls += 1
+        reply = self.replies.pop(0) if self.replies else 'NONE'
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def test_captcha_wait_returns_immediately_when_no_widget():
+    page = _Page(['NONE'])
+    assert R._await_captcha_token(page, timeout_s=10) == ''
+    assert page.calls == 1                    # no deadline paid
+
+
+def test_captcha_wait_returns_the_rendered_token():
+    page = _Page(['', 'eyJhbGciOi.token'])
+    assert R._await_captcha_token(page, timeout_s=5) == 'eyJhbGciOi.token'
+
+
+def test_captcha_wait_swallows_page_errors():
+    page = _Page([RuntimeError('page disconnected')])
+    assert R._await_captcha_token(page, timeout_s=5) == ''
+
+
+def test_captcha_wait_honours_its_deadline():
+    page = _Page([''] * 500)
+    started = time.time()
+    assert R._await_captcha_token(page, timeout_s=0.6) == ''
+    assert time.time() - started < 3.0        # bounded, not a 180 s stall
 
 
 if __name__ == '__main__':

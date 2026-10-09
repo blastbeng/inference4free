@@ -2111,6 +2111,59 @@ def _net_log_read(page, needle: str = '', limit: int = 6) -> str:
     return ' || '.join(out[-limit:])
 
 
+def _captcha_verdict_blocked(send_api: str) -> bool:
+    """True when the recorded create_email_verification_code response is a
+    captcha/verification refusal.
+
+    DeepSeek reports its Cloudflare Turnstile gate under the generic biz_msg
+    ``RECAPTCHA_VERIFY_FAILED`` (the page loads
+    ``challenges.cloudflare.com/turnstile``, not Google reCAPTCHA). When the
+    verdict is a captcha refusal NO code mail was ever sent, so waiting for
+    an OTP is pure waste and the caller must say so instead of blaming the
+    mailbox. Matched against the response body only — the request URL
+    contains ``verification`` (not ``verify_failed``), so a success body
+    never trips this.
+    """
+    low = (send_api or '').lower()
+    return any(k in low for k in ('recaptcha', 'verify_failed', 'captcha'))
+
+
+def _await_captcha_token(page, timeout_s: float = 10.0) -> str:
+    """Best-effort wait for a rendered signup captcha token ('' when none).
+
+    The signup forms embed a Cloudflare Turnstile widget that auto-solves in
+    managed mode for a real browser; the SPA reads the token from its own
+    widget callback, so waiting for it to appear is enough — we never solve
+    or inject anything. Returns immediately when NO widget is present (so a
+    page that uses another captcha mode does not pay the deadline), and the
+    raw token (or '') otherwise.
+    """
+    js = r"""
+      try {
+        var w = document.querySelector('#cf-turnstile, .cf-turnstile');
+        var f = document.querySelector('iframe[src*="challenges.cloudflare"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"]');
+        if (!w && !f) return 'NONE';
+        var el = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], textarea[name="h-captcha-response"], input[name="h-captcha-response"]');
+        if (el && el.value) return el.value;
+        try { if (window.turnstile && window.turnstile.getResponse) {
+                var r = window.turnstile.getResponse(); if (r) return r; } } catch(e){}
+        return '';
+      } catch(e) { return 'NONE'; }
+    """
+    deadline = time.time() + max(0.0, timeout_s)
+    while time.time() < deadline:
+        try:
+            val = page.run_js(js)
+        except Exception:  # noqa: BLE001 — diagnostics only
+            return ''
+        if val == 'NONE':
+            return ''
+        if val:
+            return str(val)
+        time.sleep(0.5)
+    return ''
+
+
 def _click_any(page, targets: List[str]) -> bool:
     for t in targets:
         try:
@@ -2764,6 +2817,10 @@ def signup_deepseek() -> Tuple[bool, str]:
                 last_error = 'email field not found'
                 continue
             _fill_first(page, _PASSWORD_SELECTORS, password)
+            # Let a managed-mode Turnstile widget finish (auto-solving) so the
+            # SPA has a token in state before we ask it to send the code; a
+            # page with no widget returns immediately.
+            _await_captcha_token(page, timeout_s=10)
             clicked_send = _click_any(page, ['Send Code', 'Send code',
                                             '获取验证码'])
             # Capture the form's reaction to the send: a visible error means
@@ -2796,6 +2853,33 @@ def signup_deepseek() -> Tuple[bool, str]:
                     _click_any(page, ['Send Code', 'Send code', '获取验证码'])
                     time.sleep(4)
                     send_note += ' (mailbox regenerated)'
+            # The authoritative send verdict is the API response, not the
+            # rendered body (the SPA does not paint biz_msg). A captcha
+            # refusal means NO code mail was sent — retry once while a slow
+            # Turnstile widget may still finish, then stop: a 180s OTP wait
+            # would only delay the inevitable and misreport the mailbox.
+            if _captcha_verdict_blocked(send_api):
+                _await_captcha_token(page, timeout_s=8)
+                _click_any(page, ['Send Code', 'Send code', '获取验证码'])
+                time.sleep(4)
+                send_api2 = _net_log_read(page, needle='code')
+                cleared = not _captcha_verdict_blocked(send_api2)
+                _log_history('deepseek', 'stage',
+                             'send-code captcha verdict: '
+                             + ('cleared on retry' if cleared
+                                else 'still blocked')
+                             + f' ({send_api2[-160:]})')
+                if not cleared:
+                    return False, (
+                        'deepseek signup is captcha-gated — '
+                        'create_email_verification_code refused with '
+                        'RECAPTCHA_VERIFY_FAILED (the Cloudflare Turnstile '
+                        'token is missing: the automated browser could not '
+                        'pass the challenge from this egress). A RESIDENTIAL '
+                        'I4F_SIGNUP_PROXY usually clears it; otherwise '
+                        'provide DEEPSEEK_LOGIN_EMAIL/PASSWORD for a ready '
+                        'account')
+                send_api = send_api2
             if generated:
                 code = mailgen.fetch_otp(session, max_wait_s=180)
                 if not code:
