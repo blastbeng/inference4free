@@ -42,7 +42,14 @@ logger = logging.getLogger('shared-browser')
 
 DEFAULT_PORT = int(os.getenv('I4F_BROWSER_PORT', '9333') or 9333)
 DEFAULT_PROFILE = os.getenv('I4F_BROWSER_PROFILE', '/data/shared_browser')
-IDLE_REAP = max(60.0, float(os.getenv('I4F_BROWSER_IDLE_REAP', '600') or 600))
+IDLE_REAP = max(60.0, float(os.getenv('I4F_BROWSER_IDLE_REAP', '180') or 180))
+# RAM rule: at most N live Chromium instances. The relay keeps one
+# slot (persistent chatgpt profile); every other (profile, proxy)
+# key — rotating signup proxies above all — evicts the oldest IDLE
+# instance when the cap is hit. Soft cap: with every slot busy a
+# new key is still allowed (killing an in-use browser breaks runs).
+MAX_INSTANCES = max(1, int(os.getenv('I4F_BROWSER_MAX_INSTANCES',
+                                     '3') or 3))
 # A fresh-state rung holding the gate longer than this is assumed wedged;
 # the next waiter steals the gate and closes its tab.
 FRESH_STEAL_AFTER = max(300.0, float(
@@ -590,11 +597,43 @@ def acquire(proxy: Optional[str] = None, headed: bool = False,
     with _REGISTRY_LOCK:
         inst = _REGISTRY.get(key)
         if inst is None:
+            _evict_oldest_idle(key)
             inst = _SharedBrowser(
                 key, profile=profile, port=port, proxy=proxy)
             _REGISTRY[key] = inst
     return inst.acquire(url=url, fresh=fresh, headed_hint=headed,
                         url_timeout=url_timeout)
+
+
+def _evict_oldest_idle(incoming_key: str) -> None:
+    """Keep the registry within MAX_INSTANCES (RAM rule).
+
+    Called with the registry lock held, BEFORE a new key registers.
+    Evicts the idle instance with the oldest last-release; an idle
+    instance is one with no live tab handles and no browser left
+    to kill that is younger than the reaper would already have
+    caught. In-use instances are never touched (a force-quit would
+    break the run holding the tab) — the cap is soft by design.
+    """
+    if len(_REGISTRY) < MAX_INSTANCES:
+        return
+    candidates = [(inst._last_release, k, inst)
+                  for k, inst in _REGISTRY.items()
+                  if k != incoming_key and not inst._handles]
+    if not candidates:
+        logger.info('shared-browser cap %d hit with every instance '
+                    'busy — allowing a temporary extra instance',
+                    MAX_INSTANCES)
+        return
+    candidates.sort()
+    _, old_key, victim = candidates[0]
+    logger.info('shared-browser cap %d hit — evicting idle instance '
+                '%s (RAM rule)', MAX_INSTANCES, old_key)
+    _REGISTRY.pop(old_key, None)
+    try:
+        victim.reap_if_idle(0)
+    except Exception:  # noqa: BLE001 — eviction is best effort
+        pass
 
 
 def _reaper_loop() -> None:
