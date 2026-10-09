@@ -358,25 +358,28 @@ def test_vision_payload():
 def test_refresh_liveness():
     from dsk import refresher as rf
     old = _set_env('llm7-test-key-0123456789abcdef')
-    orig_get = rf._http_get
+    # refresh_llm7 checks liveness with a DIRECT requests.get (the pooled
+    # free-proxy draws get 429'd by llm7's abuse filters) — patch that call.
+    import requests as _rq
+    orig_get = _rq.get
     try:
         # 429 still proves the key is accepted (auth runs first)
-        rf._http_get = lambda *a, **kw: _fake_response(429, {})
+        _rq.get = lambda *a, **kw: _fake_response(429, {})
         ok, msg = rf.refresh_llm7()
         assert ok is True and '429' in msg, msg
         # invalid key -> rejected with the dash.llm7.io pointer
-        rf._http_get = lambda *a, **kw: _fake_response(401, {
+        _rq.get = lambda *a, **kw: _fake_response(401, {
             'error': {'message': 'Your API key is invalid, expired, or '
                       'revoked.', 'code': 'invalid_api_key'}})
         ok, msg = rf.refresh_llm7()
         assert ok is False and 'rejected' in msg, msg
         # 200 with the balance record
-        rf._http_get = lambda *a, **kw: _fake_response(
+        _rq.get = lambda *a, **kw: _fake_response(
             200, {'balance': 95000, 'currency': 'tokens'})
         ok, msg = rf.refresh_llm7()
         assert ok is True and 'balance returned' in msg, msg
     finally:
-        rf._http_get = orig_get
+        _rq.get = orig_get
         _unset(old)
     print('PASS test_refresh_liveness')
 

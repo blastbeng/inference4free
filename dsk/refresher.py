@@ -1355,10 +1355,16 @@ def refresh_llm7() -> Tuple[bool, str]:
                        'or llm7_cookies.json')
     key = (_load_jar('llm7').get('api_key')
            or os.getenv('LLM7_API_KEY', '')).strip()
+    # Direct on purpose: the pooled free-proxy draws get 429'd by llm7's
+    # abuse filters while the direct route answers (same policy as the
+    # provider's _FORCE_DIRECT).
+    import requests as _rq
     try:
-        resp = _http_get('https://api.llm7.io/v1/balance', {},
-                         headers={'Authorization': f'Bearer {key}',
-                                  'Accept': 'application/json'})
+        resp = _rq.get('https://api.llm7.io/v1/balance',
+                       headers={'Authorization': f'Bearer {key}',
+                                'Accept': 'application/json',
+                                'User-Agent': _UA},
+                       timeout=30)
     except Exception as e:  # noqa: BLE001
         return False, f'verify failed: {type(e).__name__}: {e}'
     if resp.status_code in (401, 403):
@@ -3977,54 +3983,139 @@ def signup_llm7() -> Tuple[bool, str]:
         page.get('https://dash.llm7.io/#/api-keys')
         time.sleep(8)
         _dismiss_consents(page)
-        # probe the sign-in form before spending a disposable mailbox
-        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
+        # the shared browser profile may already hold a verified llm7
+        # session (a previous rung's login persists) — then the dashboard
+        # renders with no sign-in wall and the rung can reuse the account
+        already_in = page.run_js(
+            'return (document.body.innerText||"")'
+            '.includes("Token management")')
+        if not already_in and not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
             return False, ('llm7 sign-in form not found (OAuth-only '
                            'wall likely) - create a free key at '
                            'dash.llm7.io/#/api-keys and set '
                            'LLM7_API_KEY manually')
+        if already_in:
+            email = ''
         session, err = mailgen.create_email()
         if not session:
             return False, f'autogen mailbox unavailable: {err}'
         email = session['address']
-        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
-            return False, 'email field not found'
-        _click_any(page, ['Continue with email', 'Continue', 'Sign in',
-                          'Log in', 'Sign up', 'Continua con email',
-                          'Continua', 'Prosegui', 'Accedi', 'Iscriviti',
-                          '\u6ce8\u518c', '\u767b\u5f55'])
-        # LLM7 verifies by emailed magic link or OTP code
-        link = mailgen.fetch_magic_link(session,
-                                        url_needle='llm7',
-                                        max_wait_s=240)
-        code = None
-        if not link:
-            code = mailgen.fetch_otp(session, max_wait_s=60,
-                                     sender_needle='llm7')
-        if not link and not code:
-            return False, 'llm7 verification email not found'
-        if link:
-            page.get(link)
-            time.sleep(8)
-        else:
-            if not _fill_first(page, ['css:input[name=code]',
-                                      '@placeholder:code',
-                                      'css:input[inputmode=numeric]',
-                                      'css:input[type=tel]',
-                                      'css:input[type=text]'], code):
-                return False, 'code field not found'
-            _click_any(page, ['Verify', 'Continue', 'Submit', 'Verifica',
-                              'Conferma', 'Prosegui', '\u9a8c\u8bc1'])
-        time.sleep(10)
+        email = ''
+        session = {'backend': 'browser-session', 'address': ''}
+        if not already_in:
+            session, err = mailgen.create_email()
+            if not session:
+                return False, f'autogen mailbox unavailable: {err}'
+            email = session['address']
+            if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+                return False, 'email field not found'
+            # The ToS toggle gates the submit: 'Continue with email' stays
+            # disabled until the custom switch (label.login-terms-row + the
+            # peer-styled button; NO input[type=checkbox] in the DOM) is
+            # activated. Without this the form never submits and the rung
+            # waits forever for an email that was never sent.
+            page.run_js(
+                'const lab=document.querySelector("label.login-terms-row");'
+                'if (lab) lab.click();'
+                'const sw=[...document.querySelectorAll("button")].find('
+                '  x=>/peer/.test(x.className));'
+                'if (sw) sw.click(); return "ok"')
+            _click_any(page, ['Continue with email', 'Continue', 'Sign in',
+                              'Log in', 'Sign up', 'Continua con email',
+                              'Continua', 'Prosegui', 'Accedi', 'Iscriviti',
+                              '\u6ce8\u518c', '\u767b\u5f55'])
+            # LLM7 verifies by a 6-digit emailed code ("Your LLM7.io
+            # verification code", expires in 5 minutes, single use). The body
+            # is raw HTML whose inline styles contain hex colors (e.g.
+            # 'color: #808080') — a bare \d{6} matches the color first, the
+            # server answers a wrong code with 'Email sign-in is temporarily
+            # unavailable'. Anchor the extraction to the code block, falling
+            # back to a 6-digit run that is not a hex color.
+            _LLM7_CODE_RE = re.compile(
+                r'code is:?(?:[^0-9]{0,60})(\d{6})'
+                r'|(?<![#0-9a-fA-F])\b(\d{6})\b', re.I | re.S)
+            code = mailgen.fetch_otp(session, max_wait_s=240,
+                                     sender_needle='llm7',
+                                     code_re=_LLM7_CODE_RE)
+            link = None
+            if not code:
+                link = mailgen.fetch_magic_link(session,
+                                                url_needle='llm7',
+                                                max_wait_s=60)
+            if not link and not code:
+                return False, 'llm7 verification email not found'
+            if link:
+                page.get(link)
+                time.sleep(8)
+            else:
+                # The emailnator pooled masters carry every sibling variant's
+                # mail — a stale llm7 code from another bot's request verifies
+                # as 'Email sign-in is temporarily unavailable'. Try the first
+                # code, and on failure burn ONE resend for a fresh one.
+                tried = set()
+                for attempt in range(2):
+                    if code and str(code) not in tried:
+                        tried.add(str(code))
+                        if not _fill_first(page, ['css:input[placeholder*=digit]',
+                                                  'css:input[name=code]',
+                                                  '@placeholder:code',
+                                                  'css:input[maxlength="6"]',
+                                                  'css:input[inputmode=numeric]',
+                                                  'css:input[type=tel]',
+                                                  'css:input[type=text]'], code):
+                            return False, 'code field not found'
+                        _click_any(page, ['Verify', 'Continue', 'Submit',
+                                          'Verifica', 'Conferma', 'Prosegui',
+                                          '\u9a8c\u8bc1'])
+                    time.sleep(10)
+                    still_otp = page.run_js(
+                        'return (document.body.innerText||"")'
+                        '.includes("6-digit code")')
+                    if not still_otp:
+                        break
+                    if attempt == 0:
+                        _click_any(page, ['Resend code', 'Resend', 'Reinvia'])
+                        code = mailgen.fetch_otp(session, max_wait_s=120,
+                                                 sender_needle='llm7',
+                                                 code_re=_LLM7_CODE_RE)
         page.get('https://dash.llm7.io/#/api-keys')
         time.sleep(6)
-        if not _click_any(page, ['Create key', 'Create API key',
-                                 'New key', 'Create new key', 'Generate',
+        # the privacy-choices dialog re-renders AFTER login and can swallow
+        # the next click — dismiss again on the dashboard
+        _dismiss_consents(page)
+        if not _click_any(page, ['Add API key', 'Create key',
+                                 'Create API key', 'New key',
+                                 'Create new key', 'Generate', 'Add key',
                                  'Crea chiave', 'Crea nuova chiave',
-                                 'Crea']):
+                                 'Aggiungi chiave', 'Crea']):
             return False, ('create-key button not found on '
                            'dash.llm7.io/#/api-keys')
         time.sleep(4)
+        # 'Add API key' opens the 'Add New API Key' dialog: Token name
+        # (text) AND Expires At (datetime-local) are BOTH required — the
+        # submit answers 'Name and expiry date are required.' otherwise.
+        # The inputs are React-controlled: plain .value assignment is not
+        # seen by the state, so the native value setter fires the events.
+        page.run_js(
+            'const dlg=document.querySelector("[role=dialog],[class*=modal],'
+            '[class*=Dialog],[class*=dialog]");'
+            'if (!dlg) return "no-dialog";'
+            'const setNative=(el,val)=>{const d=Object.getOwnPropertyDescriptor('
+            'window.HTMLInputElement.prototype,"value");'
+            'd.set.call(el,val);'
+            'el.dispatchEvent(new Event("input",{bubbles:true}));'
+            'el.dispatchEvent(new Event("change",{bubbles:true}));};'
+            'const name=dlg.querySelector("input[type=text],input:not([type])");'
+            'if (name) setNative(name,"i4f-bot");'
+            'const exp=dlg.querySelector("input[type=datetime-local]");'
+            'if (exp) { const d=new Date(Date.now()+365*864e5'
+            '- new Date().getTimezoneOffset()*60000);'
+            'setNative(exp, d.toISOString().slice(0,16)); }'
+            'return "filled"')
+        time.sleep(1)
+        _click_any(page, ['Create key', 'Generate', 'Confirm', 'Save key',
+                          'Save', 'Salva', 'Conferma'])
+        time.sleep(5)
         key = ''
         try:
             key = str(page.run_js(
@@ -4034,6 +4125,15 @@ def signup_llm7() -> Tuple[bool, str]:
                 'const t = el.value || el.textContent || "";'
                 'const m = t.match(/^[A-Za-z0-9][A-Za-z0-9_-]{23,}$/m);'
                 'if (m) { hit = m[0]; break; } }'
+                'if (!hit) {'
+                'const el = [...document.querySelectorAll('
+                '"input,textarea,code,pre,strong,span,td")].find(e=>'
+                '/[A-Za-z0-9][A-Za-z0-9_.-]{23,}/.test(e.value||"") || '
+                '/^[A-Za-z0-9][A-Za-z0-9_.-]{23,}$/.test('
+                '(e.textContent||"").trim()));'
+                'if (el) { const m2 = (el.value||el.textContent||"")'
+                '.match(/[A-Za-z0-9][A-Za-z0-9_.-]{23,}/);'
+                'if (m2) hit = m2[0]; } }'
                 'return hit;') or '')
         except Exception:  # noqa: BLE001
             pass

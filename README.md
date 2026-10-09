@@ -355,7 +355,7 @@ automatically and enters the `auto` routers. Dormant until the key exists:
 | Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Workers AI catalog |
 | Meta Muse Spark | `META_API_KEY` | `api.meta.ai/v1` (`muse-spark`, `muse-glimmer`) |
 | Blackbox AI | `BLACKBOX_API_KEY` | OpenAI-compatible free tier |
-| llm7 | *(none — keyless)* | free endpoint, no key at all |
+| llm7 | `LLM7_API_KEY` (or `llm7_cookies.json`) | free daily quota on the non-usage-based catalog; the bot's signup rung automates dash.llm7.io (email OTP + key creation) — the endpoint also serves an anonymous keyless tier at tighter limits |
 
 ### 13. Session-cookie surfaces (`t3chat`, `innerai`, `adapta`)
 

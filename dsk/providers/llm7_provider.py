@@ -80,6 +80,13 @@ MODELS_URL = f'{LLM7_API_BASE}/models'
 CHAT_URL = f'{LLM7_API_BASE}/chat/completions'
 BALANCE_URL = f'{LLM7_API_BASE}/balance'
 
+# api.llm7.io is a clean bearer-auth API: the pooled free-proxy draws get
+# 429'd by its abuse filters (or black-hole the SSE stream) while the
+# direct route answers in under a second — default DIRECT.
+# I4F_LLM7_PROXY=1 re-enables the pooled-proxy draw.
+_FORCE_DIRECT = os.getenv('I4F_LLM7_PROXY', '').strip().lower() not in (
+    '1', 'true', 'yes', 'on')
+
 _USER_AGENT = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
                '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
@@ -205,7 +212,7 @@ class Llm7Provider(Provider):
             resp = http_get(MODELS_URL, headers={
                 'User-Agent': _USER_AGENT,
                 'Accept': 'application/json'}, timeout=30,
-                no_proxy=no_proxy)
+                no_proxy=no_proxy or _FORCE_DIRECT)
             if resp.status_code == 200:
                 parsed = _parse_models(resp.json())
                 if parsed:
@@ -236,9 +243,18 @@ class Llm7Provider(Provider):
                 'llm7_cookies.json): free keys come from dash.llm7.io')
         self._refresh_catalog()
         out: List[Dict[str, Any]] = []
+        seen_lower: set = set()
         for m in self._models:
+            # Router.resolve() lowercases request ids, so upstream camel-case
+            # ids (DeepSeek-V4-Flash-0731) are unresolvable as-is: route on a
+            # lowercase id and keep the original case as upstream_model
+            # (stream() sends the upstream name verbatim).
+            rid = m['id'].lower()
+            if rid in seen_lower:
+                continue
+            seen_lower.add(rid)
             out.append({
-                'id': m['id'],
+                'id': rid,
                 'upstream_model': m['id'],
                 'thinking_enabled': m['thinking'],
                 'search_enabled': False,
@@ -299,7 +315,7 @@ class Llm7Provider(Provider):
                               'Accept': 'text/event-stream'}),
             json_body=payload,
             timeout=300,
-            no_proxy=no_proxy,
+            no_proxy=no_proxy or _FORCE_DIRECT,
         )
         if resp.status_code != 200:
             try:
