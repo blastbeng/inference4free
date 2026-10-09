@@ -132,7 +132,8 @@ def _jar_path(name: str) -> Path:
              'modelscope': 'modelscope_cookies.json',
              'mistral_api': 'mistral_api_cookies.json',
              'openrouter': 'openrouter_cookies.json',
-             'llm7': 'llm7_cookies.json'}
+             'llm7': 'llm7_cookies.json',
+             'google_ai_studio': 'google_ai_studio_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -282,7 +283,8 @@ def _load_jar(name: str) -> Dict[str, str]:
                    'modelscope': ('api_key', 'MODELSCOPE_API_KEY'),
                    'mistral_api': ('api_key', 'MISTRAL_API_KEY'),
                    'openrouter': ('api_key', 'OPENROUTER_API_KEY'),
-                   'llm7': ('api_key', 'LLM7_API_KEY')}.get(name)
+                   'llm7': ('api_key', 'LLM7_API_KEY'),
+                   'google_ai_studio': ('api_key', 'GOOGLE_AI_STUDIO_API_KEY')}.get(name)
         if primary:
             jar.setdefault(primary[0], (os.getenv(primary[1], '') or '').strip())
     return {k: v for k, v in jar.items() if k and v and k != 'cookies'}
@@ -496,6 +498,18 @@ def _has_creds(name: str) -> bool:
         if os.getenv('LLM7_API_KEY', '').strip():
             return True
         jar = _load_jar('llm7')
+        return bool(jar.get('api_key') or jar.get('key')
+                    or jar.get('token'))
+    if name == 'google_ai_studio':
+        # Free AI Studio API key (AIzaSy...) from
+        # aistudio.google.com/apikey. The env var merges into the jar
+        # under api_key (see _load_jar); GEMINI_API_KEY is accepted as
+        # the official SDK alias. Liveness is checked by the refresh
+        # rung (native ListModels, NOT anonymous).
+        if (os.getenv('GOOGLE_AI_STUDIO_API_KEY', '').strip()
+                or os.getenv('GEMINI_API_KEY', '').strip()):
+            return True
+        jar = _load_jar('google_ai_studio')
         return bool(jar.get('api_key') or jar.get('key')
                     or jar.get('token'))
     if name == 'mistral':
@@ -1303,6 +1317,58 @@ def refresh_llm7() -> Tuple[bool, str]:
     return True, 'API key valid (balance returned)'
 
 
+def refresh_google_ai_studio() -> Tuple[bool, str]:
+    """Validate the AI Studio key against native ListModels.
+
+    GET v1beta/models with x-goog-api-key returns the model catalog
+    (first page, default 50 entries) only for a valid consumer key:
+    200 -> valid; 403 {"status":"PERMISSION_DENIED"} (no identity) and
+    400 "API key not valid." -> rejected - create a new free key at
+    aistudio.google.com/apikey. A 429 still proves the key is
+    accepted (quota runs after auth), so it reads as alive.
+    """
+    if not _has_creds('google_ai_studio'):
+        return False, ('no google_ai_studio credentials - get a free '
+                       'key at aistudio.google.com/apikey and set '
+                       'GOOGLE_AI_STUDIO_API_KEY or '
+                       'google_ai_studio_cookies.json')
+    key = (_load_jar('google_ai_studio').get('api_key')
+           or (os.getenv('GOOGLE_AI_STUDIO_API_KEY', '') or
+               os.getenv('GEMINI_API_KEY', ''))).strip()
+    try:
+        resp = _http_get('https://generativelanguage.googleapis.com'
+                         '/v1beta/models', {},
+                         headers={'x-goog-api-key': key,
+                                  'Accept': 'application/json'})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (401, 403):
+        return False, ('API key rejected - create a new free key at '
+                       'aistudio.google.com/apikey')
+    if resp.status_code == 400:
+        text = ''
+        try:
+            text = resp.text or ''
+        except Exception:  # noqa: BLE001
+            pass
+        if re.search(r'API key not valid|Please pass a valid API key|'
+                     r'API_KEY_INVALID', text, re.IGNORECASE):
+            return False, ('API key rejected - create a new free key '
+                           'at aistudio.google.com/apikey')
+        return True, ('key reachable, liveness inconclusive (HTTP 400) '
+                      '- validated at request time')
+    if resp.status_code == 429:
+        return True, 'rate limited but key accepted (HTTP 429)'
+    if resp.status_code != 200:
+        return True, (f'key reachable, liveness inconclusive (HTTP '
+                      f'{resp.status_code}) - validated at request time')
+    try:
+        models = ((resp.json() or {}).get('models') or [])
+    except Exception:  # noqa: BLE001
+        models = []
+    return True, f'API key valid ({len(models)} models visible)'
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
@@ -1317,6 +1383,7 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'mistral_api': refresh_mistral_api,
            'openrouter': refresh_openrouter,
            'llm7': refresh_llm7,
+           'google_ai_studio': refresh_google_ai_studio,
            'arena': _manual_only(
                'arena',
                'session cookie required (browser login → arena_cookies.json '
@@ -3551,6 +3618,107 @@ def signup_llm7() -> Tuple[bool, str]:
             _close_page(page)
 
 
+def signup_google_ai_studio() -> Tuple[bool, str]:
+    """Log into Google and harvest a free AI Studio API key.
+
+    Flow (browser): aistudio.google.com/apikey -> Google sign-in wall
+    (reuses GOOGLE_AI_STUDIO_LOGIN_EMAIL/PASSWORD, falling back to the
+    GEMINI_LOGIN_* Google credentials; without them the rung reports
+    honestly - a fresh Google account needs the gemini signup rung
+    first) -> "Create API key" -> the AIzaSy... key is displayed ->
+    scrape it and store it in the google_ai_studio jar under api_key
+    (the exact key the provider reads).
+    """
+    page = None
+    try:
+        email = (os.getenv('GOOGLE_AI_STUDIO_LOGIN_EMAIL', '').strip()
+                 or os.getenv('GEMINI_LOGIN_EMAIL', '').strip())
+        password = (os.getenv('GOOGLE_AI_STUDIO_LOGIN_PASSWORD', '').strip()
+                    or os.getenv('GEMINI_LOGIN_PASSWORD', '').strip())
+        page = _browser(headed=True)
+        page.get('https://aistudio.google.com/apikey')
+        time.sleep(8)
+        # Google sign-in wall: log in when credentials are available
+        if _fill_first(page, _GEMINI_EMAIL_SELECTORS,
+                       email or 'probe@example.invalid'):
+            if not email or not password:
+                return False, ('Google sign-in required - set '
+                               'GOOGLE_AI_STUDIO_LOGIN_EMAIL/PASSWORD '
+                               '(or GEMINI_LOGIN_EMAIL/PASSWORD), or '
+                               'create the Google account via the '
+                               'gemini signup first, then create a '
+                               'free key at aistudio.google.com/apikey '
+                               'and set GOOGLE_AI_STUDIO_API_KEY '
+                               'manually')
+            _click_any(page, ['Next', 'Continue', 'Weiter'])
+            time.sleep(5)
+            if not _fill_first(page, _PASSWORD_SELECTORS, password):
+                return False, 'google password field not found'
+            _click_any(page, ['Next', 'Continue', 'Weiter'])
+            # dismiss interstitials until the API-key UI responds
+            deadline = time.time() + 120
+            logged = False
+            while time.time() < deadline:
+                time.sleep(5)
+                _click_any(page, ['I agree', 'Accept all', 'Got it',
+                                  'Continue', 'Not now', 'Skip',
+                                  "Yes, I'm in", 'Yes, continue'])
+                body = str(_body_head(page) or '').lower()
+                if (('api key' in body or 'get started' in body)
+                        and 'sign in' not in body):
+                    logged = True
+                    break
+            if not logged:
+                page.get('https://aistudio.google.com/apikey')
+                time.sleep(6)
+                body = str(_body_head(page) or '').lower()
+                if 'sign in' in body or not body:
+                    return False, ('google login did not complete '
+                                   '(anti-bot or 2FA) - create a free '
+                                   'key at aistudio.google.com/apikey '
+                                   'and set GOOGLE_AI_STUDIO_API_KEY '
+                                   'manually')
+        if not _click_any(page, ['Create API key', 'Create key',
+                                 'Get API key', 'New API key']):
+            return False, ('create-key button not found on '
+                           'aistudio.google.com/apikey (Google login '
+                           'wall likely) - create a free key at '
+                           'aistudio.google.com/apikey and set '
+                           'GOOGLE_AI_STUDIO_API_KEY manually')
+        time.sleep(5)
+        # the key lands behind a "create in new project" dialog
+        _click_any(page, ['Create API key in new project', 'New project',
+                          'Create API key', 'Create'])
+        time.sleep(5)
+        key = ''
+        try:
+            key = str(page.run_js(
+                'let hit="";'
+                'for (const el of document.querySelectorAll('
+                '"input,textarea,code,pre,div,span")) {'
+                'const t = el.value || el.textContent || "";'
+                'const m = t.match(/AIzaSy[A-Za-z0-9_-]{30,}/);'
+                'if (m) { hit = m[0]; break; } }'
+                'return hit;') or '')
+        except Exception:  # noqa: BLE001
+            pass
+        if not key:
+            return False, ('signup finished but no AIzaSy key found '
+                           '(login or quota wall likely) - create a '
+                           'key at aistudio.google.com/apikey and set '
+                           'GOOGLE_AI_STUDIO_API_KEY manually')
+        _save_jar('google_ai_studio', {'api_key': key, 'email': email})
+        _save_account('google_ai_studio', email, '', '')
+        return True, (f'API key saved ({email or "google account"}): '
+                      f'{key[:10]}...')
+    except Exception as e:  # noqa: BLE001
+        return False, (f'google_ai_studio signup failed: '
+                       f'{type(e).__name__}: {e}')
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
 _MISTRAL_AUTH = 'https://auth.mistral.ai'
 
 
@@ -4700,6 +4868,7 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'mistral_api': signup_mistral_api,
           'openrouter': signup_openrouter,
           'llm7': signup_llm7,
+          'google_ai_studio': signup_google_ai_studio,
           'arena': _manual_only(
               'arena',
               'signup requires an allowlisted email domain '
