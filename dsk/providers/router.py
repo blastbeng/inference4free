@@ -89,6 +89,7 @@ PROVIDER_MODULES = (
     ('groq', '.groq_provider', 'GroqProvider'),
     ('cerebras', '.cerebras_provider', 'CerebrasProvider'),
     ('modelscope', '.modelscope_provider', 'ModelScopeProvider'),
+    ('mistral_api', '.mistral_api_provider', 'MistralApiProvider'),
 )
 
 OWNED_BY = {
@@ -110,6 +111,7 @@ OWNED_BY = {
     'groq': 'groq',
     'cerebras': 'cerebras',
     'modelscope': 'modelscope',
+    'mistral_api': 'mistral',
 }
 
 # Public model-id namespaces: every model surfaced via /v1/models and the
@@ -136,6 +138,7 @@ PUBLIC_PREFIX = {
     'groq': 'groq',
     'cerebras': 'cerebras',
     'modelscope': 'modelscope',
+    'mistral_api': 'mistral-api',
 }
 
 # Reverse of PUBLIC_PREFIX: 'z.ai' -> 'glm', used by resolve() so both the
@@ -361,7 +364,8 @@ AUTO_CATEGORIES: Dict[str, List[str]] = {
     'summarize':   ['chatgpt', 'gemini', 'glm', 'qwen', 'mistral', 'deepseek'],
     'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt'],
     'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral',
-                    'kimi', 'pollinations', 'huggingchat', 'arena', 'groq', 'cerebras', 'modelscope'],
+                    'kimi', 'pollinations', 'huggingchat', 'arena', 'groq', 'cerebras', 'modelscope',
+                   'mistral_api'],
 }
 
 _RE_CODE_FENCE = re.compile(

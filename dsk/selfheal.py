@@ -95,6 +95,7 @@ HEALABLE: Dict[str, Path] = {
     'groq': _BASE / 'providers' / 'groq_provider.py',
     'cerebras': _BASE / 'providers' / 'cerebras_provider.py',
     'modelscope': _BASE / 'providers' / 'modelscope_provider.py',
+    'mistral_api': _BASE / 'providers' / 'mistral_api_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -116,6 +117,7 @@ _MODULE_NAMES = {
     'groq': 'dsk.providers.groq_provider',
     'cerebras': 'dsk.providers.cerebras_provider',
     'modelscope': 'dsk.providers.modelscope_provider',
+    'mistral_api': 'dsk.providers.mistral_api_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -156,6 +158,7 @@ _PROVIDER_CLASSES = {
     'groq': 'GroqProvider',
     'cerebras': 'CerebrasProvider',
     'modelscope': 'ModelScopeProvider',
+    'mistral_api': 'MistralApiProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -203,6 +206,9 @@ _EVIDENCE_PATTERNS = {
     'modelscope': [r'api-inference\.modelscope\.cn[A-Za-z0-9_/{}$.\\-]{0,60}',
                      r'ms-[0-9a-fA-F]{8}-', r'Authentication failed',
                      r'request_id'],
+    'mistral_api': [r'api\.mistral\.ai[A-Za-z0-9_/{}$.\\-]{0,60}',
+                    r'Invalid API Key', r'max_context_length',
+                    r'console\.mistral\.ai'],
 }
 
 
@@ -486,7 +492,8 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'huggingchat': 'https://huggingface.co/chat',
             'groq': 'https://groq.com',
             'cerebras': 'https://cerebras.ai',
-            'modelscope': 'https://modelscope.cn'}.get(name, '')
+            'modelscope': 'https://modelscope.cn',
+            'mistral_api': 'https://mistral.ai'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []

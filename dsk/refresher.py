@@ -129,7 +129,8 @@ def _jar_path(name: str) -> Path:
              'huggingchat': 'huggingchat_cookies.json',
              'groq': 'groq_cookies.json',
              'cerebras': 'cerebras_cookies.json',
-             'modelscope': 'modelscope_cookies.json'}
+             'modelscope': 'modelscope_cookies.json',
+             'mistral_api': 'mistral_api_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -276,7 +277,8 @@ def _load_jar(name: str) -> Dict[str, str]:
                    'qwen': ('token', 'QWEN_TOKEN'),
                    'groq': ('api_key', 'GROQ_API_KEY'),
                    'cerebras': ('api_key', 'CEREBRAS_API_KEY'),
-                   'modelscope': ('api_key', 'MODELSCOPE_API_KEY')}.get(name)
+                   'modelscope': ('api_key', 'MODELSCOPE_API_KEY'),
+                   'mistral_api': ('api_key', 'MISTRAL_API_KEY')}.get(name)
         if primary:
             jar.setdefault(primary[0], (os.getenv(primary[1], '') or '').strip())
     return {k: v for k, v in jar.items() if k and v and k != 'cookies'}
@@ -458,6 +460,16 @@ def _has_creds(name: str) -> bool:
         if os.getenv('MODELSCOPE_API_KEY', '').strip():
             return True
         jar = _load_jar('modelscope')
+        return bool(jar.get('api_key') or jar.get('key')
+                    or jar.get('token'))
+    if name == 'mistral_api':
+        # Free-tier API key from console.mistral.ai. The env var merges
+        # into the jar under api_key (see _load_jar); any accepted key
+        # name counts as provisioned - liveness is checked by the
+        # refresh rung (Bearer /models).
+        if os.getenv('MISTRAL_API_KEY', '').strip():
+            return True
+        jar = _load_jar('mistral_api')
         return bool(jar.get('api_key') or jar.get('key')
                     or jar.get('token'))
     if name == 'mistral':
@@ -1158,6 +1170,43 @@ def refresh_modelscope() -> Tuple[bool, str]:
     return True, f'API token valid ({n} models visible)'
 
 
+def refresh_mistral_api() -> Tuple[bool, str]:
+    """Validate the Mistral API key against GET /v1/models.
+
+    A live free-tier key answers 200 with the model catalog (a bare
+    JSON array); an invalid key answers 401 with a flat FastAPI body
+    {"detail": "Invalid API Key"}. A 429 still proves the key is
+    accepted (auth runs before rate limiting), so it reads as alive;
+    any other status is inconclusive - the authoritative check runs
+    at request time.
+    """
+    if not _has_creds('mistral_api'):
+        return False, ('no mistral API credentials - set MISTRAL_API_KEY '
+                       'or create a free key in console.mistral.ai '
+                       '(mistral_api_cookies.json)')
+    key = (_load_jar('mistral_api').get('api_key')
+           or os.getenv('MISTRAL_API_KEY', '')).strip()
+    try:
+        resp = _http_get('https://api.mistral.ai/v1/models', {},
+                         headers={'Authorization': f'Bearer {key}',
+                                  'Accept': 'application/json'})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (401, 403):
+        return False, ('API key rejected - create a new free key in '
+                       'console.mistral.ai (api-keys page)')
+    if resp.status_code == 429:
+        return True, 'rate limited but key accepted (HTTP 429)'
+    if resp.status_code != 200:
+        return True, (f'key reachable, liveness inconclusive (HTTP '
+                      f'{resp.status_code}) - validated at request time')
+    try:
+        n = len(resp.json() or [])
+    except ValueError:
+        n = 0
+    return True, f'API key valid ({n} models visible)'
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
@@ -1169,6 +1218,7 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'groq': refresh_groq,
            'cerebras': refresh_cerebras,
            'modelscope': refresh_modelscope,
+           'mistral_api': refresh_mistral_api,
            'arena': _manual_only(
                'arena',
                'session cookie required (browser login → arena_cookies.json '
@@ -3138,6 +3188,88 @@ def signup_modelscope() -> Tuple[bool, str]:
             _close_page(page)
 
 
+def signup_mistral_api() -> Tuple[bool, str]:
+    """Create a console.mistral.ai account and harvest a free API key.
+
+    Flow (browser): console.mistral.ai sign-up (email) -> emailed OTP
+    code -> logged in -> /api-keys -> create key -> the opaque token
+    is displayed once -> scrape it and store it in the mistral_api
+    jar under api_key (the exact token the provider reads). A
+    phone-verification wall is probed honestly.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://console.mistral.ai/sign-up')
+        time.sleep(8)
+        # probe the form before spending a disposable mailbox
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
+                           'probe@example.invalid'):
+            return False, ('mistral signup form not found (email '
+                           'field, phone/SSO wall likely) - create a '
+                           'free key in console.mistral.ai/api-keys '
+                           'and set MISTRAL_API_KEY manually')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _click_any(page, ['Continue', 'Sign up', 'Sign in', 'Register',
+                          '注册', '登录'])
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='mistral')
+        if not code:
+            code = mailgen.fetch_otp(session, max_wait_s=60,
+                                     sender_needle='')
+        if not code:
+            return False, 'mistral verification email not found'
+        if not _fill_first(page, ['css:input[name=code]',
+                                  '@placeholder:code',
+                                  'css:input[inputmode=numeric]',
+                                  'css:input[type=tel]',
+                                  'css:input[type=text]'], code):
+            return False, 'code field not found'
+        _click_any(page, ['Verify', 'Continue', 'Submit', '验证'])
+        time.sleep(10)
+        page.get('https://console.mistral.ai/api-keys')
+        time.sleep(6)
+        if not _click_any(page, ['Create new key', 'Create key',
+                                 'New key', 'Create API key']):
+            return False, ('create-key button not found on '
+                           'console.mistral.ai/api-keys')
+        time.sleep(4)
+        key = ''
+        try:
+            key = str(page.run_js(
+                'let hit="";'
+                'for (const el of document.querySelectorAll('
+                '"input,textarea,code,pre,div,span")) {'
+                'const t = el.value || el.textContent || "";'
+                'const m = t.match(/[A-Za-z0-9]{32,}/);'
+                'if (m && !/example|placeholder/i.test(t)) '
+                '{ hit = m[0]; break; } }'
+                'return hit;') or '')
+        except Exception:  # noqa: BLE001
+            pass
+        if not key:
+            return False, ('signup finished but no API key found '
+                           '(captcha or verification wall likely) - '
+                           'create a key in console.mistral.ai/api-keys '
+                           'and set MISTRAL_API_KEY manually')
+        _save_jar('mistral_api', {'api_key': key, 'email': email})
+        _save_account('mistral_api', email, '', session.get('backend', ''))
+        return True, (f'account created, API key saved '
+                      f'({session.get("backend")}: {email})')
+    except Exception as e:  # noqa: BLE001
+        return False, f'mistral_api signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
 _MISTRAL_AUTH = 'https://auth.mistral.ai'
 
 
@@ -4284,6 +4416,7 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'groq': signup_groq,
           'cerebras': signup_cerebras,
           'modelscope': signup_modelscope,
+          'mistral_api': signup_mistral_api,
           'arena': _manual_only(
               'arena',
               'signup requires an allowlisted email domain '
