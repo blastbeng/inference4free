@@ -101,6 +101,11 @@ HEALABLE: Dict[str, Path] = {
     'google_ai_studio': _BASE / 'providers' / 'google_ai_studio_provider.py',
     'cohere': _BASE / 'providers' / 'cohere_provider.py',
     'cloudflare': _BASE / 'providers' / 'cloudflare_provider.py',
+    'meta': _BASE / 'providers' / 'meta_provider.py',
+    'blackbox': _BASE / 'providers' / 'blackbox_provider.py',
+    't3chat': _BASE / 'providers' / 't3chat_provider.py',
+    'innerai': _BASE / 'providers' / 'innerai_provider.py',
+    'adapta': _BASE / 'providers' / 'adapta_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -128,6 +133,11 @@ _MODULE_NAMES = {
     'google_ai_studio': 'dsk.providers.google_ai_studio_provider',
     'cohere': 'dsk.providers.cohere_provider',
     'cloudflare': 'dsk.providers.cloudflare_provider',
+    'meta': 'dsk.providers.meta_provider',
+    'blackbox': 'dsk.providers.blackbox_provider',
+    't3chat': 'dsk.providers.t3chat_provider',
+    'innerai': 'dsk.providers.innerai_provider',
+    'adapta': 'dsk.providers.adapta_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -174,6 +184,11 @@ _PROVIDER_CLASSES = {
     'google_ai_studio': 'GoogleAiStudioProvider',
     'cohere': 'CohereProvider',
     'cloudflare': 'CloudflareProvider',
+    'meta': 'MetaProvider',
+    'blackbox': 'BlackboxProvider',
+    't3chat': 'T3ChatProvider',
+    'innerai': 'InnerAiProvider',
+    'adapta': 'AdaptaProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -238,6 +253,19 @@ _EVIDENCE_PATTERNS = {
     'cloudflare': [r'api\.cloudflare\.com[A-Za-z0-9_/{}$.\\-]{0,60}',
                    r'Authentication error', r'object identifier is invalid',
                    r'dash\.cloudflare\.com'],
+    'meta': [r'api\\.meta\\.ai/v1[A-Za-z0-9_/{}$.\\-]{0,60}',
+             r'invalid_api_key', r'authentication_error',
+             r'developers\\.meta\\.ai'],
+    'blackbox': [r'api\\.blackbox\\.ai[A-Za-z0-9_/{}$.\\-]{0,60}',
+                 r'chat/completions', r'Invalid API key',
+                 r'docs\\.blackbox\\.ai'],
+    't3chat': [r'www\\.t3\\.chat/api/chat[A-Za-z0-9_/{}$.\\-]{0,60}',
+               r'text-delta', r'vercel security checkpoint',
+               r'parts'],
+    'innerai': [r'inner\\.ai/api[A-Za-z0-9_/{}$.\\-]{0,60}',
+                r'I4F_INNERAI_CHAT_URL', r'session'],
+    'adapta': [r'adapta\\.org[A-Za-z0-9_/{}$.\\-]{0,60}',
+               r'I4F_ADAPTA_CHAT_URL', r'Adapta One'],
 }
 
 

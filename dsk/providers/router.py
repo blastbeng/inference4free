@@ -110,6 +110,11 @@ PROVIDER_MODULES = (
     ('google_ai_studio', '.google_ai_studio_provider', 'GoogleAiStudioProvider'),
     ('cohere', '.cohere_provider', 'CohereProvider'),
     ('cloudflare', '.cloudflare_provider', 'CloudflareProvider'),
+    ('meta', '.meta_provider', 'MetaProvider'),
+    ('blackbox', '.blackbox_provider', 'BlackboxProvider'),
+    ('t3chat', '.t3chat_provider', 'T3ChatProvider'),
+    ('innerai', '.innerai_provider', 'InnerAiProvider'),
+    ('adapta', '.adapta_provider', 'AdaptaProvider'),
 )
 
 OWNED_BY = {
@@ -137,6 +142,11 @@ OWNED_BY = {
     'google_ai_studio': 'google',
     'cohere': 'cohere',
     'cloudflare': 'cloudflare',
+    'meta': 'meta',
+    'blackbox': 'blackbox',
+    't3chat': 't3chat',
+    'innerai': 'inner-ai',
+    'adapta': 'adapta',
 }
 
 # Public model-id namespaces: every model surfaced via /v1/models and the
@@ -169,6 +179,11 @@ PUBLIC_PREFIX = {
     'google_ai_studio': 'google-ai-studio',
     'cohere': 'cohere',
     'cloudflare': 'cloudflare',
+    'meta': 'meta',
+    'blackbox': 'blackbox',
+    't3chat': 't3chat',
+    'innerai': 'inner-ai',
+    'adapta': 'adapta',
 }
 
 # Reverse of PUBLIC_PREFIX: 'z.ai' -> 'glm', used by resolve() so both the
@@ -434,7 +449,8 @@ AUTO_CATEGORIES: Dict[str, List[str]] = {
     'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral',
                     'kimi', 'pollinations', 'huggingchat', 'arena', 'groq', 'cerebras', 'modelscope',
                    'mistral_api', 'openrouter', 'llm7', 'google_ai_studio', 'cohere',
-                   'cloudflare'],
+                   'cloudflare', 'meta', 'blackbox', 't3chat', 'innerai',
+                   'adapta'],
 }
 
 _RE_CODE_FENCE = re.compile(

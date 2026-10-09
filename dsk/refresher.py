@@ -1522,6 +1522,169 @@ def refresh_cloudflare() -> Tuple[bool, str]:
     return True, f'API key valid ({total} models visible)'
 
 
+
+# ---------------------------------------------------------------- Meta
+def refresh_meta() -> Tuple[bool, str]:
+    """Validate the Muse Spark preview key against GET /v1/models.
+
+    The OpenAI-compatible catalog needs the bearer (401 OpenAI-style
+    {"error":{"code":"invalid_api_key"}} without one); 200 returns the
+    model list without burning tokens. The preview is US-developers-only,
+    so a geo-block reads as 403 — the detail says so.
+    """
+    if not _has_creds('meta'):
+        return False, ('no meta credentials - create a free preview key at '
+                       'developers.meta.ai and set META_API_KEY or '
+                       'meta_cookies.json')
+    key = (_load_jar('meta').get('api_key')
+           or os.getenv('META_API_KEY', '')).strip()
+    try:
+        resp = _http_get('https://api.meta.ai/v1/models', {},
+                         headers={'Authorization': f'Bearer {key}',
+                                  'Accept': 'application/json'})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (401, 403):
+        return False, ('API key rejected (403 may be geo: the preview is '
+                       'US-only) - create a new key at developers.meta.ai')
+    if resp.status_code == 429:
+        return True, 'rate limited but key accepted (HTTP 429)'
+    if resp.status_code != 200:
+        return True, (f'key reachable, liveness inconclusive (HTTP '
+                      f'{resp.status_code}) - validated at request time')
+    try:
+        models = ((resp.json() or {}).get('data') or [])
+    except Exception:  # noqa: BLE001
+        models = []
+    return True, f'API key valid ({len(models)} models visible)'
+
+
+def refresh_blackbox() -> Tuple[bool, str]:
+    """Validate the Blackbox key with a 1-token completion.
+
+    There is no unauthenticated models endpoint, so liveness costs one
+    free-tier token. 401/403 -> rejected; 429 still proves the key routed
+    (auth runs before rate limiting).
+    """
+    if not _has_creds('blackbox'):
+        return False, ('no blackbox credentials - create a key per '
+                       'docs.blackbox.ai and set BLACKBOX_API_KEY or '
+                       'blackbox_cookies.json')
+    key = (_load_jar('blackbox').get('api_key')
+           or os.getenv('BLACKBOX_API_KEY', '')).strip()
+    import requests as _rq
+    try:
+        resp = _rq.post('https://api.blackbox.ai/chat/completions',
+                        headers={'Authorization': f'Bearer {key}',
+                                 'Content-Type': 'application/json',
+                                 'User-Agent': _UA},
+                        json={'model': 'deepseek-chat',
+                              'messages': [{'role': 'user',
+                                            'content': 'ping'}],
+                              'stream': False, 'max_tokens': 1},
+                        timeout=60,
+                        **_proxies_kwargs('https://api.blackbox.ai'))
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (401, 403):
+        return False, ('API key rejected - create a new key per '
+                       'docs.blackbox.ai')
+    if resp.status_code == 429:
+        return True, 'rate limited but key accepted (HTTP 429)'
+    if resp.status_code != 200:
+        return True, (f'key reachable, liveness inconclusive (HTTP '
+                      f'{resp.status_code}) - validated at request time')
+    return True, 'API key valid (1-token completion OK)'
+
+
+def refresh_t3chat() -> Tuple[bool, str]:
+    """Verify the t3.chat session against the app root.
+
+    200 = cookies alive; 429/403 = the Vercel Security Checkpoint (cookies
+    stale or the egress IP is blocklisted — redo the browser login).
+    """
+    if not _has_creds('t3chat'):
+        return False, ('no t3chat cookies - browser login at www.t3.chat '
+                       'then save them to t3chat_cookies.json or set '
+                       'T3CHAT_COOKIES')
+    jar = _load_jar('t3chat')
+    cookies = {k: v for k, v in jar.items()
+               if k not in ('api_key', 'email')}
+    try:
+        resp = _http_get('https://www.t3.chat/', cookies,
+                         headers={'Accept': 'text/html'})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (429, 403):
+        return False, (f'Vercel Security Checkpoint (HTTP '
+                       f'{resp.status_code}) - cookies stale or egress '
+                       'blocklisted; redo the browser login')
+    if resp.status_code != 200:
+        return False, (f'session rejected (HTTP {resp.status_code}) - '
+                       'redo the browser login')
+    return True, 'session cookies valid'
+
+
+def refresh_innerai() -> Tuple[bool, str]:
+    """Presence check + honest endpoint gap report (host resets raw TLS).
+
+    inner.ai is login-only and connection-resets every non-browser egress
+    path, so the cookies come from the shared browser and the chat
+    endpoint must be RE'd from the authenticated session before the
+    provider goes live (I4F_INNERAI_CHAT_URL).
+    """
+    if not _has_creds('innerai'):
+        return False, ('no inner.ai cookies - browser login at inner.ai '
+                       '(raw TLS is connection-reset from this egress, the '
+                       'shared browser is the only path) then save them to '
+                       'innerai_cookies.json or set INNERAI_COOKIES')
+    if not (os.getenv('I4F_INNERAI_CHAT_URL', '') or '').strip():
+        return True, ('cookies present; chat endpoint still not '
+                      'reverse-engineered (set I4F_INNERAI_CHAT_URL) - '
+                      'provider stays dormant')
+    jar = _load_jar('innerai')
+    cookies = {k: v for k, v in jar.items()
+               if k not in ('api_key', 'email')}
+    try:
+        resp = _http_get('https://inner.ai/', cookies, timeout=20)
+    except Exception as e:  # noqa: BLE001
+        return True, (f'cookies present; host unreachable from this egress '
+                      f'({type(e).__name__}) - session unverified')
+    if resp.status_code == 200:
+        return True, 'session cookies valid'
+    return True, (f'session reachable, inconclusive '
+                  f'(HTTP {resp.status_code})')
+
+
+def refresh_adapta() -> Tuple[bool, str]:
+    """Presence check + honest endpoint gap report (no public API found).
+
+    adapta.org is a login-only workspace; cookies come from the shared
+    browser and the chat endpoint must be RE'd from the authenticated
+    session before the provider goes live (I4F_ADAPTA_CHAT_URL).
+    """
+    if not _has_creds('adapta'):
+        return False, ('no adapta cookies - browser login at adapta.org '
+                       'then save them to adapta_cookies.json or set '
+                       'ADAPTA_COOKIES')
+    if not (os.getenv('I4F_ADAPTA_CHAT_URL', '') or '').strip():
+        return True, ('cookies present; chat endpoint still not '
+                      'reverse-engineered (set I4F_ADAPTA_CHAT_URL) - '
+                      'provider stays dormant')
+    jar = _load_jar('adapta')
+    cookies = {k: v for k, v in jar.items()
+               if k not in ('api_key', 'email')}
+    try:
+        resp = _http_get('https://adapta.org/', cookies, timeout=20)
+    except Exception as e:  # noqa: BLE001
+        return True, (f'cookies present; host unreachable from this egress '
+                      f'({type(e).__name__}) - session unverified')
+    if resp.status_code == 200:
+        return True, 'session cookies valid'
+    return True, (f'session reachable, inconclusive '
+                  f'(HTTP {resp.status_code})')
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
@@ -1539,6 +1702,11 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'google_ai_studio': refresh_google_ai_studio,
            'cohere': refresh_cohere,
            'cloudflare': refresh_cloudflare,
+          'meta': refresh_meta,
+          'blackbox': refresh_blackbox,
+          't3chat': refresh_t3chat,
+          'innerai': refresh_innerai,
+          'adapta': refresh_adapta,
            'arena': _manual_only(
                'arena',
                'session cookie required (browser login → arena_cookies.json '
@@ -5346,6 +5514,385 @@ def signup_perplexity() -> Tuple[bool, str]:
                   f'(user {user.get("email") or user.get("id")})')
 
 
+
+def _scrape_api_key(page, min_len: int = 24) -> str:
+    """Best-effort API-key scrape from the current page.
+
+    Inputs first (a freshly created key is usually echoed into an input),
+    then text nodes; keys are 24-64 chars of [A-Za-z0-9_-] with at least
+    one digit or dash (so it never matches a username).
+    """
+    import re as _re
+    pattern = ('[A-Za-z0-9][A-Za-z0-9_-]{%d,64}' % (min_len - 1))
+    guard = _re.compile(r'^(?=.*[0-9_-])' + pattern + '$')
+    js = (
+        'let hit="";'
+        'const RX=/(' + pattern + ')/;'
+        'for (const el of document.querySelectorAll("input,textarea")) {'
+        'const t=(el.value||"").trim();'
+        'if (RX.test(t)) { hit=t.match(RX)[1]; break; } }'
+        'if (!hit) {'
+        'for (const el of document.querySelectorAll("code,pre,div,span,td")) {'
+        'const t=(el.value||el.textContent||"");'
+        'if (t.length<200 && RX.test(t)) { hit=t.match(RX)[1]; break; } } }'
+        'return hit;')
+    try:
+        key = str(page.run_js(js) or '').strip()
+    except Exception:  # noqa: BLE001
+        return ''
+    if key and guard.match(key):
+        return key
+    return ''
+
+
+def signup_meta() -> Tuple[bool, str]:
+    """Create a Meta developer account and harvest a Muse Spark API key.
+
+    Flow (browser, US egress): developers.meta.ai -> login/register ->
+    email form probed (SSO-only walls are reported honestly) -> emailed
+    verification -> dashboard key creation -> the key is scraped into the
+    meta jar under api_key. The preview is US-only, so the browser runs on
+    the signup proxy ladder when one is configured.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://developers.meta.ai/')
+        time.sleep(8)
+        _dismiss_consents(page)
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
+            return False, ('meta login form not found (SSO-only wall '
+                           'likely) - create a key at developers.meta.ai '
+                           'and set META_API_KEY manually')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _click_any(page, ['Continue', 'Sign up', 'Next', 'Log in',
+                          'Register'])
+        time.sleep(8)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='meta')
+        link = None
+        if not code:
+            link = mailgen.fetch_magic_link(session, url_needle='meta',
+                                            max_wait_s=240)
+        if not code and not link:
+            return False, 'meta verification email not found'
+        if code:
+            if not _fill_first(page, ['css:input[name=code]',
+                                      '@placeholder:code',
+                                      'css:input[inputmode=numeric]',
+                                      'css:input[type=tel]',
+                                      'css:input[type=text]'], code):
+                return False, 'code field not found'
+            _click_any(page, ['Verify', 'Continue', 'Submit'])
+        else:
+            page.get(link)
+        time.sleep(10)
+        # key creation: probe the obvious dashboard controls, then scrape
+        page.run_js('window.scrollBy(0, 600);')
+        _click_any(page, ['Create API key', 'Create key', 'Create Key',
+                          'Generate API key', 'New API key', 'API Keys',
+                          'Get API key', 'Start building'])
+        time.sleep(5)
+        key = _scrape_api_key(page)
+        if not key:
+            return False, ('signup finished but no API key found '
+                           '(dashboard layout changed or verification '
+                           'wall) - create a key at developers.meta.ai '
+                           'and set META_API_KEY manually')
+        _save_jar('meta', {'api_key': key, 'email': email})
+        _save_account('meta', email, '', session.get('backend', ''))
+        return True, (f'account created, API key saved '
+                      f'({session.get("backend")}: {email})')
+    except Exception as e:  # noqa: BLE001
+        return False, f'meta signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
+def signup_blackbox() -> Tuple[bool, str]:
+    """Create a Blackbox account and harvest an inference API key.
+
+    Flow (browser): blackbox.ai signup -> email + password (Google-only
+    walls are reported honestly) -> emailed verification -> key creation
+    -> the key is scraped into the blackbox jar under api_key.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://www.blackbox.ai/')
+        time.sleep(8)
+        _dismiss_consents(page)
+        _click_any(page, ['Sign up', 'Sign Up', 'Get started', 'Login',
+                          'Log in'])
+        time.sleep(5)
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
+            return False, ('blackbox signup form not found (Google-only '
+                           'wall likely) - create a key per '
+                           'docs.blackbox.ai and set BLACKBOX_API_KEY '
+                           'manually')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        password = session.get('password') or mailgen.gen_password()
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _fill_first(page, _PASSWORD_SELECTORS, password)
+        _click_any(page, ['Continue', 'Sign up', 'Sign Up', 'Next',
+                          'Register'])
+        time.sleep(8)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='blackbox')
+        link = None
+        if not code:
+            link = mailgen.fetch_magic_link(session,
+                                            url_needle='blackbox',
+                                            max_wait_s=240)
+        if not code and not link:
+            return False, 'blackbox verification email not found'
+        if code:
+            if not _fill_first(page, ['css:input[name=code]',
+                                      '@placeholder:code',
+                                      'css:input[inputmode=numeric]',
+                                      'css:input[type=text]'], code):
+                return False, 'code field not found'
+            _click_any(page, ['Verify', 'Continue', 'Submit'])
+        else:
+            page.get(link)
+        time.sleep(10)
+        page.get('https://www.blackbox.ai/settings/api-keys')
+        time.sleep(6)
+        _click_any(page, ['Create API key', 'Create key', 'Create Key',
+                          'Generate API key', 'New key'])
+        time.sleep(4)
+        key = _scrape_api_key(page)
+        if not key:
+            return False, ('signup finished but no API key found '
+                           '(dashboard layout changed) - create a key '
+                           'per docs.blackbox.ai and set BLACKBOX_API_KEY '
+                           'manually')
+        _save_jar('blackbox', {'api_key': key, 'email': email})
+        _save_account('blackbox', email, password,
+                      session.get('backend', ''))
+        return True, (f'account created, API key saved '
+                      f'({session.get("backend")}: {email})')
+    except Exception as e:  # noqa: BLE001
+        return False, f'blackbox signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
+def signup_t3chat() -> Tuple[bool, str]:
+    """Log into t3.chat with a disposable mailbox and save the session.
+
+    Flow (browser): www.t3.chat/sign-in -> email -> emailed magic link
+    (opened in the same session to pass the Vercel checkpoint) -> the full
+    cookie set is CDP-dumped into the t3chat jar.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://www.t3.chat/sign-in')
+        time.sleep(8)
+        _dismiss_consents(page)
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
+            return False, ('t3.chat sign-in form not found (Google-only '
+                           'wall likely) - log in manually and save the '
+                           'cookies to t3chat_cookies.json')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _click_any(page, ['Continue', 'Sign in', 'Sign In', 'Log in',
+                          'Submit', 'Send'])
+        time.sleep(8)
+        link = mailgen.fetch_magic_link(session, url_needle='t3.chat',
+                                        max_wait_s=240)
+        code = None
+        if not link:
+            code = mailgen.fetch_otp(session, max_wait_s=60,
+                                     sender_needle='t3')
+        if not link and not code:
+            return False, 't3.chat verification email not found'
+        if link:
+            page.get(link)
+            time.sleep(10)
+        else:
+            if not _fill_first(page, ['css:input[name=code]',
+                                      'css:input[inputmode=numeric]',
+                                      'css:input[type=text]'], code):
+                return False, 'verification code field not found'
+            _click_any(page, ['Verify', 'Continue', 'Submit'])
+            time.sleep(8)
+        page.get('https://www.t3.chat/')
+        time.sleep(6)
+        saved = _export_cookies(page, 't3chat',
+                                ('.t3.chat', 't3.chat'))
+        if not saved:
+            return False, ('login finished but no session cookies found '
+                           '(checkpoint or email-domain blocklist likely)')
+        _save_account('t3chat', email, '', session.get('backend', ''))
+        return True, (f'login done, cookies saved '
+                      f'({session.get("backend")}: {email})')
+    except Exception as e:  # noqa: BLE001
+        return False, f't3chat signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
+def signup_innerai() -> Tuple[bool, str]:
+    """Log into inner.ai with a disposable mailbox and save the session.
+
+    inner.ai resets raw TLS from this egress, so this rung is the ONLY
+    path in (the shared browser renders fine). Cookies land in the
+    innerai jar; the chat endpoint is then RE'd from the authenticated
+    session and plugged via I4F_INNERAI_CHAT_URL.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://inner.ai/')
+        time.sleep(8)
+        _dismiss_consents(page)
+        _click_any(page, ['Log in', 'Log In', 'Sign in', 'Sign In',
+                          'Get started', 'Sign up'])
+        time.sleep(5)
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
+            return False, ('inner.ai login form not found (SSO-only wall '
+                           'likely) - log in manually and save the cookies '
+                           'to innerai_cookies.json')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _click_any(page, ['Continue', 'Next', 'Sign in', 'Log in',
+                          'Submit'])
+        time.sleep(8)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='inner')
+        link = None
+        if not code:
+            link = mailgen.fetch_magic_link(session, url_needle='inner',
+                                            max_wait_s=240)
+        if not code and not link:
+            return False, 'inner.ai verification email not found'
+        if code:
+            if not _fill_first(page, ['css:input[name=code]',
+                                      '@placeholder:code',
+                                      'css:input[inputmode=numeric]',
+                                      'css:input[type=text]'], code):
+                return False, 'code field not found'
+            _click_any(page, ['Verify', 'Continue', 'Submit'])
+        else:
+            page.get(link)
+        time.sleep(10)
+        saved = _export_cookies(page, 'innerai',
+                                ('.inner.ai', 'inner.ai'))
+        if not saved:
+            return False, ('login finished but no session cookies found '
+                           '(captcha or email-domain blocklist likely)')
+        _save_account('innerai', email, '', session.get('backend', ''))
+        return True, (f'login done, cookies saved '
+                      f'({session.get("backend")}: {email}); next: RE the '
+                      'chat endpoint and set I4F_INNERAI_CHAT_URL')
+    except Exception as e:  # noqa: BLE001
+        return False, f'innerai signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
+def signup_adapta() -> Tuple[bool, str]:
+    """Log into adapta.org with a disposable mailbox and save the session.
+
+    adapta.org is login-only (Framer marketing site fronts the app);
+    cookies land in the adapta jar; the chat endpoint is then RE'd from
+    the authenticated session and plugged via I4F_ADAPTA_CHAT_URL.
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://adapta.org/')
+        time.sleep(8)
+        _dismiss_consents(page)
+        _click_any(page, ['Log in', 'Log In', 'Sign in', 'Sign In',
+                          'Entrar', 'Entrar na plataforma',
+                          'Get started', 'Começar'])
+        time.sleep(6)
+        if not _has_field(page, _CHATGPT_EMAIL_SELECTORS):
+            return False, ('adapta login form not found (SSO-only wall '
+                           'likely) - log in manually and save the cookies '
+                           'to adapta_cookies.json')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        password = session.get('password') or mailgen.gen_password()
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _fill_first(page, _PASSWORD_SELECTORS, password)
+        _click_any(page, ['Continue', 'Next', 'Entrar', 'Sign in',
+                          'Log in', 'Submit'])
+        time.sleep(8)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='adapta')
+        link = None
+        if not code:
+            link = mailgen.fetch_magic_link(session,
+                                            url_needle='adapta',
+                                            max_wait_s=240)
+        if not code and not link:
+            return False, 'adapta verification email not found'
+        if code:
+            if not _fill_first(page, ['css:input[name=code]',
+                                      '@placeholder:code',
+                                      'css:input[inputmode=numeric]',
+                                      'css:input[type=text]'], code):
+                return False, 'code field not found'
+            _click_any(page, ['Verify', 'Continue', 'Submit',
+                              'Confirmar'])
+        else:
+            page.get(link)
+        time.sleep(10)
+        saved = _export_cookies(page, 'adapta',
+                                ('.adapta.org', 'adapta.org'))
+        if not saved:
+            return False, ('login finished but no session cookies found '
+                           '(captcha or email-domain blocklist likely)')
+        _save_account('adapta', email, password,
+                      session.get('backend', ''))
+        return True, (f'login done, cookies saved '
+                      f'({session.get("backend")}: {email}); next: RE the '
+                      'chat endpoint and set I4F_ADAPTA_CHAT_URL')
+    except Exception as e:  # noqa: BLE001
+        return False, f'adapta signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
 SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'gemini': signup_gemini,
           'claude': signup_claude,
@@ -5367,6 +5914,11 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'google_ai_studio': signup_google_ai_studio,
           'cohere': signup_cohere,
           'cloudflare': signup_cloudflare,
+          'meta': signup_meta,
+          'blackbox': signup_blackbox,
+          't3chat': signup_t3chat,
+          'innerai': signup_innerai,
+          'adapta': signup_adapta,
           'arena': _manual_only(
               'arena',
               'signup requires an allowlisted email domain '
