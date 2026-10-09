@@ -208,6 +208,9 @@ class FirstTokenTimeoutError(ProviderUnavailableError):
         super().__init__(message)
 
 
+
+
+
 class Provider:
     """Base class every provider must implement.
 
@@ -226,6 +229,20 @@ class Provider:
     """
 
     name: str = ''
+
+    # Discovery-cost hint for the router's two-wave model discovery (see
+    # dsk/providers/router.py): providers whose ``list_models`` boots a
+    # browser (relay picker / web-app scraping) or crawls a slow site set
+    # ``discovery_slow = True`` and are discovered SEQUENTIALLY after the
+    # parallel HTTP tier — a cold 8GB host must not spawn several Chromiums
+    # at once. Default False: an undeclared provider is assumed to be a
+    # cheap HTTP call and joins the parallel wave. The knowledge lives HERE
+    # (the provider owns the fact that it is heavy) — the router never
+    # hardcodes provider names. Runtime measurement backs the declaration
+    # up: a provider whose measured discovery EWMA exceeds the router's
+    # I4F_DISCOVERY_SLOW_ABOVE_S is sequenced on later passes even without
+    # a declaration.
+    discovery_slow: bool = False
 
     def available(self, auth_key: Optional[str] = None) -> bool:
         """Whether this provider has usable credentials configured."""

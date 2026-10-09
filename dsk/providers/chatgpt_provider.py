@@ -198,6 +198,10 @@ def _is_thinking_model(entry: Dict[str, Any]) -> bool:
 class ChatGPTProvider(Provider):
     name = 'chatgpt'
 
+    # picker discovery falls back to the anonymous browser relay — discovered sequentially, not in the parallel HTTP
+    # wave (see Provider.discovery_slow in base.py).
+    discovery_slow = True
+
     def __init__(self) -> None:
         # Stable device id: ChatGPT rejects requests without one, and a fresh
         # random id per process trips "Unusual activity has been detected"

@@ -334,6 +334,10 @@ class _QwenPunish(ProviderUnavailableError):
 class QwenProvider(Provider):
     name = 'qwen'
 
+    # anon picker discovery runs through the browser relay — discovered sequentially, not in the parallel HTTP
+    # wave (see Provider.discovery_slow in base.py).
+    discovery_slow = True
+
     # ---------------------------------------------------------------- provider
     def available(self, auth_key: Optional[str] = None) -> bool:
         # Guest relay mode needs no credentials: qwen models stay listed even

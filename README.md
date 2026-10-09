@@ -384,7 +384,12 @@ curl -s http://localhost:${I4F_PORT:-8000}/health
 
 Unknown model ids are routed by fuzzy match, and per-model fallback
 chains (`I4F_FALLBACKS` / `I4F_DEFAULT_FALLBACKS`) kick in automatically
-when a provider fails.
+when a provider fails. A **last-resort cross-provider net**
+(`I4F_FALLBACK_NET`, on by default) additionally backstops every leaf
+model and scoped router (`deepseek/auto`, …): when their own chain is
+exhausted — a muted account fails every sibling with one auth error —
+the request is served by the fastest healthy provider instead of
+erroring. Set `I4F_FALLBACK_NET=0` to surface provider-own errors.
 
 When adding or auditing a provider, keep the pool metadata honest: every
 route must advertise `thinking_enabled: true` **iff** it can — or is called
@@ -543,6 +548,7 @@ A llama.cpp-style chat playground is served at `http://localhost:${I4F_PORT:-800
 | `I4F_MODELS_TTL` | `300` | Seconds between dynamic model re-discovery across providers |
 | `I4F_FALLBACKS` | *(none)* | JSON map of per-model fallback chains, e.g. `{"deepseek-chat": ["deepseek-reasoner"]}` |
 | `I4F_DEFAULT_FALLBACKS` | *(none)* | Comma-separated fallbacks applied to every route |
+| `I4F_FALLBACK_NET` | `1` | Last-resort cross-provider net behind leaf/scoped chains — a dead provider (muted account) can never error a request while others are healthy; `0` disables |
 | `I4F_MAX_RETRIES` / `I4F_RETRY_BACKOFF` | `2` / `2.0` | Retries per provider before falling back + exponential backoff base (seconds) |
 | `I4F_RETRY_CAP` | `10` | Cap for a single retry wait (honored `Retry-After` included) — lower = faster fallback |
 | `I4F_FIRST_TOKEN_TIMEOUT` | `180` | Seconds a provider may take to emit its FIRST chunk before the router gives up on it and falls back immediately (0 disables) |

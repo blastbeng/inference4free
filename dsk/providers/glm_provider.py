@@ -841,6 +841,10 @@ def _zai_ask(prompt: str, upstream: str, thinking: bool,
 class GlmProvider(Provider):
     name = 'glm'
 
+    # z.ai picker discovery boots the pooled Chromium — discovered sequentially, not in the parallel HTTP
+    # wave (see Provider.discovery_slow in base.py).
+    discovery_slow = True
+
     # ---------------------------------------------------------------- provider
     def available(self, auth_key: Optional[str] = None) -> bool:
         return _browser_enabled() or bool(_refresh_token())

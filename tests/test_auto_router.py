@@ -149,12 +149,21 @@ def test_auto_chain_rotates_across_every_healthy_provider(tmp):
         'deepseek': FakeProvider('deepseek', [{'id': 'deepseek-chat'}]),
         'qwen': FakeProvider('qwen', [{'id': 'qwen-max'}]),
     })
+    # unmeasured BROWSER providers (qwen relay: 60-90s cold boot) park at the
+    # back until they earn a latency data point — they must never open a
+    # request with a full cold boot
     heads = []
     for _ in range(6):
         chain = router._auto_chain('general')
         assert len(chain) == 6, chain          # every model of every provider
+        assert chain[-1] == 'qwen-max', chain  # parked, still in the chain
         heads.append(router.routes[chain[0]].provider_name)
-    assert set(heads) == {'glm', 'deepseek', 'qwen'}, heads
+    assert set(heads) == {'glm', 'deepseek'}, heads
+    # once measured FAST, qwen joins the head rotation like everyone else
+    router._lat['qwen'] = 1.0
+    heads = {router.routes[router._auto_chain('general')[0]].provider_name
+             for _ in range(6)}
+    assert 'qwen' in heads, heads
 
 
 def test_auto_chain_covers_providers_outside_the_category_tables(tmp):
@@ -182,8 +191,12 @@ def test_failed_provider_is_demoted_out_of_the_chain_front(tmp):
 
         chunks = list(router.stream(router.resolve('auto'), 'hello'))
         assert chunks[0]['served_by'] == 'glm/glm-4.7'
+        # unmeasured browser-relay providers never lead a chain (cold boot),
+        # so glm served and chatgpt was not even reached
+        assert chatgpt.calls == []
 
-        # the outcome is remembered: chatgpt no longer leads the chain ...
+        # a real failure IS remembered: chatgpt no longer counts healthy ...
+        router._mark_failed('chatgpt', 'auth wall')
         assert router._healthy_model('gpt-5') is False
         chain = router._auto_chain('general')
         assert router.routes[chain[0]].provider_name == 'glm'
@@ -232,6 +245,10 @@ def test_auto_router_serves_the_next_provider_not_the_first_one(tmp):
         working = {name: FakeProvider(name, [{'id': f'{name}-m'}])
                    for name in ('glm', 'deepseek', 'qwen')}
         router = build_router({**broken, **working})
+        # qwen is a browser-relay provider: give it a measured-fast data
+        # point so it takes part in the head rotation (unmeasured it parks
+        # behind the HTTP providers by design)
+        router._lat['qwen'] = 1.0
 
         served = []
         for _ in range(6):
@@ -563,12 +580,13 @@ def test_chain_exhaustion_names_every_failed_provider(tmp):
         try:
             list(router.stream(route, 'hi'))
             raise AssertionError('expected the chain to exhaust into an error')
-        except ProviderAuthError as e:
+        except ProviderError as e:
             msg = str(e)
-    # the LAST provider's exception type is preserved (auth -> 401 mapping)
-    assert 'deepseek account muted' in msg
-    # and the full chain history travels with it
+    # the LAST provider's exception type is preserved (chatgpt's browser
+    # relay is an unmeasured browser provider, so it walks after deepseek)
     assert 'relay busy with another stream' in msg
+    # and the full chain history travels with it
+    assert 'deepseek account muted' in msg
     assert 'fallback chain exhausted' in msg
 
 
@@ -585,6 +603,155 @@ def test_single_provider_failure_message_stays_untouched(tmp):
             raise AssertionError('expected the provider error to surface')
         except ProviderError as e:
             assert str(e) == 'relay busy with another stream'
+
+
+# --------------------------------- cross-provider LAST-RESORT safety net
+
+def _muted_specs():
+    """The live incident: the deepseek account is muted (biz_code=5) — every
+    deepseek model fails with the same provider-wide auth error — while other
+    providers are healthy."""
+    deepseek = FakeProvider('deepseek', [
+        {'id': 'deepseek-chat'},
+        {'id': 'deepseek-reasoner', 'thinking_enabled': True},
+        {'id': 'deepseek-search', 'search_enabled': True},
+    ], error=ProviderAuthError('deepseek account muted '
+                               '(biz_code=5: user is muted)'))
+    glm = FakeProvider('glm', [{'id': 'glm-4.7'}])
+    return {'deepseek': deepseek, 'glm': glm}
+
+
+def test_muted_scoped_router_is_rescued_by_the_cross_provider_net(tmp):
+    """'deepseek/auto' with a muted account must be SERVED by another
+    provider, never surface 'fallback chain exhausted' to the client."""
+    providers = _muted_specs()
+    deepseek, glm = providers['deepseek'], providers['glm']
+    router = build_router(providers)
+    with no_refresher(), no_retries():
+        chunks = list(router.stream(router.resolve('deepseek/auto'), 'hi'))
+    # served, by a provider OUTSIDE the scoped router's own registry
+    assert any(c.get('content') == 'glm:glm-4.7' for c in chunks), chunks
+    assert chunks[0]['served_by'] == 'glm/glm-4.7'
+    # the muted provider was tried once and its siblings were skipped
+    # (provider-wide auth failure) — the request did not crawl all models
+    assert deepseek.calls == ['deepseek-chat']
+    assert glm.calls == ['glm-4.7']
+
+    # the NEXT request within the demotion window skips deepseek entirely:
+    # a dead provider costs zero attempts — quick fallback, every time
+    with no_refresher(), no_retries():
+        chunks = list(router.stream(router.resolve('deepseek/auto'), 'hi'))
+    assert chunks[0]['served_by'] == 'glm/glm-4.7'
+    assert deepseek.calls == ['deepseek-chat']
+    assert glm.calls == ['glm-4.7', 'glm-4.7']
+
+
+def test_leaf_model_without_fallbacks_gets_the_cross_provider_net(tmp):
+    """A leaf request (deepseek/deepseek-chat, no I4F_FALLBACKS configured —
+    the operator default) must degrade to a healthy provider instead of
+    dying with the provider's own error."""
+    providers = _muted_specs()
+    glm = providers['glm']
+    router = build_router(providers)
+    with no_refresher(), no_retries():
+        chunks = list(router.stream(
+            router.resolve('deepseek/deepseek-chat'), 'hi'))
+    assert chunks[0]['served_by'] == 'glm/glm-4.7'
+    assert glm.calls == ['glm-4.7']
+
+
+def test_pool_router_net_keeps_the_pool_contract(tmp):
+    """The net backstops pool routers WITHOUT breaking their strict thinking
+    partition: auto-fast may only be rescued by never-thinking models."""
+    deepseek = FakeProvider('deepseek', [{'id': 'deepseek-chat'}],
+                            error=ProviderAuthError('deepseek account muted '
+                                                    '(biz_code=5)'))
+    glm = FakeProvider('glm', [{'id': 'glm-4.7', 'thinking_enabled': True}])
+    pollinations = FakeProvider('pollinations',
+                                [{'id': 'pollinations-text'}])
+    router = build_router({'deepseek': deepseek, 'glm': glm,
+                           'pollinations': pollinations})
+
+    # auto-fast: the thinking glm model must NOT serve — the never-thinking
+    # anonymous tier does
+    with no_refresher(), no_retries():
+        chunks = list(router.stream(router.resolve('deepseek/auto-fast'),
+                                    'hi'))
+    assert chunks[0]['served_by'] == 'pollinations/pollinations-text'
+    assert glm.calls == [], 'auto-fast must never serve a thinking model'
+
+    # auto-thinking: deepseek lists no thinking model at all -> the scoped
+    # chain is empty and fails CLEANLY (the net never relaxes the contract
+    # into a non-thinking answer)
+    with no_refresher(), no_retries():
+        try:
+            list(router.stream(router.resolve('deepseek/auto-thinking'),
+                               'hi'))
+            raise AssertionError('expected the clean pool error')
+        except ProviderError as e:
+            assert 'no thinking-capable models in its pool' in str(e)
+
+
+def test_fallback_net_can_be_disabled(tmp):
+    """I4F_FALLBACK_NET=0 restores the legacy provider-own-error behavior."""
+    saved = router_mod.FALLBACK_NET
+    router_mod.FALLBACK_NET = False
+    try:
+        providers = _muted_specs()
+        glm = providers['glm']
+        router = build_router(providers)
+        with no_refresher(), no_retries():
+            try:
+                list(router.stream(
+                    router.resolve('deepseek/deepseek-chat'), 'hi'))
+                raise AssertionError('expected the provider error to surface')
+            except ProviderAuthError as e:
+                assert 'deepseek account muted' in str(e)
+        assert glm.calls == []
+    finally:
+        router_mod.FALLBACK_NET = saved
+
+
+# ------------------------------------ text chains are never served images
+
+def test_image_models_never_serve_text_requests(tmp):
+    """'say OK' on auto-fast came back as ![image](…) — an image-render
+    model that rotation luck put at the head of the pool. Image-gen routes
+    are out of text chains (auto + safety net) whenever text routes exist."""
+    pollinations = FakeProvider('pollinations', [
+        {'id': 'openai-fast'},
+        {'id': 'sana', 'image_gen': True},
+    ])
+    deepseek = FakeProvider('deepseek', [{'id': 'deepseek-chat'}])
+    router = build_router({'pollinations': pollinations, 'deepseek': deepseek})
+
+    # the global auto-fast pool: the image model must not serve text
+    chain = router._auto_chain('general', pool='fast')
+    assert 'sana' not in chain, chain
+    assert 'openai-fast' in chain
+    # the net behind a scoped/leaf chain: same rule
+    net = router._safety_net(['deepseek-chat'])
+    assert 'sana' not in net, net
+    assert 'openai-fast' in net
+    # image-gen requests keep their own dedicated chain (unchanged)
+    img_chain = router._auto_chain('image_gen')
+    assert 'sana' in img_chain
+
+
+def test_unmeasured_browser_providers_never_lead_a_chain(tmp):
+    """Right after a restart the latency table is empty and plain rotation
+    opened fallback walks with a browser-relay cold boot (qwen stalled a
+    deepseek/auto rescue for 180s). Unmeasured browser providers rotate
+    AFTER every unmeasured HTTP provider."""
+    providers = ['chatgpt', 'qwen', 'pollinations', 'groq']
+    router = build_router({p: FakeProvider(p, [{'id': 'm'}])
+                           for p in providers})
+    for _ in range(6):  # rotation moves the front; the tail order is fixed
+        ordered = router._tier_order(providers, 'general')
+        assert ordered.index('chatgpt') > ordered.index('pollinations'), ordered
+        assert ordered.index('qwen') > ordered.index('groq'), ordered
+        assert ordered[-2:] == ['chatgpt', 'qwen'] or \
+               ordered[-2:] == ['qwen', 'chatgpt'], ordered
 
 
 # ------------------------------------------------------------- runner

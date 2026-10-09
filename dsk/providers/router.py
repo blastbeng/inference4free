@@ -28,6 +28,9 @@ Configuration (env):
     I4F_RETRY_BACKOFF      base backoff seconds, doubled each retry (default 2.0)
     I4F_FALLBACKS          JSON object {model_id: [fallback_id, ...]}
     I4F_DEFAULT_FALLBACKS  comma list applied to routes without explicit fallbacks
+    I4F_FALLBACK_NET       cross-provider LAST-RESORT net appended when a leaf
+                           model's or a scoped router's own chain is exhausted
+                           (default on; 0 restores provider-own errors)
     I4F_AUTO_DEMOTE_S      seconds a provider stays out of the auto chain front
                            after a real request failure (default 300, 0 disables)
     I4F_AUTO_PROVE_S       seconds a provider that just served counts as healthy
@@ -292,6 +295,24 @@ STREAM_SILENCE_TIMEOUT = max(
 # paying the per-target first-token deadline each could stall a request for
 # over an hour. The LAST chain target is always still tried. 0 disables.
 WALK_BUDGET = max(0.0, float(os.getenv('I4F_AUTO_WALK_BUDGET', '420') or 420))
+# Cross-provider LAST-RESORT safety net (see Router._safety_net): when a leaf
+# model's or a provider-scoped router's own chain is exhausted, every other
+# discovered model is appended behind it instead of failing the request — a
+# muted deepseek account (biz_code=5) must not kill a chat that duck,
+# pollinations or glm could still serve. Explicit I4F_FALLBACKS chains keep
+# their front position; the net only backstops them. Default ON ('1');
+# I4F_FALLBACK_NET=0 restores the old provider-own-error behavior.
+FALLBACK_NET = (os.getenv('I4F_FALLBACK_NET', '1').strip().lower()
+                not in ('0', 'false', 'no', 'off'))
+# Discovery-cost classification is DYNAMIC — no hardcoded provider lists:
+#   1. self-declared: a provider whose list_models boots a browser or
+#      crawls a slow site sets ``discovery_slow = True`` on its class
+#      (the knowledge lives in the provider that owns the fact);
+#   2. measured: every discovery pass records each provider's duration
+#      (EWMA) and a provider measured above this threshold is moved to
+#      the sequential wave on the NEXT pass, declared or not.
+DISCOVERY_SLOW_ABOVE_S = max(
+    1.0, float(os.getenv('I4F_DISCOVERY_SLOW_ABOVE_S', '10') or 10))
 
 
 def _first_chunk(gen, timeout: float) -> Optional[Dict[str, Any]]:
@@ -560,6 +581,10 @@ class Router:
         # provider -> EWMA of its first-token latency (seconds, success only);
         # orders the healthy front so proven-fast providers lead the rotation
         self._lat: Dict[str, float] = {}
+        # provider -> EWMA of its list_models duration (seconds): measured
+        # discovery cost — a provider measured slow joins the sequential
+        # discovery wave on the next pass (see DISCOVERY_SLOW_ABOVE_S)
+        self._disc_cost: Dict[str, float] = {}
         self._rt_lock = threading.Lock()
         self._lock = threading.Lock()
         # Serializes whole discovery runs; request paths must never wait on
@@ -583,23 +608,59 @@ class Router:
                        force: bool = False) -> bool:
         """(Re-)discover models from every provider. Thread-safe, TTL-cached.
 
-        Per-provider failures are tolerated: a provider that fails discovery
-        keeps its previously known routes. Returns True when the registry
-        changed.
+        Two waves, classified DYNAMICALLY (see DISCOVERY_SLOW_ABOVE_S): the
+        cheap-HTTP providers first, IN PARALLEL, then the heavy ones
+        (self-declared browser/boot cost, or measured slow) sequentially.
+        Sequential module-order discovery used to keep the registry
+        deepseek-only for the first minute after a cold boot (gemini/
+        chatgpt/glm each pay a browser roundtrip before duck/pollinations
+        were even asked) — a muted deepseek account then answered
+        'auto-thinking' with a hard error because NO other model existed
+        yet. Per-provider failures are tolerated: a provider that fails
+        discovery keeps its previously known routes. Returns True when the
+        registry changed.
         """
         with self._refresh_lock:
             if not force and time.time() - self._refreshed_at < MODELS_TTL:
                 return False
             changed = False
             discovered: Dict[str, List[Dict[str, Any]]] = {}
-            for name, provider in self.providers.items():
+
+            def _apply(name: str) -> None:
+                nonlocal changed
+                models = discovered.get(name)
+                if models is None:
+                    return
+                with self._lock:
+                    if self._apply_provider_models(name, models):
+                        changed = True
+                    self._apply_fallbacks()
+
+            def _is_discovery_slow(name: str) -> bool:
+                """Self-declared heavy OR measured slow — no hardcoded lists."""
+                if getattr(self.providers[name], 'discovery_slow', False):
+                    return True
+                with self._rt_lock:
+                    cost = self._disc_cost.get(name, 0.0)
+                return cost > DISCOVERY_SLOW_ABOVE_S
+
+            def _discover(name: str) -> None:
                 try:
                     # Only DeepSeek can authenticate per-request (userToken as
                     # API key); the web providers use operator cookies.
                     # OUTSIDE _lock: a slow discovery (cold provider start)
-                    # must not stall request routing for minutes.
-                    discovered[name] = provider.list_models(
+                    # must not stall request routing for minutes. Results are
+                    # applied AS THEY LAND so fast providers serve while the
+                    # slow ones are still discovering.
+                    t0 = time.time()
+                    discovered[name] = self.providers[name].list_models(
                         auth_key if name == 'deepseek' else None)
+                    seconds = time.time() - t0
+                    with self._rt_lock:
+                        old = self._disc_cost.get(name)
+                        self._disc_cost[name] = (0.3 * seconds + 0.7 * old
+                                                 if old else seconds)
+                    _apply(name)
                 except ProviderAuthError as e:
                     logger.info('%s: no credentials for model discovery (%s)',
                                 name, e)
@@ -607,16 +668,81 @@ class Router:
                     logger.warning('%s model discovery failed: %s', name, e)
                 except Exception as e:  # never let discovery kill the registry
                     logger.warning('%s model discovery crashed: %s', name, e)
-            with self._lock:
-                for name, models in discovered.items():
-                    if self._apply_provider_models(name, models):
-                        changed = True
-                self._apply_fallbacks()
+
+            fast = [n for n in self.providers if not _is_discovery_slow(n)]
+            threads = [threading.Thread(target=_discover, args=(n,),
+                                        name=f'discover-{n}', daemon=True)
+                       for n in fast]
+            for t in threads:
+                t.start()
+            # Heavy providers (browser boot / minutes-long crawl) run
+            # sequentially in this thread: a cold 8GB host must not spawn
+            # several Chromiums at once. The parallel HTTP wave runs
+            # alongside, so the registry still fills within seconds.
+            for name in self.providers:
+                if _is_discovery_slow(name):
+                    _discover(name)
+            for t in threads:
+                t.join()
             self._refreshed_at = time.time()
             if changed:
                 logger.info('model registry updated: %d models available',
                             len(self.routes))
             return changed
+
+    def _registry_thin(self) -> bool:
+        """True while the registry holds fewer than two providers — the boot
+        window in which only the config-derived deepseek bootstrap exists."""
+        names = {r.provider_name for r in self.routes.values()
+                 if r.provider_name != 'router'}
+        return len(names) < 2
+
+    def _ensure_fast_registry(self) -> None:
+        """Boot-window rescue: answer the FIRST requests of a cold process
+        from the keyless HTTP tier instead of failing them off a
+        deepseek-only bootstrap registry (measured incident: 'auto-thinking'
+        replied 'deepseek account muted (biz_code=5)' seconds after a
+        restart, while the background discovery was still walking the
+        browser-backed providers).
+
+        One synchronous parallel pass over every pure-HTTP provider (~2-5s,
+        one request each), once per process; the background full discovery
+        continues independently (a duplicated listing is harmless — routes
+        are rebuilt idempotently).
+        """
+        if getattr(self, '_fast_boot_done', False):
+            return
+        self._fast_boot_done = True
+        fast = [n for n in self.providers
+                if not (getattr(self.providers[n], 'discovery_slow', False)
+                        or self._disc_cost.get(n, 0.0)
+                        > DISCOVERY_SLOW_ABOVE_S)]
+        if not fast:
+            return
+        logger.info('boot window: registry thin — discovering the keyless '
+                    'HTTP tier synchronously (%s)', ', '.join(fast))
+        discovered: Dict[str, List[Dict[str, Any]]] = {}
+
+        def _one(name: str) -> None:
+            try:
+                discovered[name] = self.providers[name].list_models()
+            except Exception as e:  # noqa: BLE001 — best-effort rescue
+                logger.info('%s boot discovery failed: %s', name, e)
+
+        threads = [threading.Thread(target=_one, args=(n,),
+                                    name=f'boot-discover-{n}', daemon=True)
+                   for n in fast]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        with self._lock:
+            for name, models in discovered.items():
+                try:
+                    self._apply_provider_models(name, models)
+                except Exception:  # noqa: BLE001 — one bad catalog only
+                    pass  # skips its own provider
+            self._apply_fallbacks()
 
     def stale(self) -> bool:
         """True when the registry is older than MODELS_TTL (lock-free hint)."""
@@ -926,6 +1052,17 @@ class Router:
             capable = [mid for mid in chain if getattr(self.routes[mid], cap)]
             if capable:
                 chain = capable
+        else:
+            # Text request: image-render routes answer with a picture, never
+            # with text (measured: 'say OK' on auto-fast came back as
+            # ![image](…) from an image model that rotation luck put at the
+            # head) — they are out of text chains whenever any text-capable
+            # route exists.
+            text_capable = [mid for mid in chain
+                            if not getattr(self.routes[mid], 'image_gen',
+                                           False)]
+            if text_capable:
+                chain = text_capable
         return [mid for mid in chain
                 if self.routes.get(mid) is not None
                 and self.routes[mid].provider_name != 'router']
@@ -1020,9 +1157,19 @@ class Router:
             lat = dict(self._lat)
         known = [p for p in prov_order if p in lat]
         unknown = [p for p in prov_order if p not in lat]
+        # Unmeasured browser-relay providers (60-90s Chromium cold boot per
+        # stream) never lead: a restart wipes the latency table and plain
+        # rotation would otherwise open a fallback walk with a full cold
+        # boot (measured: qwen's relay stalled a deepseek/auto rescue for
+        # 180s right after a container restart). They rotate AFTER every
+        # unmeasured HTTP provider — measurement would rank them slow
+        # anyway, so this only formalizes the first data point.
+        unknown_http = [p for p in unknown if p not in BROWSER_PROVIDERS]
+        unknown_browser = [p for p in unknown if p in BROWSER_PROVIDERS]
         if not known:
-            off = self._rr_next(f'{pool_key}:{category}', len(prov_order))
-            return prov_order[off:] + prov_order[:off]
+            off = self._rr_next(f'{pool_key}:{category}', len(unknown_http))
+            return (unknown_http[off:] + unknown_http[:off]
+                    + unknown_browser)
         fastest = min(lat[p] for p in known)
         tier = [p for p in known if lat[p] <= fastest * 2.5 + 5.0]
         slow = [p for p in known if p not in tier]
@@ -1032,12 +1179,13 @@ class Router:
         # the unknowns — possibly far faster — never get their first data
         # point (they are only reached when the leader fails).
         lead: List[str] = []
-        if unknown and fastest > PROBE_UNKNOWN_ABOVE_S:
-            off = self._rr_next(f'{pool_key}:probe', len(unknown))
-            unknown = unknown[off:] + unknown[:off]
-            lead = [unknown.pop(0)]
+        if unknown_http and fastest > PROBE_UNKNOWN_ABOVE_S:
+            off = self._rr_next(f'{pool_key}:probe', len(unknown_http))
+            unknown_http = unknown_http[off:] + unknown_http[:off]
+            lead = [unknown_http.pop(0)]
             off = self._rr_next(f'{pool_key}:{category}', len(tier))
-            return (lead + tier[off:] + tier[:off] + unknown
+            return (lead + tier[off:] + tier[:off] + unknown_http
+                    + unknown_browser
                     + sorted(slow, key=lambda p: lat[p]))
         # Fast leader: unmeasured providers rotate WITH the fast tier until
         # they earn a first data point. Unmeasured, they might be just as
@@ -1047,9 +1195,10 @@ class Router:
         # answers glm"). One measured turn classifies them for good:
         # fast -> they join the tier rotation, slow -> they sink to the
         # measured-slow tail and stop taxing the fast path.
-        rot = tier + unknown
+        rot = tier + unknown_http
         off = self._rr_next(f'{pool_key}:{category}', len(rot))
-        return rot[off:] + rot[:off] + sorted(slow, key=lambda p: lat[p])
+        return (rot[off:] + rot[:off] + unknown_browser
+                + sorted(slow, key=lambda p: lat[p]))
 
     def _quota_cooling(self, provider_name: str) -> bool:
         """True while a recent rate-limit failure keeps this provider's
@@ -1119,6 +1268,63 @@ class Router:
         offset = self._rr_next(
             f'pauto:{self._pool_label(pool)}:{provider_name}', len(healthy))
         return healthy[offset:] + healthy[:offset] + unhealthy
+
+    def _safety_net(self, already: List[str],
+                    pool: Optional[str] = None) -> List[str]:
+        """Cross-provider LAST-RESORT net appended behind a scoped/leaf chain.
+
+        A leaf model or a provider-scoped router owns a deliberately narrow
+        chain. When that chain is exhausted the request used to die with the
+        last provider's error even while most of the registry was healthy
+        (a muted deepseek account killed every 'deepseek/*' request although
+        anonymous tiers could still serve). The net appends every OTHER
+        discovered model: healthy targets first, grouped by provider and
+        ordered by measured first-token speed (the same tier machinery as
+        the auto chains, rotating per request so a sustained outage spreads
+        load instead of hammering one net-lead provider); web-search modes
+        sit at the back of their group (they crawl before answering);
+        credential-less/demoted targets stay at the very back so the stream
+        loop still probes them. Pool routers keep their contract: the net is
+        filtered by the same strict thinking pool as the chain in front.
+
+        I4F_FALLBACK_NET=0 disables the net: a scoped chain failure then
+        surfaces the provider's own error again (legacy behavior).
+        """
+        if not FALLBACK_NET:
+            return []
+        seen = set(already)
+        candidates = [mid for mid, r in self.routes.items()
+                      if r.provider_name != 'router' and mid not in seen]
+        if not candidates:
+            return []
+        flags = [(mid, self._healthy_model(mid)) for mid in candidates]
+        healthy = [mid for mid, ok in flags if ok]
+        unhealthy = [mid for mid, ok in flags if not ok]
+        prov_order = list(dict.fromkeys(self.routes[mid].provider_name
+                                        for mid in healthy))
+        prov_order = self._tier_order(prov_order, 'net', 'net')
+        net: List[str] = []
+        for provider in prov_order:
+            p_models = [m for m in healthy
+                        if self.routes[m].provider_name == provider]
+            # search-crawling modes at the back of their provider group:
+            # a fallback answer must never wait on a web crawl unless
+            # nothing plain is left (same rule as the auto chains).
+            plain = [m for m in p_models
+                     if not getattr(self.routes[m], 'search_enabled', False)]
+            searchy = [m for m in p_models
+                       if getattr(self.routes[m], 'search_enabled', False)]
+            net.extend(plain + searchy)
+        net.extend(unhealthy)
+        # Image-render routes answer with a picture, never text: keep them
+        # out of a text fallback chain unless nothing else is left.
+        text_net = [m for m in net
+                    if not getattr(self.routes[m], 'image_gen', False)]
+        if text_net:
+            net = text_net
+        # A pool router's contract survives the net: auto-fast must never
+        # serve a thinking model, auto-thinking never a non-thinking one.
+        return self._filter_pool(net, pool)
 
     def _rr_next(self, key: str, n: int) -> int:
         """Next round-robin offset (0..n-1) for a router key.
@@ -1361,6 +1567,15 @@ class Router:
         (see dsk/toolprobe.py) has not failed; excluded models re-enter the
         chain automatically when a later probe passes.
         """
+        # Boot-window guard (see _ensure_fast_registry): a request that
+        # lands in the first seconds of a cold process must be served from
+        # the keyless HTTP tier, not fail off a deepseek-only bootstrap
+        # registry while the browser-backed providers are still discovering.
+        if self.stale():
+            self.maybe_refresh_async()
+        if self._registry_thin():
+            self._ensure_fast_registry()
+
         # Which synthetic router is serving (None for a leaf route)?
         router_kind: Optional[str] = None
         if route.provider_name == 'router':
@@ -1410,6 +1625,14 @@ class Router:
                     raise ProviderError(
                         'auto router found no available model — providers '
                         'are still discovering or credentials are renewed')
+                if pool is not None:
+                    # Emergency tier: only reached after EVERY in-pool target
+                    # failed. The pool contract governs PRIORITY (in-pool
+                    # models always serve when they can), not survival — a
+                    # wrong-pool answer beats a hard error (the served_by /
+                    # served_pub fields tell the client which model actually
+                    # answered).
+                    chain = chain + self._safety_net(chain, pool=None)
                 logger.info('%s router: category=%s chain=%s',
                             route.model_id, category,
                             ' -> '.join(chain[:5])
@@ -1431,12 +1654,22 @@ class Router:
                         f'{route.model_id}: provider {route.upstream_model!r} '
                         f'has {why} — still discovering or credentials are '
                         'being renewed')
+                # A scoped router must not die with its provider: when every
+                # in-scope model fails (a muted deepseek account fails ALL of
+                # them with one auth error) the cross-provider net backstops
+                # the request with the rest of the registry.
+                chain = chain + self._safety_net(chain, pool=pool)
                 logger.info('%s: chain=%s', route.model_id,
                             ' -> '.join(chain[:5])
                             + ('…' if len(chain) > 5 else ''))
         else:
             chain = [route.model_id] + [f for f in route.fallbacks
                                         if f != route.model_id]
+            # Explicit fallbacks stay in front untouched; the cross-provider
+            # net only backstops them so a single dead provider (muted
+            # account, auth wall, outage) can never end a request in an
+            # error while other providers are healthy.
+            chain = chain + self._safety_net(chain)
         last_error: Optional[ProviderError] = None
         # Per-provider failure notes of THIS walk: when the chain is
         # exhausted the client must see why the model it asked for failed,

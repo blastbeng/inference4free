@@ -185,6 +185,11 @@ class HuggingChatProvider(Provider):
 
     name = 'huggingchat'
 
+    # cold site crawl — documented minutes-long first discovery; run
+    # sequentially, not in the parallel HTTP wave (see Provider.
+    # discovery_slow in base.py).
+    discovery_slow = True
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._catalog_ts = 0.0
