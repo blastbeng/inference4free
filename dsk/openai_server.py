@@ -66,7 +66,7 @@ from .providers.base import (
     fetch_image_bytes,
     parse_data_uri,
 )
-from .providers.router import Router, public_model_id
+from .providers.router import Router, is_router_model_id, public_model_id
 
 HOST = os.getenv("I4F_HOST", "0.0.0.0")
 PORT = int(os.getenv("I4F_PORT", "8000"))
@@ -317,8 +317,8 @@ def _tool_traffic_signal(pub: Optional[str], success: bool, soft: bool) -> None:
     (re-includes an excluded model instantly); a request answered without a
     call under ``tool_choice='required'`` is an unambiguous soft failure
     (K consecutive ones exclude the model). Best-effort: never raises."""
-    if not pub or pub == 'auto' or pub.endswith('/auto'):
-        return  # router entries are never probed/tracked individually
+    if not pub or is_router_model_id(pub):
+        return  # router entries (auto / auto-fast / auto-thinking, per provider) are never probed/tracked individually
     try:
         from dsk import toolprobe
         if success:
@@ -1346,7 +1346,7 @@ async def toolcall_reprobe(request: Request):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "missing 'model' (JSON body or query param)",
             "type": "invalid_request_error"}})
-    if model_id == 'auto' or model_id.endswith('/auto'):
+    if is_router_model_id(model_id):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "router models are not probed directly — reprobe "
                        "one of their leaf models instead",

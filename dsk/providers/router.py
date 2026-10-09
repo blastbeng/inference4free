@@ -39,6 +39,21 @@ served by the best available provider, falling back through all other healthy
 models on rate limits, auth failures (which also trigger an inline credential
 renewal), outages or blocks. ``auto`` is also the default when a client omits
 the model field.
+
+Two more global routers, each mirrored per provider ('<prefix>/auto-fast',
+'<prefix>/auto-thinking'), partition the discovered models by thinking
+capability (see AUTO_ROUTER_KINDS / _filter_pool):
+
+    auto-fast      ONLY models that can never think — no thinking capability
+                   or no way to activate it (and no web-search modes); served
+                   with thinking forced OFF. Zero reasoning_content output,
+                   by contract.
+    auto-thinking  ONLY thinking-capable models — always-on ones and models
+                   callable with the thinking flag active — served with
+                   thinking forced ON.
+
+The per-request ``thinking`` body flag is ignored on these two routers: the
+router id IS the contract. Plain ``auto`` keeps the legacy behavior.
 """
 
 import importlib
@@ -174,13 +189,21 @@ def public_model_id(provider_name: str, model_id: str) -> str:
     return f'{prefix}/{model_id}'
 
 
+def provider_router_id(provider_name: str, suffix: str) -> str:
+    """Public id of a provider-scoped synthetic router: '<prefix>/<suffix>'
+    (deepseek/auto, z.ai/auto-fast, alibaba/auto-thinking, …). Providers
+    without a namespace prefix use ``<provider_name>/<suffix>`` so the id can
+    never collide with the global routers ('auto', 'auto-fast',
+    'auto-thinking')."""
+    prefix = PUBLIC_PREFIX.get(provider_name)
+    base = prefix if prefix else provider_name
+    return f'{base}/{suffix}'
+
+
 def provider_auto_id(provider_name: str) -> str:
     """Public id of a provider-scoped auto router (deepseek/auto, z.ai/auto,
-    alibaba/auto, …). Providers without a namespace prefix use
-    ``<provider_name>/auto`` so the id can never collide with the global
-    ``auto`` smart router."""
-    prefix = PUBLIC_PREFIX.get(provider_name)
-    return f'{prefix}/auto' if prefix else f'{provider_name}/auto'
+    alibaba/auto, …)."""
+    return provider_router_id(provider_name, AUTO_MODEL_ID)
 
 MAX_RETRIES = int(os.getenv('I4F_MAX_RETRIES', '2'))
 RETRY_BACKOFF = float(os.getenv('I4F_RETRY_BACKOFF', '2.0'))
@@ -370,6 +393,36 @@ def _parse_fallbacks() -> Dict[str, List[str]]:
 # (available()) and every other discovered model is appended as a safety net.
 # ---------------------------------------------------------------------------
 AUTO_MODEL_ID = 'auto'
+# Pool routers (global + one per provider, '<prefix>/auto-fast' and
+# '<prefix>/auto-thinking'): a strict disjoint partition of the discovered
+# models by thinking capability.
+#   auto-fast     ONLY models that can NEVER think: no thinking capability at
+#                 all, or no way to activate it (metadata thinking_enabled
+#                 False, and for auto-fast also no web-search modes).
+#   auto-thinking ONLY models that can think — always-on models and models
+#                 callable with the thinking flag active — served with
+#                 thinking FORCED ON.
+# The per-request `thinking` body flag is ignored on these two routers: the
+# router id IS the contract. Plain 'auto' keeps the legacy behavior.
+AUTO_FAST_MODEL_ID = 'auto-fast'
+AUTO_THINKING_MODEL_ID = 'auto-thinking'
+AUTO_ROUTER_KINDS = (AUTO_MODEL_ID, AUTO_FAST_MODEL_ID, AUTO_THINKING_MODEL_ID)
+
+
+def is_router_model_id(model_id: str) -> bool:
+    """True for synthetic router ids owned by the Router itself.
+
+    Matches the global routers ('auto', 'auto-fast', 'auto-thinking') and
+    every provider-scoped variant ('deepseek/auto', 'z.ai/auto-fast', …).
+    Used by the /v1 gates (tool probe, model probe, traffic signals) so a
+    router id is never probed or tracked like a leaf model. Ids are matched
+    case-insensitively, exactly like Router.resolve().
+    """
+    mid = (model_id or '').strip().lower()
+    if mid in AUTO_ROUTER_KINDS:
+        return True
+    tail = mid.rsplit('/', 1)[-1] if '/' in mid else ''
+    return tail in (AUTO_FAST_MODEL_ID, AUTO_THINKING_MODEL_ID)
 
 AUTO_CATEGORIES: Dict[str, List[str]] = {
     # pollinations leads image_gen: keyless + fast, burns no account quota
@@ -554,16 +607,19 @@ class Router:
     def _reserved_ids(self) -> Set[str]:
         """Model ids owned by the router itself.
 
-        The global ``auto`` smart router and every ``<prefix>/auto``
-        provider-scoped router are synthetic routes, not upstream models. An
-        upstream catalog that happens to expose a model literally named
-        ``auto`` (chatgpt's /backend-api/models does exactly that) must never
-        take one of these ids over: writing it into ``routes`` silently
-        replaces the smart router with that single upstream model, so every
+        The global smart routers ('auto', 'auto-fast', 'auto-thinking') and
+        every '<prefix>/<kind>' provider-scoped router are synthetic routes,
+        not upstream models. An upstream catalog that happens to expose a
+        model literally named ``auto`` (chatgpt's /backend-api/models does
+        exactly that) — or 'auto-fast' / 'auto-thinking' — must never take
+        one of these ids over: writing it into ``routes`` silently replaces
+        the router with that single upstream model, so every
         ``model: "auto"`` request stops being routed at all.
         """
-        reserved = {AUTO_MODEL_ID}
-        reserved.update(provider_auto_id(name) for name in self.providers)
+        reserved = set(AUTO_ROUTER_KINDS)
+        reserved.update(provider_router_id(name, kind)
+                        for name in self.providers
+                        for kind in AUTO_ROUTER_KINDS)
         return reserved
 
     def _apply_provider_models(self, name: str,
@@ -642,32 +698,38 @@ class Router:
                     route.fallbacks.append(fallback)
 
     # ----------------------------------------------------------- auto routing
-    def _auto_route(self) -> Route:
-        """Return (registering on first use) the synthetic 'auto' route.
+    def _auto_route(self, suffix: str = AUTO_MODEL_ID) -> Route:
+        """Return (registering on first use) a global synthetic router route
+        ('auto', 'auto-fast' or 'auto-thinking').
 
         Ownership is re-asserted, not just checked for absence: if a provider
         ever leaves a route of its own under the reserved id (an older registry,
         a hand-written ``register()`` call), the smart router takes it back
         instead of silently deferring to it forever.
         """
-        route = self.routes.get(AUTO_MODEL_ID)
+        model_id = suffix if suffix in AUTO_ROUTER_KINDS else AUTO_MODEL_ID
+        route = self.routes.get(model_id)
         if route is None or route.provider_name != 'router':
             route = Route(
-                model_id=AUTO_MODEL_ID,
+                model_id=model_id,
                 provider_name='router',
-                upstream_model='auto',
+                upstream_model=model_id,
                 vision=True, image_gen=True,
+                thinking_enabled=(model_id == AUTO_THINKING_MODEL_ID),
+                search_enabled=False,
             )
-            self.routes[AUTO_MODEL_ID] = route
+            self.routes[model_id] = route
         return route
 
-    def _provider_auto_route(self, provider_name: str) -> Route:
-        """Return (registering on first use) the synthetic '<prefix>/auto'
-        route of one provider: a smart router restricted to that provider's
-        own discovered models. Registered for every enabled provider so the
-        routes survive re-discovery (``_apply_provider_models`` never touches
-        router-owned routes)."""
-        model_id = provider_auto_id(provider_name)
+    def _provider_router_route(self, provider_name: str,
+                               suffix: str = AUTO_MODEL_ID) -> Route:
+        """Return (registering on first use) the synthetic '<prefix>/<suffix>'
+        route of one provider ('deepseek/auto', 'deepseek/auto-fast',
+        'deepseek/auto-thinking', …): a smart router restricted to that
+        provider's own discovered models. Registered for every enabled
+        provider so the routes survive re-discovery
+        (``_apply_provider_models`` never touches router-owned routes)."""
+        model_id = provider_router_id(provider_name, suffix)
         route = self.routes.get(model_id)
         if route is None or route.provider_name != 'router':
             route = Route(
@@ -675,21 +737,65 @@ class Router:
                 provider_name='router',
                 upstream_model=provider_name,
                 vision=True, image_gen=True,
+                thinking_enabled=(suffix == AUTO_THINKING_MODEL_ID),
+                search_enabled=False,
             )
             self.routes[model_id] = route
         return route
 
+    def _provider_auto_route(self, provider_name: str) -> Route:
+        """Legacy alias of the plain '<prefix>/auto' provider router."""
+        return self._provider_router_route(provider_name, AUTO_MODEL_ID)
+
     def _auto_routes(self) -> None:
-        """(Re-)register every synthetic auto route: the global smart router
-        plus one per-provider router. Called at init and after provider
-        reloads; re-discovery preserves them."""
-        self._auto_route()
+        """(Re-)register every synthetic router route: the three global
+        routers plus the three per-provider variants. Called at init and
+        after provider reloads; re-discovery preserves them."""
+        for suffix in AUTO_ROUTER_KINDS:
+            self._auto_route(suffix)
         for name in self.providers:
-            self._provider_auto_route(name)
+            for suffix in AUTO_ROUTER_KINDS:
+                self._provider_router_route(name, suffix)
+
+    @staticmethod
+    def _pool_label(pool: Optional[str]) -> str:
+        """Round-robin/tier key label of a pool: 'auto' (legacy),
+        'auto-fast', 'auto-thinking' — the router id itself, so each pool
+        rotates through the providers on its own cursor."""
+        return {None: 'auto', 'fast': 'auto-fast',
+                'thinking': 'auto-thinking'}.get(pool, 'auto')
+
+    def _filter_pool(self, ordered: List[str],
+                     pool: Optional[str]) -> List[str]:
+        """Restrict a candidate chain to one thinking pool (STRICT).
+
+        pool='fast'     only routes that can NEVER think (metadata
+                        thinking_enabled False) and that do not crawl the web
+                        (search_enabled False) — the auto-fast contract.
+        pool='thinking' only routes that can think (thinking_enabled True);
+                        search-capable ones stay, rotated to the back by the
+                        chain builder — the auto-thinking contract.
+        pool=None       legacy 'auto' behavior: no restriction.
+
+        May return an EMPTY list: an empty pool is surfaced as a clean
+        ProviderError at serve time, never relaxed into a contract violation
+        (a fast router must never serve a thinking model, whatever else is
+        available).
+        """
+        if pool not in ('fast', 'thinking'):
+            return ordered
+        routes = self.routes
+        if pool == 'fast':
+            return [mid for mid in ordered
+                    if not getattr(routes[mid], 'thinking_enabled', False)
+                    and not getattr(routes[mid], 'search_enabled', False)]
+        return [mid for mid in ordered
+                if getattr(routes[mid], 'thinking_enabled', False)]
 
     def _auto_chain(self, category: str,
                     thinking_override: Optional[bool] = None,
-                    search_override: Optional[bool] = None) -> List[str]:
+                    search_override: Optional[bool] = None,
+                    pool: Optional[str] = None) -> List[str]:
         """Build the ordered model chain for an 'auto' request.
 
         Preferred targets for the classified category come first (a provider
@@ -707,7 +813,13 @@ class Router:
         rotated too so consecutive calls from the same provider land on
         different models. Unhealthy (credential-less) targets stay at the very
         back so the stream loop still probes them.
+
+        ``pool`` restricts the chain to one thinking pool (see
+        ``_filter_pool``): 'fast' for auto-fast, 'thinking' for auto-thinking.
+        The restriction is strict — an empty pool yields an empty chain and
+        the caller raises a clean error.
         """
+        pool_key = self._pool_label(pool)
         ordered: List[str] = []
 
         def _expand(pref: str) -> None:
@@ -732,6 +844,11 @@ class Router:
                 if kept:
                     ordered = kept
 
+        # Pool contract (auto-fast / auto-thinking): strict capability filter.
+        ordered = self._filter_pool(ordered, pool)
+        if not ordered:
+            return []
+
         flags = [(mid, self._healthy_model(mid)) for mid in ordered]
         # Healthy targets first (category order preserved); credential-less
         # or offline providers stay at the very back so the stream loop
@@ -752,7 +869,7 @@ class Router:
         # on different models of that provider.
         prov_order = list(dict.fromkeys(self.routes[mid].provider_name
                                         for mid in healthy))
-        prov_order = self._tier_order(prov_order, category)
+        prov_order = self._tier_order(prov_order, category, pool_key)
         chain: List[str] = []
         for provider in prov_order:
             p_models = [mid for mid in healthy
@@ -766,7 +883,7 @@ class Router:
                      if not getattr(self.routes[m], 'search_enabled', False)]
             searchy = [m for m in p_models
                        if getattr(self.routes[m], 'search_enabled', False)]
-            m_off = self._rr_next(f'auto:{category}:{provider}',
+            m_off = self._rr_next(f'{pool_key}:{category}:{provider}',
                                   len(plain) or 1)
             chain.extend((plain[m_off:] + plain[:m_off]) + searchy)
         chain.extend(unhealthy)
@@ -847,7 +964,8 @@ class Router:
             old = self._lat.get(provider_name) or 0.0
             self._lat[provider_name] = max(old, float(seconds))
 
-    def _tier_order(self, prov_order: List[str], category: str) -> List[str]:
+    def _tier_order(self, prov_order: List[str], category: str,
+                    pool_key: str = 'auto') -> List[str]:
         """Order the healthy front by measured speed.
 
         Round-robin alone put a browser-relay provider (60-90s cold boot per
@@ -869,7 +987,7 @@ class Router:
         known = [p for p in prov_order if p in lat]
         unknown = [p for p in prov_order if p not in lat]
         if not known:
-            off = self._rr_next(f'auto:{category}', len(prov_order))
+            off = self._rr_next(f'{pool_key}:{category}', len(prov_order))
             return prov_order[off:] + prov_order[:off]
         fastest = min(lat[p] for p in known)
         tier = [p for p in known if lat[p] <= fastest * 2.5 + 5.0]
@@ -881,10 +999,10 @@ class Router:
         # point (they are only reached when the leader fails).
         lead: List[str] = []
         if unknown and fastest > PROBE_UNKNOWN_ABOVE_S:
-            off = self._rr_next('auto:probe', len(unknown))
+            off = self._rr_next(f'{pool_key}:probe', len(unknown))
             unknown = unknown[off:] + unknown[:off]
             lead = [unknown.pop(0)]
-            off = self._rr_next(f'auto:{category}', len(tier))
+            off = self._rr_next(f'{pool_key}:{category}', len(tier))
             return (lead + tier[off:] + tier[:off] + unknown
                     + sorted(slow, key=lambda p: lat[p]))
         # Fast leader: unmeasured providers rotate WITH the fast tier until
@@ -896,7 +1014,7 @@ class Router:
         # fast -> they join the tier rotation, slow -> they sink to the
         # measured-slow tail and stop taxing the fast path.
         rot = tier + unknown
-        off = self._rr_next(f'auto:{category}', len(rot))
+        off = self._rr_next(f'{pool_key}:{category}', len(rot))
         return rot[off:] + rot[:off] + sorted(slow, key=lambda p: lat[p])
 
     def _quota_cooling(self, provider_name: str) -> bool:
@@ -935,18 +1053,25 @@ class Router:
 
     def _provider_chain(self, provider_name: str,
                         thinking_override: Optional[bool] = None,
-                        search_override: Optional[bool] = None) -> List[str]:
-        """Build the ordered chain for a '<prefix>/auto' provider router.
+                        search_override: Optional[bool] = None,
+                        pool: Optional[str] = None) -> List[str]:
+        """Build the ordered chain for a '<prefix>/<kind>' provider router
+        ('deepseek/auto', 'deepseek/auto-fast', 'deepseek/auto-thinking').
 
         Every discovered model of that single provider, healthy targets
         first (the rest stay at the back so the stream loop still probes
         them — credentials can appear at any moment). Explicit thinking/
         search requests restrict the chain to routes supporting the mode.
-        The healthy front of the chain is round-robin rotated per request:
-        successive calls cycle through every healthy model.
+        ``pool`` applies the strict thinking-pool contract FIRST (see
+        ``_filter_pool``): an empty pool yields an empty chain, surfaced as
+        a clean error at serve time. The healthy front of the chain is
+        round-robin rotated per request: successive calls cycle through
+        every healthy model (per pool, so the rotations stay independent).
         """
         ordered: List[str] = [model_id for model_id, route in self.routes.items()
                               if route.provider_name == provider_name]
+        # Pool contract first: capability is a hard filter, not a preference.
+        ordered = self._filter_pool(ordered, pool)
         for flag, requested in (('thinking_enabled', thinking_override),
                                 ('search_enabled', search_override)):
             if requested:
@@ -957,7 +1082,8 @@ class Router:
         flags = [(mid, self._healthy_model(mid)) for mid in ordered]
         healthy = [mid for mid, ok in flags if ok]
         unhealthy = [mid for mid, ok in flags if not ok]
-        offset = self._rr_next(f'pauto:{provider_name}', len(healthy))
+        offset = self._rr_next(
+            f'pauto:{self._pool_label(pool)}:{provider_name}', len(healthy))
         return healthy[offset:] + healthy[:offset] + unhealthy
 
     def _rr_next(self, key: str, n: int) -> int:
@@ -1013,22 +1139,33 @@ class Router:
         Unknown ids trigger a best-effort re-discovery (the upstream may have
         added models since the last refresh); ids that are still unknown fall
         back to the default fast route, so clients sending an arbitrary name
-        still get served. An empty id or ``'auto'`` selects the smart router:
-        its serving chain is built per request from live provider state.
+        still get served. An empty id or ``'auto'`` selects the smart router;
+        ``'auto-fast'`` / ``'auto-thinking'`` select the pool routers, and
+        ``'<prefix>/<kind>'`` (deepseek/auto-fast, z.ai/auto-thinking, …) the
+        provider-scoped variants: their serving chains are built per request
+        from live provider state.
         """
         model_id = (model_id or '').strip().lower()
         if not model_id or model_id == AUTO_MODEL_ID:
             return self._auto_route()
+        if model_id in (AUTO_FAST_MODEL_ID, AUTO_THINKING_MODEL_ID):
+            return self._auto_route(model_id)
         route = self.routes.get(model_id)
         if route is not None:
             return route
-        # '<prefix>/auto' or '<provider>/auto' selects the provider-scoped
-        # smart router (deepseek/auto, z.ai/auto, alibaba/auto, glm/auto…).
-        if model_id.endswith('/auto'):
-            prefix = model_id[:-len('/auto')]
-            name = _PREFIX_TO_PROVIDER.get(prefix, prefix)
-            if name in self.providers:
-                return self._provider_auto_route(name)
+        # '<prefix>/<kind>' or '<provider>/<kind>' selects the provider-scoped
+        # smart router (deepseek/auto, z.ai/auto, deepseek/auto-fast,
+        # alibaba/auto-thinking, glm/auto…). Checked longest-suffix first so
+        # '/auto-fast' and '/auto-thinking' never parse as '/auto' + junk.
+        for suffix in (AUTO_THINKING_MODEL_ID, AUTO_FAST_MODEL_ID,
+                       AUTO_MODEL_ID):
+            tag = f'/{suffix}'
+            if model_id.endswith(tag):
+                prefix = model_id[:-len(tag)]
+                name = _PREFIX_TO_PROVIDER.get(prefix, prefix)
+                if name in self.providers:
+                    return self._provider_router_route(name, suffix)
+                break
         route = self._resolve_alias(model_id)
         if route is not None:
             return route
@@ -1064,19 +1201,29 @@ class Router:
         alibaba/qwen-3-max, …); resolve() accepts both
         the prefixed and the bare internal form.
         """
-        auto = self.routes.get(AUTO_MODEL_ID)
         entries: List[Dict[str, Any]] = []
 
         def _pub(mid: str) -> str:
             r = self.routes.get(mid)
             return public_model_id(r.provider_name, mid) if r else mid
 
-        if auto is not None:
-            # Listed first: the smart router handles every capability (it
-            # re-routes to a capable model at serve time), so clients must
-            # not pre-gate vision/image requests on its behalf.
+        # Global smart routers, listed first: they handle every capability
+        # (they re-route to a capable model at serve time), so clients must
+        # not pre-gate vision/image requests on their behalf. Advertised
+        # thinking/search flags are the CONTRACT of each router: auto-fast
+        # never thinks and never searches, auto-thinking always thinks.
+        _GLOBAL_FLAGS = {
+            AUTO_MODEL_ID: (True, True),
+            AUTO_FAST_MODEL_ID: (False, False),
+            AUTO_THINKING_MODEL_ID: (True, True),
+        }
+        for suffix in AUTO_ROUTER_KINDS:
+            router_route = self.routes.get(suffix)
+            if router_route is None or router_route.provider_name != 'router':
+                continue
+            think_meta, search_meta = _GLOBAL_FLAGS[suffix]
             entries.append({
-                'id': auto.model_id,
+                'id': router_route.model_id,
                 'object': 'model',
                 'created': 1700000000,
                 'owned_by': 'inference4free',
@@ -1084,21 +1231,36 @@ class Router:
                 'max_model_len': 131072,
                 'max_completion_tokens': 32768,
                 'max_tokens': 32768,
-                'thinking_enabled': True,
-                'search_enabled': True,
+                'thinking_enabled': think_meta,
+                'search_enabled': search_meta,
                 'vision': True,
                 'image_gen': True,
                 'fallbacks': [],
             })
-        # Per-provider smart routers (deepseek/auto, z.ai/auto, …): listed
-        # right after the global auto. Capability flags are the union of the
-        # provider's discovered models (all-True before discovery completes
-        # so clients do not pre-gate — the router filters at serve time).
+        # Per-provider smart routers (deepseek/auto, deepseek/auto-fast,
+        # z.ai/auto-thinking, …): listed right after the global ones.
+        # Capability flags are the union of the provider's DISCOVERED models
+        # in that router's pool (all-True before discovery completes so
+        # clients do not pre-gate — the router filters at serve time). The
+        # thinking/search contract flags are fixed per kind.
         for r in self.routes.values():
-            if r.provider_name != 'router' or r.model_id == AUTO_MODEL_ID:
+            if r.provider_name != 'router' or r.model_id in AUTO_ROUTER_KINDS:
                 continue
             siblings = [s for s in self.routes.values()
                         if s.provider_name == r.upstream_model]
+            tail = r.model_id.rsplit('/', 1)[-1]
+            if tail == AUTO_FAST_MODEL_ID:
+                # pool: models that can never think and never search — the
+                # unions over these siblings then advertise exactly the
+                # auto-fast contract (thinking/search always False)
+                pool_siblings = [s for s in siblings
+                                 if not s.thinking_enabled
+                                 and not s.search_enabled]
+            elif tail == AUTO_THINKING_MODEL_ID:
+                # pool: models that can think (search-capable ones included)
+                pool_siblings = [s for s in siblings if s.thinking_enabled]
+            else:
+                pool_siblings = siblings
             entries.append({
                 'id': r.model_id,
                 'object': 'model',
@@ -1108,13 +1270,16 @@ class Router:
                 'max_model_len': 131072,
                 'max_completion_tokens': 32768,
                 'max_tokens': 32768,
-                'thinking_enabled': (not siblings
-                                     or any(s.thinking_enabled for s in siblings)),
-                'search_enabled': (not siblings
-                                   or any(s.search_enabled for s in siblings)),
-                'vision': (not siblings or any(s.vision for s in siblings)),
-                'image_gen': (not siblings
-                              or any(s.image_gen for s in siblings)),
+                'thinking_enabled': (not pool_siblings
+                                     or any(s.thinking_enabled
+                                            for s in pool_siblings)),
+                'search_enabled': (not pool_siblings
+                                   or any(s.search_enabled
+                                          for s in pool_siblings)),
+                'vision': (not pool_siblings
+                           or any(s.vision for s in pool_siblings)),
+                'image_gen': (not pool_siblings
+                              or any(s.image_gen for s in pool_siblings)),
                 'fallbacks': [],
             })
         entries.extend(
@@ -1162,11 +1327,32 @@ class Router:
         (see dsk/toolprobe.py) has not failed; excluded models re-enter the
         chain automatically when a later probe passes.
         """
+        # Which synthetic router is serving (None for a leaf route)?
+        router_kind: Optional[str] = None
+        if route.provider_name == 'router':
+            if route.model_id in AUTO_ROUTER_KINDS:
+                router_kind = route.model_id
+            else:
+                tail = route.model_id.rsplit('/', 1)[-1]
+                router_kind = tail if tail in AUTO_ROUTER_KINDS else None
+
+        # Pool-router contract: the thinking flag is FORCED by the router id,
+        # never taken from the request (an 'auto-thinking' request must think,
+        # an 'auto-fast' request must not — whatever the client asked for).
+        if router_kind == AUTO_FAST_MODEL_ID:
+            thinking_override = False
+        elif router_kind == AUTO_THINKING_MODEL_ID:
+            thinking_override = True
+
         thinking = route.thinking_enabled if thinking_override is None else thinking_override
         search = route.search_enabled if search_override is None else search_override
 
         if route.provider_name == 'router':
-            if route.model_id == AUTO_MODEL_ID:
+            pool = (None if router_kind == AUTO_MODEL_ID else
+                    'fast' if router_kind == AUTO_FAST_MODEL_ID else
+                    'thinking' if router_kind == AUTO_THINKING_MODEL_ID
+                    else None)
+            if route.model_id in AUTO_ROUTER_KINDS:
                 # Global smart router: classify the request and build the
                 # chain from live provider state (preferred category models
                 # first, the rest as safety net). The loop below still
@@ -1175,25 +1361,42 @@ class Router:
                 category = classify_request(prompt, bool(images),
                                             image_generation)
                 chain = self._auto_chain(category, thinking_override,
-                                         search_override)
+                                         search_override, pool=pool)
                 if not chain:
+                    if pool == 'fast':
+                        raise ProviderError(
+                            'auto-fast router found no non-thinking model — '
+                            'providers are still discovering or credentials '
+                            'are renewed')
+                    if pool == 'thinking':
+                        raise ProviderError(
+                            'auto-thinking router found no thinking-capable '
+                            'model — providers are still discovering or '
+                            'credentials are renewed')
                     raise ProviderError(
                         'auto router found no available model — providers '
                         'are still discovering or credentials are renewed')
-                logger.info('auto router: category=%s chain=%s', category,
+                logger.info('%s router: category=%s chain=%s',
+                            route.model_id, category,
                             ' -> '.join(chain[:5])
                             + ('…' if len(chain) > 5 else ''))
             else:
-                # Provider-scoped smart router ('<prefix>/auto'): the same
-                # serve-time machinery restricted to one provider's models.
+                # Provider-scoped smart router ('<prefix>/auto-fast', …): the
+                # same serve-time machinery restricted to one provider's
+                # models and one thinking pool.
                 chain = self._provider_chain(route.upstream_model,
                                              thinking_override,
-                                             search_override)
+                                             search_override, pool=pool)
                 if not chain:
+                    why = ('no non-thinking models in its pool'
+                           if pool == 'fast' else
+                           'no thinking-capable models in its pool'
+                           if pool == 'thinking' else
+                           'no discovered models yet')
                     raise ProviderError(
                         f'{route.model_id}: provider {route.upstream_model!r} '
-                        'has no discovered models yet — still discovering or '
-                        'credentials are being renewed')
+                        f'has {why} — still discovering or credentials are '
+                        'being renewed')
                 logger.info('%s: chain=%s', route.model_id,
                             ' -> '.join(chain[:5])
                             + ('…' if len(chain) > 5 else ''))

@@ -80,6 +80,10 @@ _MODELS_TTL = 300.0
 
 # uuidv7 shape used across the payloads (time-ordered ids the web client
 # generates with crypto.randomUUID()-equivalent logic).
+# Model ids/names that stream reasoning (R1 distills, *-thinking, o1/o3-style,
+# …) — used only for the catalog 'thinking' flag (see _parse_catalog).
+_RE_THINKING = re.compile(r'(?:reasoning|thinking|[-_/]r1\b)', re.IGNORECASE)
+
 _RE_UUID = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
 
@@ -171,6 +175,15 @@ def _parse_catalog(data: Any) -> List[Dict[str, Any]]:
                 'organization': entry.get('organization') or None,
                 'vision': bool(in_caps.get('image')),
                 'image_out': bool(out_caps.get('image')),
+                # The catalog carries no explicit reasoning flag, but several
+                # arena models stream reasoning deltas (``g:"text"`` frames).
+                # The router's thinking pools partition on this flag: a
+                # hardcoded False leaked thinking models into the auto-fast
+                # pool. Explicit capabilities flag when present, id regex as
+                # the fallback (same heuristic as the other HTTP providers).
+                'thinking': (bool(caps.get('reasoning'))
+                             or bool(_RE_THINKING.search(name))
+                             or bool(_RE_THINKING.search(mid))),
             })
     return models
 
@@ -242,7 +255,7 @@ class ArenaProvider(Provider):
             out.append({
                 'id': m['public_name'],
                 'upstream_model': m['upstream'],
-                'thinking_enabled': False,
+                'thinking_enabled': bool(m.get('thinking')),
                 'search_enabled': False,
                 'vision': m['vision'],
                 'image_gen': False,

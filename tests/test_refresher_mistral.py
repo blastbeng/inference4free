@@ -32,6 +32,7 @@ No network: curl_cffi and _http_get are faked.
 
 Run:  python tests/test_refresher_mistral.py     (or: pytest tests/)
 """
+import contextlib
 import os
 import sys
 import types
@@ -70,6 +71,7 @@ def _install_fake_curl(status, recorder, payload=None):
     sys.modules['curl_cffi.requests'] = requests_mod
 
 
+@contextlib.contextmanager
 def _ctx(jar=None, env_token=None, whoami_status=200, payload=None):
     """Patch the jar/env/HTTP surface; yield the request recorder."""
     recorder = []
@@ -212,18 +214,19 @@ def test_refresh_converges_an_unverified_address():
     def fake_get(url, cookies, timeout=30, headers=None):
         return _Resp(200, payload)
 
-    old_verify = R._mistral_verify_email
-    old_accounts = R._load_accounts
-    R._mistral_verify_email = lambda email, session: (
-        seen.update(email=email) or (True, 'OTP verified'))
-    R._load_accounts = lambda: {'mistral': {'email': 'a@b.c', 'password': 'x'}}
     with _ctx(jar=JAR):
+        old = {k: getattr(R, k) for k in ('_mistral_verify_email',
+                                          '_load_accounts', '_log_history')}
+        R._mistral_verify_email = lambda email, session: (
+            seen.update(email=email) or (True, 'OTP verified'))
+        R._load_accounts = lambda: {'mistral': {'email': 'a@b.c', 'password': 'x'}}
         R._http_get = fake_get
         R._log_history = lambda *a, **k: None
-        ok, detail = R.refresh_mistral()
-    finally:
-        R._mistral_verify_email = old_verify
-        R._load_accounts = old_accounts
+        try:
+            ok, detail = R.refresh_mistral()
+        finally:
+            for k, v in old.items():
+                setattr(R, k, v)
     assert ok is True and 'verified' in detail
     assert seen['email'] == 'a@b.c'
 
@@ -231,16 +234,17 @@ def test_refresh_converges_an_unverified_address():
 def test_refresh_reports_a_failed_verification():
     payload = {'identity': {'verifiable_addresses': [{'verified': False,
                                                        'value': 'a@b.c'}]}}
-    old_verify = R._mistral_verify_email
-    old_accounts = R._load_accounts
-    R._mistral_verify_email = lambda email, session: (False, 'no OTP')
-    R._load_accounts = lambda: {'mistral': {'email': 'a@b.c', 'password': 'x'}}
     with _ctx(jar=JAR):
+        old = {k: getattr(R, k) for k in ('_mistral_verify_email',
+                                          '_load_accounts')}
+        R._mistral_verify_email = lambda email, session: (False, 'no OTP')
+        R._load_accounts = lambda: {'mistral': {'email': 'a@b.c', 'password': 'x'}}
         R._http_get = lambda url, cookies, timeout=30, headers=None: _Resp(200, payload)
-        ok, detail = R.refresh_mistral()
-    finally:
-        R._mistral_verify_email = old_verify
-        R._load_accounts = old_accounts
+        try:
+            ok, detail = R.refresh_mistral()
+        finally:
+            for k, v in old.items():
+                setattr(R, k, v)
     assert ok is False and 'no OTP' in detail
 
 

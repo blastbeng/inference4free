@@ -382,7 +382,8 @@ def _cycle(get_models: Callable[[], List[str]]) -> None:
 
 
 def _is_router_model(model_id: str) -> bool:
-    return model_id == 'auto' or model_id.endswith('/auto')
+    from dsk.providers.router import is_router_model_id
+    return is_router_model_id(model_id)
 
 
 # ------------------------------------------------------------ /v1/models glue

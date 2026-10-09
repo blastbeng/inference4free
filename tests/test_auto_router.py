@@ -26,6 +26,7 @@ sys.path.insert(0, ROOT)
 from dsk.providers import router as router_mod          # noqa: E402
 from dsk.providers.base import (                        # noqa: E402
     ProviderAuthError,
+    ProviderError,
     ProviderRateLimitError,
 )
 
@@ -238,6 +239,198 @@ def test_auto_router_serves_the_next_provider_not_the_first_one(tmp):
             served.append(chunks[0]['served_by'].split('/')[0])
         assert set(served) == {'glm', 'deepseek', 'qwen'}, served
         assert 'chatgpt' not in served and 'gemini' not in served
+
+
+# ------------------------------------------- 4. auto-fast / auto-thinking pools
+
+class RecordingProvider(FakeProvider):
+    """FakeProvider that also records every stream() kwargs dict."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stream_kwargs = []
+
+    def stream(self, prompt, model=None, **kwargs):
+        self.stream_kwargs.append(dict(kwargs))
+        yield from super().stream(prompt, model=model, **kwargs)
+
+
+def _pool_router_specs():
+    """Two providers whose catalogs split cleanly across the thinking pools."""
+    glm = FakeProvider('glm', [{'id': 'glm-4.7', 'thinking_enabled': True},
+                               {'id': 'glm-4.6'}])
+    deepseek = FakeProvider('deepseek', [
+        {'id': 'deepseek-chat'},
+        {'id': 'deepseek-reasoner', 'thinking_enabled': True},
+        {'id': 'deepseek-search', 'search_enabled': True},
+    ])
+    return {'glm': glm, 'deepseek': deepseek}
+
+
+def test_pool_routers_registered_and_resolvable(tmp):
+    router = build_router(_pool_router_specs())
+    # every kind resolves globally, via the public prefix and via the bare
+    # provider name — always to a synthetic router-owned route
+    for mid in ('auto', 'auto-fast', 'auto-thinking', 'z.ai/auto',
+                'deepseek/auto', 'z.ai/auto-fast', 'deepseek/auto-fast',
+                'z.ai/auto-thinking', 'deepseek/auto-thinking',
+                'glm/auto-fast'):
+        assert router.resolve(mid).provider_name == 'router', mid
+    assert router.resolve('AUTO-FAST').model_id == 'auto-fast'  # lowercased
+    assert router.resolve('deepseek/auto-thinking').upstream_model == 'deepseek'
+
+    # /v1/models lists each router id exactly once
+    ids = [entry['id'] for entry in router.list_models()]
+    for mid in ('auto', 'auto-fast', 'auto-thinking', 'z.ai/auto',
+                'deepseek/auto', 'z.ai/auto-fast', 'deepseek/auto-fast',
+                'z.ai/auto-thinking', 'deepseek/auto-thinking'):
+        assert ids.count(mid) == 1, (mid, ids)
+
+
+def test_upstream_model_named_auto_fast_cannot_hijack_the_router(tmp):
+    chatgpt = FakeProvider('chatgpt', [{'id': 'auto-fast'}, {'id': 'gpt-5'}])
+    router = build_router({'chatgpt': chatgpt})
+
+    # the synthetic route keeps the 'auto-fast' id …
+    assert router.routes['auto-fast'].provider_name == 'router'
+    assert router.resolve('auto-fast').provider_name == 'router'
+    # … and the colliding upstream model stays reachable, namespaced
+    assert router.routes['chatgpt-auto-fast'].upstream_model == 'auto-fast'
+    ids = [entry['id'] for entry in router.list_models()]
+    assert ids.count('openai/auto-fast') == 1, ids
+
+
+def test_pools_partition_models_strictly(tmp):
+    router = build_router(_pool_router_specs())
+
+    # auto-fast: ONLY never-thinking models — thinking models AND search
+    # modes are excluded, even though both are served by plain 'auto'
+    fast = router._auto_chain('general', pool='fast')
+    assert set(fast) == {'glm-4.6', 'deepseek-chat'}, fast
+
+    # auto-thinking: ONLY models that can think (deepseek-search does not)
+    think = router._auto_chain('general', pool='thinking')
+    assert set(think) == {'glm-4.7', 'deepseek-reasoner'}, think
+
+    # plain auto keeps the legacy full chain
+    full = router._auto_chain('general')
+    assert set(full) == {'glm-4.7', 'glm-4.6', 'deepseek-chat',
+                         'deepseek-reasoner', 'deepseek-search'}, full
+
+
+def test_provider_pool_chains_restrict_to_one_provider(tmp):
+    router = build_router(_pool_router_specs())
+    assert router._provider_chain('glm', pool='thinking') == ['glm-4.7']
+    assert router._provider_chain('glm', pool='fast') == ['glm-4.6']
+    assert router._provider_chain('deepseek', pool='fast') == ['deepseek-chat']
+    assert (router._provider_chain('deepseek', pool='thinking')
+            == ['deepseek-reasoner'])
+    # search models are in NEITHER pool
+    assert router._provider_chain('deepseek') == ['deepseek-chat',
+                                                  'deepseek-reasoner',
+                                                  'deepseek-search']
+
+
+def test_stream_forces_thinking_flag_by_pool_contract(tmp):
+    glm = RecordingProvider('glm', [{'id': 'glm-4.7', 'thinking_enabled': True},
+                                    {'id': 'glm-4.6'}])
+    router = build_router({'glm': glm})
+
+    # auto-thinking forces thinking ON, even when the request asks for False
+    chunks = list(router.stream(router.resolve('auto-thinking'), 'hi',
+                                thinking_override=False))
+    assert chunks[0]['served_by'] == 'glm/glm-4.7'
+    assert glm.stream_kwargs[-1]['thinking_enabled'] is True
+
+    # auto-fast forces thinking OFF, even when the request asks for True —
+    # and it can only have been served by the never-thinking model
+    chunks = list(router.stream(router.resolve('auto-fast'), 'hi',
+                                thinking_override=True))
+    assert chunks[0]['served_by'] == 'glm/glm-4.6'
+    assert glm.stream_kwargs[-1]['thinking_enabled'] is False
+
+
+def test_empty_pool_raises_clean_error(tmp):
+    # glm lists ONLY a thinking model; deepseek ONLY a non-thinking one
+    glm = FakeProvider('glm', [{'id': 'glm-4.7', 'thinking_enabled': True}])
+    deepseek = FakeProvider('deepseek', [{'id': 'deepseek-chat'}])
+    router = build_router({'glm': glm, 'deepseek': deepseek})
+
+    # per-provider pool routers fail cleanly when that provider's pool is
+    # empty — they must never fall back to the other pool's models
+    with no_refresher():
+        for model_id, needle in (('z.ai/auto-fast', 'non-thinking'),
+                                 ('deepseek/auto-thinking', 'thinking')):
+            try:
+                list(router.stream(router.resolve(model_id), 'hi'))
+                raise AssertionError(f'{model_id}: expected ProviderError')
+            except ProviderError as e:
+                assert needle in str(e), (model_id, e)
+
+    # the GLOBAL pool routers fail cleanly only when NO provider at all has
+    # a model in the pool: a glm-only registry has no never-thinking model …
+    thinking_only = build_router(
+        {'glm': FakeProvider('glm',
+                             [{'id': 'glm-4.7', 'thinking_enabled': True}])})
+    with no_refresher():
+        try:
+            list(thinking_only.stream(thinking_only.resolve('auto-fast'), 'hi'))
+            raise AssertionError('expected ProviderError')
+        except ProviderError as e:
+            assert 'non-thinking' in str(e), e
+        # … and a deepseek-only registry has no thinking model
+        fast_only = build_router(
+            {'deepseek': FakeProvider('deepseek', [{'id': 'deepseek-chat'}])})
+        try:
+            list(fast_only.stream(fast_only.resolve('auto-thinking'), 'hi'))
+            raise AssertionError('expected ProviderError')
+        except ProviderError as e:
+            assert 'thinking' in str(e), e
+
+    # and the mixed registry DOES serve both global pools (no false errors):
+    # auto-fast lands on the only never-thinking model, auto-thinking on the
+    # only thinking one
+    with no_refresher():
+        fast_chunks = list(router.stream(router.resolve('auto-fast'), 'hi'))
+        assert fast_chunks[0]['served_by'] == 'deepseek/deepseek-chat'
+        think_chunks = list(router.stream(router.resolve('auto-thinking'),
+                                          'hi'))
+        assert think_chunks[0]['served_by'] == 'glm/glm-4.7'
+
+
+def test_list_models_advertises_pool_contracts(tmp):
+    glm = FakeProvider('glm', [{'id': 'glm-4.7', 'thinking_enabled': True,
+                                'vision': True},
+                               {'id': 'glm-4.6'}])
+    router = build_router({'glm': glm})
+    entries = {entry['id']: entry for entry in router.list_models()}
+
+    # global routers advertise their contract flags
+    assert entries['auto-fast']['thinking_enabled'] is False
+    assert entries['auto-thinking']['thinking_enabled'] is True
+    # per-provider variants: capability unions over the POOL's models only
+    assert entries['z.ai/auto-fast']['thinking_enabled'] is False
+    assert entries['z.ai/auto-fast']['vision'] is False     # glm-4.6 has none
+    assert entries['z.ai/auto-thinking']['thinking_enabled'] is True
+    assert entries['z.ai/auto-thinking']['vision'] is True  # glm-4.7 has it
+
+
+def test_pool_rotations_use_independent_cursors(tmp):
+    specs = _pool_router_specs()
+    # a provider with two never-thinking models: its provider-scoped fast
+    # router has something to rotate (single-target cursors return early)
+    specs['qwen'] = FakeProvider('qwen', [{'id': 'qwen-omni-flash'},
+                                          {'id': 'qwen-turbo'}])
+    router = build_router(specs)
+    router._auto_chain('general')
+    router._auto_chain('general', pool='fast')
+    router._auto_chain('general', pool='thinking')
+    router._provider_chain('qwen', pool='fast')
+    keys = set(router._rr)
+    assert any(k.startswith('auto:') for k in keys), keys
+    assert any(k.startswith('auto-fast:') for k in keys), keys
+    assert any(k.startswith('auto-thinking:') for k in keys), keys
+    assert any(k.startswith('pauto:auto-fast:qwen') for k in keys), keys
 
 
 # ------------------------------------------------------------- runner
