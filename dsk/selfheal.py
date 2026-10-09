@@ -100,6 +100,7 @@ HEALABLE: Dict[str, Path] = {
     'llm7': _BASE / 'providers' / 'llm7_provider.py',
     'google_ai_studio': _BASE / 'providers' / 'google_ai_studio_provider.py',
     'cohere': _BASE / 'providers' / 'cohere_provider.py',
+    'cloudflare': _BASE / 'providers' / 'cloudflare_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -126,6 +127,7 @@ _MODULE_NAMES = {
     'llm7': 'dsk.providers.llm7_provider',
     'google_ai_studio': 'dsk.providers.google_ai_studio_provider',
     'cohere': 'dsk.providers.cohere_provider',
+    'cloudflare': 'dsk.providers.cloudflare_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -171,6 +173,7 @@ _PROVIDER_CLASSES = {
     'llm7': 'Llm7Provider',
     'google_ai_studio': 'GoogleAiStudioProvider',
     'cohere': 'CohereProvider',
+    'cloudflare': 'CloudflareProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -232,6 +235,9 @@ _EVIDENCE_PATTERNS = {
     'cohere': [r'api\.cohere\.(?:com|ai)[A-Za-z0-9_/{}$.\\-]{0,60}',
                r'no api key supplied', r'Incorrect API key provided',
                r'dashboard\.cohere\.com'],
+    'cloudflare': [r'api\.cloudflare\.com[A-Za-z0-9_/{}$.\\-]{0,60}',
+                   r'Authentication error', r'object identifier is invalid',
+                   r'dash\.cloudflare\.com'],
 }
 
 
@@ -520,7 +526,8 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'openrouter': 'https://openrouter.ai',
             'llm7': 'https://llm7.io',
             'google_ai_studio': 'https://ai.google.dev',
-            'cohere': 'https://cohere.com'}.get(name, '')
+            'cohere': 'https://cohere.com',
+            'cloudflare': 'https://developers.cloudflare.com/workers-ai'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []

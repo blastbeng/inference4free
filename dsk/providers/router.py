@@ -94,6 +94,7 @@ PROVIDER_MODULES = (
     ('llm7', '.llm7_provider', 'Llm7Provider'),
     ('google_ai_studio', '.google_ai_studio_provider', 'GoogleAiStudioProvider'),
     ('cohere', '.cohere_provider', 'CohereProvider'),
+    ('cloudflare', '.cloudflare_provider', 'CloudflareProvider'),
 )
 
 OWNED_BY = {
@@ -120,6 +121,7 @@ OWNED_BY = {
     'llm7': 'llm7',
     'google_ai_studio': 'google',
     'cohere': 'cohere',
+    'cloudflare': 'cloudflare',
 }
 
 # Public model-id namespaces: every model surfaced via /v1/models and the
@@ -151,6 +153,7 @@ PUBLIC_PREFIX = {
     'llm7': 'llm7',
     'google_ai_studio': 'google-ai-studio',
     'cohere': 'cohere',
+    'cloudflare': 'cloudflare',
 }
 
 # Reverse of PUBLIC_PREFIX: 'z.ai' -> 'glm', used by resolve() so both the
@@ -377,7 +380,8 @@ AUTO_CATEGORIES: Dict[str, List[str]] = {
     'coding':      ['deepseek', 'glm', 'qwen', 'kimi', 'mistral', 'chatgpt'],
     'general':     ['chatgpt', 'gemini', 'glm', 'deepseek', 'qwen', 'mistral',
                     'kimi', 'pollinations', 'huggingchat', 'arena', 'groq', 'cerebras', 'modelscope',
-                   'mistral_api', 'openrouter', 'llm7', 'google_ai_studio', 'cohere'],
+                   'mistral_api', 'openrouter', 'llm7', 'google_ai_studio', 'cohere',
+                   'cloudflare'],
 }
 
 _RE_CODE_FENCE = re.compile(

@@ -134,7 +134,8 @@ def _jar_path(name: str) -> Path:
              'openrouter': 'openrouter_cookies.json',
              'llm7': 'llm7_cookies.json',
              'google_ai_studio': 'google_ai_studio_cookies.json',
-             'cohere': 'cohere_cookies.json'}
+             'cohere': 'cohere_cookies.json',
+             'cloudflare': 'cloudflare_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -286,7 +287,8 @@ def _load_jar(name: str) -> Dict[str, str]:
                    'openrouter': ('api_key', 'OPENROUTER_API_KEY'),
                    'llm7': ('api_key', 'LLM7_API_KEY'),
                    'google_ai_studio': ('api_key', 'GOOGLE_AI_STUDIO_API_KEY'),
-                   'cohere': ('api_key', 'COHERE_API_KEY')}.get(name)
+                   'cohere': ('api_key', 'COHERE_API_KEY'),
+                   'cloudflare': ('api_key', 'CLOUDFLARE_API_TOKEN')}.get(name)
         if primary:
             jar.setdefault(primary[0], (os.getenv(primary[1], '') or '').strip())
     return {k: v for k, v in jar.items() if k and v and k != 'cookies'}
@@ -524,6 +526,19 @@ def _has_creds(name: str) -> bool:
         jar = _load_jar('cohere')
         return bool(jar.get('api_key') or jar.get('key')
                     or jar.get('token'))
+    if name == 'cloudflare':
+        # Workers AI needs BOTH an API token and the 32-hex account
+        # id. The env vars merge into the jar under api_key/
+        # account_id (see _load_jar); liveness is checked by the
+        # refresh rung (authenticated models/search - no neuron burn).
+        if (os.getenv('CLOUDFLARE_API_TOKEN', '').strip()
+                and os.getenv('CLOUDFLARE_ACCOUNT_ID', '').strip()):
+            return True
+        jar = _load_jar('cloudflare')
+        return bool((jar.get('api_key') or jar.get('key')
+                     or jar.get('token'))
+                    and (jar.get('account_id') or jar.get('account')
+                         or jar.get('accountid')))
     if name == 'mistral':
         token = (os.getenv('MISTRAL_SESSION_TOKEN', '').strip()
                  or (_load_jar('mistral') or {}).get('session_token') or '')
@@ -1418,6 +1433,67 @@ def refresh_cohere() -> Tuple[bool, str]:
     return True, f'API key valid ({len(models)} models visible)'
 
 
+def refresh_cloudflare() -> Tuple[bool, str]:
+    """Verify the Workers AI token + account id with an authenticated
+    catalog probe (models/search?per_page=1 - no neuron burn).
+
+    The v4 envelope reports auth trouble as 401/403 code 10000, 400
+    code 9106 (missing auth headers) or 404 code 7003 (unroutable
+    account id - routing happens before auth); all three read as
+    rejected. A 429 still proves the token routed and was accepted.
+    """
+    if not _has_creds('cloudflare'):
+        return False, ('no cloudflare credentials - create a Workers AI '
+                       'token at dash.cloudflare.com/profile/api-tokens '
+                       'and set CLOUDFLARE_API_TOKEN + '
+                       'CLOUDFLARE_ACCOUNT_ID or cloudflare_cookies.json')
+    jar = _load_jar('cloudflare')
+    key = (os.getenv('CLOUDFLARE_API_TOKEN', '')
+           or jar.get('api_key') or jar.get('key')
+           or jar.get('token') or '').strip()
+    acc = (os.getenv('CLOUDFLARE_ACCOUNT_ID', '')
+           or jar.get('account_id') or jar.get('account')
+           or jar.get('accountid') or '').strip()
+    url = ('https://api.cloudflare.com/client/v4/accounts/' + acc +
+           '/ai/models/search?per_page=1&page=1')
+    try:
+        resp = _http_get(url, {},
+                         headers={'Authorization': f'Bearer {key}',
+                                  'Accept': 'application/json'})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    rejected = ('create a Workers AI token at dash.cloudflare.com/profile/'
+                'api-tokens (Account > Workers AI > Edit) and set '
+                'CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID')
+    if resp.status_code in (401, 403):
+        return False, ('Workers AI credentials rejected (HTTP '
+                       f'{resp.status_code}) - {rejected}')
+    if resp.status_code == 429:
+        return True, 'rate limited but token accepted (HTTP 429)'
+    if resp.status_code != 200:
+        return False, (f'Workers AI credentials rejected (HTTP '
+                       f'{resp.status_code}): '
+                       f'{(resp.text or "")[:200]} - {rejected}')
+    try:
+        data = resp.json() or {}
+    except Exception:  # noqa: BLE001
+        data = {}
+    if isinstance(data, dict) and data.get('success') is False:
+        errs = '; '.join(str((e or {}).get('message') or e)
+                         if isinstance(e, dict) else str(e)
+                         for e in (data.get('errors') or [])[:2])
+        return False, (f'Workers AI credentials rejected: {errs} - '
+                       f'{rejected}')
+    total = 0
+    info = data.get('result_info') if isinstance(data, dict) else None
+    if isinstance(info, dict):
+        try:
+            total = int(info.get('total_count') or 0)
+        except (TypeError, ValueError):
+            total = 0
+    return True, f'API key valid ({total} models visible)'
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
@@ -1434,6 +1510,7 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'llm7': refresh_llm7,
            'google_ai_studio': refresh_google_ai_studio,
            'cohere': refresh_cohere,
+           'cloudflare': refresh_cloudflare,
            'arena': _manual_only(
                'arena',
                'session cookie required (browser login → arena_cookies.json '
@@ -3870,6 +3947,134 @@ def signup_cohere() -> Tuple[bool, str]:
             _close_page(page)
 
 
+def signup_cloudflare() -> Tuple[bool, str]:
+    """Mint a Workers AI token from an existing Cloudflare account.
+
+    Cloudflare signup is email-verified behind aggressive bot walls and
+    the free tier only needs an EXISTING account, so this rung is a
+    LOGIN (no mailgen): CLOUDFLARE_LOGIN_EMAIL + CLOUDFLARE_LOGIN_
+    PASSWORD (or the cloudflare jar email/password) -> dash login ->
+    profile/api-tokens -> custom token with Account > Workers AI >
+    Edit -> scrape the 40-char token -> resolve the account id via
+    GET /client/v4/accounts -> store both in the cloudflare jar.
+    """
+    jar0 = _load_jar('cloudflare') or {}
+    email = ((os.getenv('CLOUDFLARE_LOGIN_EMAIL', '') or '').strip()
+             or jar0.get('email') or '')
+    password = ((os.getenv('CLOUDFLARE_LOGIN_PASSWORD', '') or '').strip()
+                or jar0.get('password') or '')
+    if not email or not password:
+        return False, ('cloudflare signup needs an existing account - set '
+                       'CLOUDFLARE_LOGIN_EMAIL + CLOUDFLARE_LOGIN_PASSWORD '
+                       '(free account at dash.cloudflare.com/sign-up), then '
+                       're-run; the rung mints a Workers AI token and saves '
+                       'CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID')
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://dash.cloudflare.com/login')
+        time.sleep(8)
+        if not _fill_first(page, _GEMINI_EMAIL_SELECTORS, email):
+            return False, 'cloudflare login email field not found'
+        _click_any(page, ['Continue', 'Next', 'Log in', 'Sign in'])
+        time.sleep(5)
+        if not _fill_first(page, _PASSWORD_SELECTORS, password):
+            # the password step may sit behind an interstitial
+            # (Turnstile / 2FA): poll the rendered body honestly
+            for _ in range(24):
+                time.sleep(5)
+                head = _body_head(page)
+                if any(k in (head or '') for k in
+                       ('api tokens', 'home', 'dashboard', 'websites')):
+                    break
+            if not _fill_first(page, _PASSWORD_SELECTORS, password):
+                return False, ('cloudflare login blocked (Turnstile/2FA '
+                               'likely) - mint a token manually at '
+                               'dash.cloudflare.com/profile/api-tokens '
+                               '(Account > Workers AI > Edit) and set '
+                               'CLOUDFLARE_API_TOKEN + '
+                               'CLOUDFLARE_ACCOUNT_ID')
+        _click_any(page, ['Log in', 'Sign in', 'Continue'])
+        time.sleep(15)
+        page.get('https://dash.cloudflare.com/profile/api-tokens')
+        time.sleep(8)
+        if not _click_any(page, ['Create Token', 'Create token']):
+            return False, ('create-token button not found on '
+                           'dash.cloudflare.com/profile/api-tokens '
+                           '(login wall?) - mint a Workers AI token '
+                           'manually (Account > Workers AI > Edit) and '
+                           'set CLOUDFLARE_API_TOKEN + '
+                           'CLOUDFLARE_ACCOUNT_ID')
+        time.sleep(4)
+        # custom-token template, then the guided form
+        _click_any(page, ['Get started', 'Create Custom Token'])
+        time.sleep(4)
+        _fill_first(page, ['css:input[type=text]', '@placeholder:name',
+                           '@aria-label:name'], 'i4f-workers-ai')
+        # permissions: Account > Workers AI > Edit (best-effort; the
+        # guided form is heavily frameworked and may need the manual
+        # rung - every failure path reports the env names honestly)
+        _select_first(page, ['css:select'], 'Account')
+        _combobox_pick(page, 'Workers AI', 'Edit')
+        _click_any(page, ['Continue to summary', 'Continue'])
+        time.sleep(4)
+        _click_any(page, ['Create Token', 'Create token'])
+        time.sleep(6)
+        token = ''
+        try:
+            token = str(page.run_js(
+                'let hit="";'
+                'for (const el of document.querySelectorAll('
+                '"input,textarea")) {'
+                'const t = (el.value || "").trim();'
+                'const m = t.match(/^[A-Za-z0-9_-]{40}$/);'
+                'if (m) { hit = m[0]; break; } }'
+                'if (!hit) {'
+                'for (const el of document.querySelectorAll('
+                '"code,pre,div,span")) {'
+                'const t = el.value || el.textContent || "";'
+                'const m = t.match(/(?:^|[^A-Za-z0-9_-])'
+                '([A-Za-z0-9_-]{40})(?:[^A-Za-z0-9_-]|$)/);'
+                'if (m && m[1] && '
+                '!/^[0-9a-f]{8}-[0-9a-f]{4}/.test(m[1])) '
+                '{ hit = m[1]; break; } } }'
+                'return hit;') or '')
+        except Exception:  # noqa: BLE001
+            pass
+        if not token:
+            return False, ('token created but not scraped (display wall '
+                           'likely) - copy it from '
+                           'dash.cloudflare.com/profile/api-tokens and set '
+                           'CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID')
+        # resolve the account id with the fresh token
+        aid = ''
+        try:
+            resp = _http_get('https://api.cloudflare.com/client/v4/accounts',
+                             {}, headers={'Authorization': f'Bearer {token}',
+                                          'Accept': 'application/json'})
+            data = resp.json() if resp.status_code == 200 else {}
+            found = ((data.get('result') or [])
+                     if isinstance(data, dict) else [])
+            if found and isinstance(found[0], dict):
+                aid = str(found[0].get('id') or '')
+        except Exception:  # noqa: BLE001
+            aid = ''
+        if not aid:
+            return False, ('token scraped but account id unresolved - set '
+                           'CLOUDFLARE_ACCOUNT_ID (dash right sidebar) '
+                           'alongside CLOUDFLARE_API_TOKEN')
+        _save_jar('cloudflare', {'api_key': token, 'account_id': aid,
+                                 'email': email})
+        _save_account('cloudflare', email, '', 'login')
+        return True, ('Workers AI token minted and account id resolved '
+                      f'({email})')
+    except Exception as e:  # noqa: BLE001
+        return False, f'cloudflare signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
 _MISTRAL_AUTH = 'https://auth.mistral.ai'
 
 
@@ -5021,6 +5226,7 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'llm7': signup_llm7,
           'google_ai_studio': signup_google_ai_studio,
           'cohere': signup_cohere,
+          'cloudflare': signup_cloudflare,
           'arena': _manual_only(
               'arena',
               'signup requires an allowlisted email domain '
