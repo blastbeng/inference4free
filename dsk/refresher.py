@@ -540,23 +540,46 @@ def _has_creds(name: str) -> bool:
                     and (jar.get('account_id') or jar.get('account')
                          or jar.get('accountid')))
     if name == 'mistral':
-        token = (os.getenv('MISTRAL_SESSION_TOKEN', '').strip()
-                 or (_load_jar('mistral') or {}).get('session_token') or '')
+        jar = _load_jar('mistral') or {}
+        env_token = os.getenv('MISTRAL_SESSION_TOKEN', '').strip()
+        token = env_token or (jar.get('session_token') or '')
         if not token:
             return False
         # The Ory session dies server-side while the token string sits in
         # the jar: presence proves nothing. A cheap authenticated GET is
         # the real check — an expired session answers 401 and Mistral then
         # serves every chat as ANONYMOUS quota (5 msgs/day, IP-bound).
+        #
+        # 2026-10-09 measured: the check MUST be whoami on auth.mistral.ai,
+        # sent as ``Cookie: <jar name>=<token>``. Two decoys look plausible
+        # and are dead ends:
+        #   - chat.mistral.ai/api/v1/usage answers 401 "Invalid API Key" to
+        #     ANY session token (it is the API-key console endpoint) and
+        #     403 "Just a moment..." (Cloudflare challenge) to the fixed
+        #     cookie name -> _has_creds was permanently False, so the ladder
+        #     re-logged the account in on EVERY cycle.
+        #   - the token as a bare header, as Bearer, or under the fixed
+        #     ``ory_kratos_session`` name all answer 401; only the jar's
+        #     dynamic ``ory_session_<rand>`` name as a Cookie validates.
+        cookie_name = (jar.get('session_cookie_name') or '').strip() \
+            or 'ory_kratos_session'
         try:
             from curl_cffi import requests as _rq
-            r = _rq.get('https://chat.mistral.ai/api/v1/usage',
-                        headers={'Authorization': f'Bearer {token}',
-                                 'Cookie': f'ory_kratos_session={token}'},
+            r = _rq.get('https://auth.mistral.ai/sessions/whoami',
+                        headers={'Cookie': f'{cookie_name}={token}'},
                         impersonate='chrome120', timeout=20)
-            return r.status_code == 200
-        except Exception:  # noqa: BLE001 — network error: treat as invalid
-            return False
+            if r.status_code == 200:
+                return True
+        except Exception:  # noqa: BLE001 — network error: cannot verify
+            # A hiccup must not read as "no credentials": that would send
+            # the ladder to signup and burn a fresh identity.
+            return True
+        if env_token and not (jar.get('session_cookie_name') or '').strip():
+            # Hand-imported token, cookie name unknown: whoami cannot replay
+            # it. The operator set it deliberately; the provider validates
+            # it at request time.
+            return True
+        return False
     # gemini: a real session means a __Secure-1PSID cookie (env already
     # merged into the jar by _load_jar). Other google.com cookies alone
     # are not a usable session.
@@ -1044,6 +1067,11 @@ def refresh_mistral() -> Tuple[bool, str]:
     if not token:
         token = jar.get('session_token') or ''
     try:
+        # NOTE: _http_get's second positional is COOKIES, not headers —
+        # ``{cookie_name: token}`` is what sends ``Cookie: <name>=<token>``,
+        # the only shape whoami accepts (measured 2026-10-09: the token as a
+        # header, as Bearer, or under the fixed ory_kratos_session name all
+        # answer 401).
         resp = _http_get('https://auth.mistral.ai/sessions/whoami',
                          {cookie_name: token})
     except Exception as e:  # noqa: BLE001
