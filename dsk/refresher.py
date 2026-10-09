@@ -127,7 +127,8 @@ def _jar_path(name: str) -> Path:
              'pollinations': 'pollinations_cookies.json',
              'arena': 'arena_cookies.json',
              'huggingchat': 'huggingchat_cookies.json',
-             'groq': 'groq_cookies.json'}
+             'groq': 'groq_cookies.json',
+             'cerebras': 'cerebras_cookies.json'}
     return _data_dir() / files[name]
 
 
@@ -272,7 +273,8 @@ def _load_jar(name: str) -> Dict[str, str]:
                    'kimi': ('token', 'KIMI_TOKEN'),
                    'mistral': ('session_token', 'MISTRAL_SESSION_TOKEN'),
                    'qwen': ('token', 'QWEN_TOKEN'),
-                   'groq': ('api_key', 'GROQ_API_KEY')}.get(name)
+                   'groq': ('api_key', 'GROQ_API_KEY'),
+                   'cerebras': ('api_key', 'CEREBRAS_API_KEY')}.get(name)
         if primary:
             jar.setdefault(primary[0], (os.getenv(primary[1], '') or '').strip())
     return {k: v for k, v in jar.items() if k and v and k != 'cookies'}
@@ -434,6 +436,16 @@ def _has_creds(name: str) -> bool:
         if os.getenv('GROQ_API_KEY', '').strip():
             return True
         jar = _load_jar('groq')
+        return bool(jar.get('api_key') or jar.get('key')
+                    or jar.get('token'))
+    if name == 'cerebras':
+        # Free-tier API key (csk-...) from cloud.cerebras.ai. The
+        # env var merges into the jar under api_key (see _load_jar);
+        # any accepted key name counts as provisioned - liveness is
+        # checked by the refresh rung (Bearer /models).
+        if os.getenv('CEREBRAS_API_KEY', '').strip():
+            return True
+        jar = _load_jar('cerebras')
         return bool(jar.get('api_key') or jar.get('key')
                     or jar.get('token'))
     if name == 'mistral':
@@ -1061,6 +1073,43 @@ def refresh_groq() -> Tuple[bool, str]:
     return True, f'API key valid ({n} models visible)'
 
 
+def refresh_cerebras() -> Tuple[bool, str]:
+    """Validate the Cerebras API key against GET /v1/models.
+
+    A live free-tier key answers 200 with the model catalog; an expired
+    or revoked key answers 401 wrong_api_key (flat body, not nested
+    under error like Groq's). A 429 still proves the key is accepted
+    (auth runs before rate limiting), so it reads as alive; any other
+    status is inconclusive - the authoritative check runs at request
+    time.
+    """
+    if not _has_creds('cerebras'):
+        return False, ('no cerebras credentials - set CEREBRAS_API_KEY or '
+                       'create a key in cloud.cerebras.ai '
+                       '(cerebras_cookies.json)')
+    key = (_load_jar('cerebras').get('api_key')
+           or os.getenv('CEREBRAS_API_KEY', '')).strip()
+    try:
+        resp = _http_get('https://api.cerebras.ai/v1/models', {},
+                         headers={'Authorization': f'Bearer {key}',
+                                  'Accept': 'application/json'})
+    except Exception as e:  # noqa: BLE001
+        return False, f'verify failed: {type(e).__name__}: {e}'
+    if resp.status_code in (401, 403):
+        return False, ('API key rejected - create a new one in '
+                       'cloud.cerebras.ai')
+    if resp.status_code == 429:
+        return True, 'rate limited but key accepted (HTTP 429)'
+    if resp.status_code != 200:
+        return True, (f'key reachable, liveness inconclusive (HTTP '
+                      f'{resp.status_code}) - validated at request time')
+    try:
+        n = len(((resp.json() or {}).get('data')) or [])
+    except ValueError:
+        n = 0
+    return True, f'API key valid ({n} models visible)'
+
+
 REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'deepseek': refresh_deepseek, 'claude': refresh_claude,
            'grok': refresh_grok, 'qwen': refresh_qwen, 'kimi': refresh_kimi,
@@ -1070,6 +1119,7 @@ REFRESH = {'gemini': refresh_gemini, 'chatgpt': refresh_chatgpt,
            'pollinations': _anonymous('pollinations'),
            'huggingchat': refresh_huggingchat,
            'groq': refresh_groq,
+           'cerebras': refresh_cerebras,
            'arena': _manual_only(
                'arena',
                'session cookie required (browser login → arena_cookies.json '
@@ -2880,6 +2930,82 @@ def signup_groq() -> Tuple[bool, str]:
             _close_page(page)
 
 
+def signup_cerebras() -> Tuple[bool, str]:
+    """Create a cloud.cerebras.ai account and harvest a free-tier API key.
+
+    Flow (browser): cloud.cerebras.ai sign-up (email) -> emailed OTP
+    code -> logged in -> /platform/apikeys -> "Create API Key" -> the
+    csk- value is displayed once -> scrape it and store it in the
+    cerebras jar under api_key (the exact key the provider reads).
+    """
+    if not mailgen.autogen_enabled():
+        return False, 'mail autogen disabled (I4F_MAIL_AUTOGEN=false)'
+    page = None
+    try:
+        page = _browser(headed=True)
+        page.get('https://cloud.cerebras.ai')
+        time.sleep(8)
+        # probe the form before spending a disposable mailbox
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS,
+                           'probe@example.invalid'):
+            return False, ('cerebras login form not found (email field) - '
+                           'create a key in cloud.cerebras.ai/platform/'
+                           'apikeys and set CEREBRAS_API_KEY manually')
+        session, err = mailgen.create_email()
+        if not session:
+            return False, f'autogen mailbox unavailable: {err}'
+        email = session['address']
+        if not _fill_first(page, _CHATGPT_EMAIL_SELECTORS, email):
+            return False, 'email field not found'
+        _click_any(page, ['Continue', 'Sign in', 'Log in', 'Sign up'])
+        time.sleep(8)
+        code = mailgen.fetch_otp(session, max_wait_s=240,
+                                 sender_needle='cerebras')
+        if not code:
+            code = mailgen.fetch_otp(session, max_wait_s=60,
+                                     sender_needle='')
+        if not code:
+            return False, 'cerebras verification email not found'
+        if not _fill_first(page, ['css:input[name=code]', '@placeholder:code',
+                                  'css:input[inputmode=numeric]',
+                                  'css:input[type=tel]',
+                                  'css:input[type=text]'], code):
+            return False, 'code field not found'
+        _click_any(page, ['Verify', 'Continue', 'Submit'])
+        time.sleep(10)
+        page.get('https://cloud.cerebras.ai/platform/apikeys')
+        time.sleep(6)
+        if not _click_any(page, ['Create API Key', 'New API Key',
+                                 'Create key', 'API Keys']):
+            return False, 'create-key button not found on /platform/apikeys'
+        time.sleep(4)
+        key = ''
+        try:
+            key = str(page.run_js(
+                'let hit="";'
+                'for (const el of document.querySelectorAll('
+                '"input,code,pre,div")) {'
+                'const t = el.value || el.textContent || "";'
+                'const m = t.match(/csk-[A-Za-z0-9]{20,}/);'
+                'if (m) { hit = m[0]; break; } }'
+                'return hit;') or '')
+        except Exception:  # noqa: BLE001
+            pass
+        if not key:
+            return False, ('signup finished but no csk- key found (captcha '
+                           'or verification wall likely) - set '
+                           'CEREBRAS_API_KEY manually')
+        _save_jar('cerebras', {'api_key': key, 'email': email})
+        _save_account('cerebras', email, '', session.get('backend', ''))
+        return True, (f'account created, API key saved '
+                      f'({session.get("backend")}: {email})')
+    except Exception as e:  # noqa: BLE001
+        return False, f'cerebras signup failed: {type(e).__name__}: {e}'
+    finally:
+        if page is not None:
+            _close_page(page)
+
+
 _MISTRAL_AUTH = 'https://auth.mistral.ai'
 
 
@@ -4024,6 +4150,7 @@ SIGNUP = {'deepseek': signup_deepseek, 'chatgpt': signup_chatgpt,
           'pollinations': _anonymous('pollinations'),
           'huggingchat': signup_huggingchat,
           'groq': signup_groq,
+          'cerebras': signup_cerebras,
           'arena': _manual_only(
               'arena',
               'signup requires an allowlisted email domain '
