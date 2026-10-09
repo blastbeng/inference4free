@@ -17,6 +17,7 @@ No network: the catalog fetch and the node solver are monkeypatched.
 
 Run:  python tests/test_duck_provider.py     (or: pytest tests/)
 """
+import json
 import os
 import sys
 
@@ -162,6 +163,50 @@ def test_wiring():
     assert _has_creds('duck') is True          # anonymous provider
     assert _jar_path('duck').name == 'duck_cookies.json'
     assert 'duck' in REFRESH and 'duck' in SIGNUP
+
+
+def test_parse_reasoning_summary_events():
+    # ``role: "reasoning"`` events carry ``summaryText``: emitted as thinking
+    # pieces, empty summaries skipped, plain content/message untouched.
+    line = json.dumps({'role': 'reasoning', 'state': 'done',
+                       'summaryText': 'thinking about 19*21'})
+    piece = dp.DuckProvider._parse_line(f'data: {line}')
+    assert piece == {'content': 'thinking about 19*21', 'type': 'thinking',
+                     'finish_reason': None, 'cumulative': True}
+    listed = dp.DuckProvider._parse_line('data: ' + json.dumps(
+        {'role': 'reasoning', 'state': 'done',
+         'summaryText': ['part one, ', 'part two']}))
+    assert listed == {'content': 'part one, part two', 'type': 'thinking',
+                      'finish_reason': None, 'cumulative': True}
+    empty = dp.DuckProvider._parse_line('data: ' + json.dumps(
+        {'role': 'reasoning', 'state': 'done', 'summaryText': ''}))
+    assert empty is None
+    empty_list = dp.DuckProvider._parse_line('data: ' + json.dumps(
+        {'role': 'reasoning', 'state': 'done', 'summaryText': []}))
+    assert empty_list is None
+    text = dp.DuckProvider._parse_line('data: ' + json.dumps(
+        {'role': 'assistant', 'message': '399'}))
+    assert text == {'content': '399', 'type': 'text', 'finish_reason': None}
+
+
+def test_iter_chunks_dedupes_cumulative_summary():
+    # summaryText is the summary SO FAR: _iter_chunks forwards only the new
+    # suffix, so a growing summary never repeats in the reasoning channel.
+    class _Resp:
+        def iter_content(self, chunk_size=None):
+            lines = [
+                'data: ' + json.dumps({'role': 'reasoning', 'summaryText': 'step one'}),
+                'data: ' + json.dumps({'role': 'reasoning', 'summaryText': 'step one, step two'}),
+                'data: ' + json.dumps({'role': 'assistant', 'message': 'done'}),
+                '[DONE]',
+            ]
+            yield ('\n'.join(lines) + '\n').encode()
+    provider = dp.DuckProvider.__new__(dp.DuckProvider)
+    pieces = list(dp.DuckProvider._iter_chunks(provider, _Resp()))
+    thinking = [p for p in pieces if p.get('type') == 'thinking']
+    assert [p['content'] for p in thinking] == ['step one', ', step two']
+    text = [p['content'] for p in pieces if p.get('type') == 'text']
+    assert 'done' in text
 
 
 def test_fallback_catalog_shape():

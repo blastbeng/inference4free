@@ -454,6 +454,35 @@ def _probe_once(name: str) -> Tuple[str, str]:
                 return 'structural', ('cookies present but 0 models discovered '
                                       '(session may be expired)')
             return 'ok', f'{len(models)} models'
+        if name == 'perplexity':
+            # available() is True unconditionally (anonymous mode) and the
+            # catalog lists models either way, so neither proves anything:
+            # the upstream hard-walls anonymous answers (fraud_authwall_
+            # upsell / 403, measured 2026-10). A tiny REAL completion is the
+            # only honest probe.
+            from .providers.perplexity_provider import PerplexityProvider
+            provider = PerplexityProvider()
+            try:
+                models = provider.list_models()
+            except Exception as e:  # noqa: BLE001
+                return _classify(e), f'{type(e).__name__}: {e}'[:300]
+            if not models:
+                return 'structural', 'perplexity discovered 0 models'
+            target = (models[0].get('upstream_model')
+                      or models[0].get('id') or 'turbo')
+            try:
+                first = next(provider.stream(
+                    'ping', model=target, thinking_enabled=False,
+                    search_enabled=False, max_tokens=8), None)
+            except Exception as e:  # noqa: BLE001 — classify by exception
+                verdict = _classify(e)
+                if verdict == 'auth':
+                    return 'auth', ('anonymous session auth-walled — signup '
+                                    'rung must create a signed-in jar')
+                return verdict, f'{type(e).__name__}: {e}'[:300]
+            if not first:
+                return 'structural', 'perplexity completion produced no events'
+            return 'ok', 'completion responds (anonymous session accepted)'
         module = importlib.import_module(_PROVIDER_MODULES[name])
         provider = getattr(module, _PROVIDER_CLASSES[name])()
         if not provider.available():

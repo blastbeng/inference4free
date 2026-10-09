@@ -26,7 +26,8 @@ Run:  python tests/test_pollinations_provider.py     (or: pytest tests/)
 import sys
 import types
 
-ROOT = '/opt/docker/compose/inference4free'
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from dsk.providers import pollinations_provider as pp     # noqa: E402

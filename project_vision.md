@@ -194,6 +194,14 @@ with backup, hot-reload, re-probe; automatic rollback at the first problem.
 File whitelist, attempt/incident caps, JSONL audit, `I4F_SELFHEAL=false` to
 disable. **The LLM fixer never sees credentials.**
 
+Probes are **honest per provider** (`_probe_once`): DeepSeek gets a real
+completion through its PoW pipeline, qwen a `validate_token` call, ChatGPT the
+sentinel gate, gemini real cookies + `list_models`, perplexity a real
+completion (its `available()` is unconditional and the anonymous catalog
+lists models that are auth-walled — the generic JS-bundle evidence fallback
+would report a misleading `ok`); only providers without a dedicated probe
+fall back to bundle-evidence grep.
+
 ### 2.6 Tool calling for agent coding — `dsk/openai_server.py` + `dsk/toolprobe.py`
 
 The web providers have no native function calling: the server emulates it.
@@ -239,9 +247,12 @@ The web providers have no native function calling: the server emulates it.
   (latency budget) get traffic; latency-ranked selection
   (`I4F_PROXY_TOP_K`), **no-proxy as a first-class route**, sticky
   per-provider assignment with TTL rotation, cooldown on failures, never Tor.
-- **`dsk/browser.py`** — RAM rule: **a single shared Chromium process**,
-  tabs per consumer (relays, z.ai, signup rungs, copilot harvest), idle
-  reaper, wedge hygiene (kill-by-port, profile lock, zombies, Xvfb).
+- **`dsk/browser.py`** — RAM rule: **one shared Chromium process per
+  profile**, consumers are tabs (relays, z.ai, signup rungs, copilot
+  harvest), idle reaper (default 180 s), hard instance cap
+  (`I4F_BROWSER_MAX_INSTANCES`, default 3) with soft oldest-idle eviction
+  (a busy profile is never killed), wedge hygiene (kill-by-port, profile
+  lock, zombies, Xvfb).
 - **`dsk/pow.py` + `dsk/wasm/`** — DeepSeek proof-of-work solved with **its
   own** sha3 WASM module.
 - **`dsk/bypass.py` + `dsk/CloudflareBypasser.py` + `dsk/server.py`** —

@@ -608,24 +608,42 @@ class DuckProvider(Provider):
     def _iter_chunks(self, response) -> Generator[Dict[str, Any], None, None]:
         """Parse the duckchat SSE ``data: {...}`` line format.
 
-        Each event carries the delta in ``message`` or ``content``; ``[DONE]``
-        ends the stream. The response's own ``x-vqd-hash-1`` header (next
-        challenge) was captured by the caller before iteration.
+        Each event carries the delta in ``message`` or ``content``; reasoning
+        summaries arrive as ``role: "reasoning"`` events with ``summaryText``;
+        ``[DONE]`` ends the stream. The response's own ``x-vqd-hash-1`` header
+        (next challenge) was captured by the caller before iteration.
         """
         decoder = codecs.getincrementaldecoder('utf-8')('replace')
         buffer = ''
+        last_reasoning = ''
+
+        def _emit(piece: Optional[Dict[str, Any]]) -> Generator[Dict[str, Any], None, None]:
+            nonlocal last_reasoning
+            if not piece:
+                return
+            if piece.get('type') == 'thinking' and piece.get('cumulative'):
+                # summaryText is the full summary so far, not a delta: forward
+                # only the new suffix (a reset — non-prefix text — is forwarded
+                # whole and becomes the new baseline).
+                full = piece['content']
+                if full.startswith(last_reasoning):
+                    delta = full[len(last_reasoning):]
+                else:
+                    delta = full
+                last_reasoning = full
+                if delta:
+                    yield {'content': delta, 'type': 'thinking', 'finish_reason': None}
+                return
+            yield piece
+
         for chunk in response.iter_content(chunk_size=None):
             buffer += decoder.decode(chunk or b'')
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
-                piece = self._parse_line(line)
-                if piece:
-                    yield piece
+                yield from _emit(self._parse_line(line))
         buffer += decoder.decode(b'', final=True)
         for line in buffer.split('\n'):
-            piece = self._parse_line(line)
-            if piece:
-                yield piece
+            yield from _emit(self._parse_line(line))
         yield {'content': '', 'type': 'text', 'finish_reason': 'stop'}
 
     @staticmethod
@@ -642,6 +660,19 @@ class DuckProvider(Provider):
         except ValueError:
             return None
         if not isinstance(data, dict):
+            return None
+        if data.get('role') == 'reasoning':
+            # Reasoning-summary events: ``summaryText`` carries the summary so
+            # far — a string or a list of summary segments (usually empty: the
+            # raw CoT arrives encrypted in ``encryptedText``). Emitted as the
+            # standard thinking piece; ``_iter_chunks`` strips the
+            # already-forwarded prefix, so a cumulative summary never repeats.
+            reasoning = data.get('summaryText')
+            if isinstance(reasoning, list):
+                reasoning = ''.join(s for s in reasoning if isinstance(s, str))
+            if isinstance(reasoning, str) and reasoning:
+                return {'content': reasoning, 'type': 'thinking',
+                        'finish_reason': None, 'cumulative': True}
             return None
         content = data.get('content') or data.get('message') or ''
         if isinstance(content, str) and content:

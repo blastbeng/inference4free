@@ -150,7 +150,7 @@ curl http://localhost:8000/v1/chat/completions -d '{"model":"z.ai/auto-thinking"
 
 When a ChatGPT/Qwen session expires, the providers do **not** go dark: they fall back to an **anonymous browser relay** that drives the public web UI (`chatgpt.com`, `chat.qwen.ai`) in a real Chromium — no credentials needed at all. Model titles are read from the site's own picker; a picker that won't open degrades gracefully to the family default. The relay serves **one stream at a time** (the web UI is a single chat): a concurrent request fails fast with `relay busy with another stream` and the router falls back to the next chain position. Model discovery, the picker catalog and the relay state feed `/v1/models` exactly like the HTTP transport.
 
-All relay/tab consumers share **one Chromium process** (`dsk/browser.py`): per-profile tabs, idle reaping (`I4F_BROWSER_IDLE_REAP`), and stale-page recycling (`I4F_CHATGPT_RELAY_STALE_AFTER`, `I4F_QWEN_RELAY_STALE_AFTER`) so anonymous sessions — which expire server-side — never serve from a dead page.
+All relay/tab consumers share **one Chromium process per profile** (`dsk/browser.py`): consumers are **tabs, never new instances**, idle reaping (`I4F_BROWSER_IDLE_REAP`, default 180 s), stale-page recycling (`I4F_CHATGPT_RELAY_STALE_AFTER`, `I4F_QWEN_RELAY_STALE_AFTER`), and a hard instance cap (`I4F_BROWSER_MAX_INSTANCES`, default 3) with oldest-idle eviction — a soft cap: a busy profile is never killed, at most one extra instance is allowed. Count browsers by their `--user-data-dir`, not by process count (one Chromium is a whole process tree of zygotes/renderers).
 
 ### Module map
 
@@ -557,7 +557,8 @@ A llama.cpp-style chat playground is served at `http://localhost:${I4F_PORT:-800
 | `I4F_HIDE_TOOLLESS` | `true` | Hide probe-confirmed tool-less models from `/v1/models` |
 | `I4F_LLMTRIM` | `true` | Enable the llmtrim request stage |
 | `I4F_SELFHEAL` | `true` | Self-heal daemon (probe TTL / trigger / cooldown / max attempts: `I4F_SELFHEAL_PROBE_TTL=600`, `I4F_SELFHEAL_TRIGGER=3`, `I4F_SELFHEAL_COOLDOWN=3600`, `I4F_SELFHEAL_MAX_ATTEMPTS=3`) |
-| `I4F_BROWSER_PORT` / `I4F_BROWSER_HEADLESS` / `I4F_BROWSER_IDLE_REAP` | `9333` / *(auto)* / `300` | Shared Chromium manager: debug port, headless override, idle reap |
+| `I4F_BROWSER_PORT` / `I4F_BROWSER_HEADLESS` / `I4F_BROWSER_IDLE_REAP` | `9333` / *(auto)* / `180` | Shared Chromium manager: debug port, headless override, idle reap |
+| `I4F_BROWSER_MAX_INSTANCES` | `3` | Hard cap on concurrent Chromium instances (per profile+proxy key) with oldest-idle eviction; busy profiles are never killed (soft cap) |
 | `I4F_CHATGPT_RELAY_STALE_AFTER` / `I4F_QWEN_RELAY_STALE_AFTER` | `600` | Seconds after which an idle relay page is recycled (anonymous sessions expire server-side) |
 | `I4F_SIGNUP_PROXY` | *(pool)* | Fixed proxy for signup browser flows |
 | `I4F_SIGNUP_BREAKER_COOLDOWN_S` | `43200` | Sleep after 3 consecutive signup failures (12 h, not 30 min — a never-succeeding signup must not burn RAM all day) |
