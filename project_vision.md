@@ -2,7 +2,7 @@
 
 > **What it is, how it works, and what it MUST be.**
 > Vision document, updated 2026-10-09, derived from a complete analysis of the
-> code (≈28,000 lines in `dsk/`, 24 registered providers, 19 test suites).
+> code (≈31,000 lines in `dsk/`, 29 registered providers, 21 test suites).
 
 ---
 
@@ -52,7 +52,7 @@ FastAPI, entrypoint `python -m dsk.openai_server`. It exposes:
 
 | Endpoint | Function |
 |---|---|
-| `GET /v1/models` | Dynamic registry discovered from live sessions; `vision` / `image_gen` capability flags; tool-less models hidden by toolprobe |
+| `GET /v1/models` | Dynamic registry discovered from live sessions; the router ids (`auto`, `auto-fast`, `auto-thinking` — global and per provider); `thinking_enabled` / `search_enabled` / `vision` / `image_gen` capability flags; tool-less models hidden by toolprobe (router entries never hidden — their `tools` flag mirrors their pool) |
 | `POST /v1/chat/completions` | Streaming + non-streaming; multi-protocol tool calling; vision via `image_url` content parts; extra parameters `thinking`, `search_enabled`, `disable_proxy` |
 | `POST /v1/images/generations` | OpenAI Images API (`url` / `b64_json`), reserved to models with `image_gen` |
 | `GET /health` | Proxy, selfheal, refresher, toolprobe state (liveness + diagnostics) |
@@ -69,14 +69,14 @@ errors always follow the OpenAI shape `{"error": {message, type, param, code}}`.
 **Chat request pipeline:**
 `LLM CALL → llmtrim (history trimmed to the route's context budget) → router (classification + fallback chain) → proxies (rotating egress) → provider → OpenAI SSE bridge` — with tool-call emulation in the middle.
 
-### 2.2 Routing — `dsk/providers/router.py` (≈1,450 lines)
+### 2.2 Routing — `dsk/providers/router.py` (≈1,690 lines)
 
 The heart of the aggregation. Prime rule: **no model is hardcoded** — every
 route is born from the provider's `list_models()` on the live session, with a
 TTL (`I4F_MODELS_TTL`, 300 s) and on-demand re-discovery on unknown ids. A
 provider that fails discovery keeps its already-known routes.
 
-- **Registry of 24 providers** (`PROVIDER_MODULES`, lazy imports: a broken
+- **Registry of 29 providers** (`PROVIDER_MODULES`, lazy imports: a broken
   module disables only itself).
 - **Public namespacing**: every model on `/v1/models` carries the provider
   prefix (`deepseek/deepseek-chat`, `z.ai/glm-4.7`, `alibaba/qwen-3-max`, …);
@@ -95,8 +95,36 @@ provider that fails discovery keeps its already-known routes.
   - runtime state: demotion after failure (`I4F_AUTO_DEMOTE_S`), "proven"
     after success (`I4F_AUTO_PROVE_S`), quota cooldown on rate limits, stall
     cooldown on first-token timeouts.
-- **`<provider>/auto`**: the same machinery restricted to a single provider's
-  models (registered for each of the 24).
+- **Router family** — three synthetic router kinds, each global AND
+  per-provider (`<prefix>/<kind>`, registered for each of the 29):
+  - **`auto` / `<provider>/auto`**: the smart router (and default model when
+    the client omits `model`) — serves every discovered model;
+  - **`auto-fast` / `<provider>/auto-fast`**: strict pool of the models that
+    can **never** think (metadata `thinking_enabled` False — no thinking
+    capability or no way to activate it; web-search modes excluded too),
+    streamed with thinking forced **off**: zero `reasoning_content`, by
+    contract;
+  - **`auto-thinking` / `<provider>/auto-thinking`**: strict pool of the
+    thinking-capable models (always-on ones and models callable with the
+    thinking flag active), streamed with thinking forced **on**;
+  - the pools are a disjoint partition of the registry (`_filter_pool`,
+    strict: an empty pool is a clean `ProviderError`, never relaxed into a
+    contract violation); the per-request `thinking` body flag is ignored on
+    the two pool routers — the router id IS the contract;
+  - each pool rotates on its own round-robin/tier cursors
+    (`auto-fast:{category}:{provider}`, `pauto:auto-fast:{provider}`, …);
+  - `/v1/models` advertises each router's contract flags and unions the
+    capability flags over its own pool's models; the toolprobe `tools` flag
+    on a router entry mirrors the same pool, and `is_router_model_id`
+    (shared with the `/v1` gates) keeps router ids out of the leaf probes;
+  - the metadata invariant that keeps the pools honest:
+    `thinking_enabled = True` ⇔ the route can/will be called with thinking
+    active (the thinking itself may surface as separate reasoning frames or
+    be folded into the answer by the transport — the flag says the route is
+    CALLED thinking-active). Every provider's `list_models()` must respect
+    it (arena was fixed for this — it hardcoded False while some of its
+    models stream reasoning frames); new providers are audited against it
+    before registration.
 - **Fallback and retry**: per-provider retries with exponential backoff
   (honoring `Retry-After`, cap `I4F_RETRY_CAP`), then the chain is walked;
   mid-stream failures do not re-emit content; on `auth` the credential renewal
@@ -105,7 +133,7 @@ provider that fails discovery keeps its already-known routes.
   (`I4F_STREAM_SILENCE_TIMEOUT`, 180 s) that aborts and falls back when a
   stream goes quiet after it started.
 
-### 2.3 The providers — `dsk/providers/` (24, in four classes)
+### 2.3 The providers — `dsk/providers/` (29, in four classes)
 
 Common contract (`base.py`): every provider inherits `Provider` and produces a
 generator of chunks `{'content': str, 'type': 'text'|'thinking', 'finish_reason': …}`,
@@ -121,8 +149,8 @@ the cookie jars.
 |---|---|---|
 | **Reverse-engineered web** | `deepseek` (token + PoW WASM + CF bypass), `gemini` (1PSID cookies, batchexecute RPC, vision via multipart upload to `content-push.googleapis.com`), `chatgpt` (backend-api / browser relay), `claude` (sessionKey, temporary conversations), `grok` (sso cookie, images via Aurora), `mistral` (Le Chat, session token), `qwen` (bearer + bx-ua fingerprint / guest relay), `kimi` (token cookie, gRPC-web frames) | created/renewed by the bot |
 | **Anonymous / keyless** | `duck` (duck.ai `duckchat/v1`, Node.js challenge solver `duck_solver.js`), `pollinations` (text + image, live catalogs), `glm` (anonymous z.ai + signed chatglm.cn; Chromium browser transport), `copilot` (websocket, harvested anonymous identity), `perplexity` (SSE ask, Sonar backend) | none (always available) |
-| **Reverse-eng. dormant** | `arena` (ex-LMArena, login wall + reCAPTCHA v3), `huggingchat` (cookie jar; public catalog) | dormant until a session exists |
-| **Free API tiers** | `groq`, `cerebras`, `modelscope`, `mistral_api`, `openrouter` (`:free` models), `llm7`, `google_ai_studio`, `cohere`, `cloudflare` (Workers AI: token + account id) | free API key, verified by the refresh rung without burning quota |
+| **Reverse-eng. dormant** | `arena` (ex-LMArena, login wall + reCAPTCHA v3), `huggingchat` (cookie jar; public catalog), `t3chat` (free LLM-chat web app), `innerai`, `adapta` (login workspaces) | dormant until a session exists |
+| **Free API tiers** | `groq`, `cerebras`, `modelscope`, `mistral_api`, `openrouter` (`:free` models), `llm7` (keyless), `google_ai_studio`, `cohere`, `cloudflare` (Workers AI: token + account id), `meta` (Muse Spark), `blackbox` | free API key, verified by the refresh rung without burning quota |
 
 **Browser relays** (`dsk/chatgpt_relay.py`, `dsk/qwen_relay.py`): where the
 HTTP transport is walled (ChatGPT 2026 Sentinel/Turnstile, Qwen Aliyun WAF),
@@ -141,7 +169,8 @@ The renewal ladder, from cheapest to most invasive, per provider:
 3. **full auto-signup**: a mailbox is generated on the fly (7 backends in
    `mailgen.py`: IMAP catch-all → emailnator (real gmail addresses) →
    tempmail.lol → tempmail.plus → temp-mail.io → Guerrilla → mail.tm/mail.gw),
-   the form is filled in, the OTP is read automatically.
+   the form is filled in (CMP/consent interstitials — including the EU consent
+   wall — are dismissed automatically), the OTP is read automatically.
 
 Proactive daemon every `I4F_REFRESHER_TTL` (6 h) + on-demand trigger from
 selfheal on `auth` outcomes. Per-provider cooldowns, daily budget, per-rung
@@ -185,6 +214,14 @@ The web providers have no native function calling: the server emulates it.
   the same state (soft-fail only if `tool_choice='required'` produced no
   calls); infrastructure failures do not count. Persistent state in
   `data/toolcall_state.json`.
+- **Router-aware annotation** (`annotate_models`): router ids are recognized
+  via `is_router_model_id` and never probed or tracked as leaf models (the
+  per-model probe endpoint refuses them with a 400); on `/v1/models` a
+  router's `tools` flag mirrors its pool — global routers weigh every
+  provider's pool leaves, provider-scoped ones only their own, with
+  `auto-fast` / `auto-thinking` restricted to the pool partition — `false`
+  only when every pool leaf is known-failed, and router entries are never
+  hidden by `I4F_HIDE_TOOLLESS`.
 
 ### 2.7 Cross-cutting modules
 
@@ -219,11 +256,13 @@ The web providers have no native function calling: the server emulates it.
 - All persistent state lives in `./data/`: per-provider cookie jars,
   `accounts.json`, `toolcall_state.json`, `refresher/history.jsonl`,
   `selfheal/` (backups + audit), `cookies.json` (cf_clearance).
-- **Tests**: 19 suites in `tests/` covering the API-key provider contract
-  (catalog parsing, dormancy without keys, env activation, stream parsing,
-  error frame → exceptions), the auto router (fair rotation, demotion,
-  anti-hijack of the `auto` id), credential/jar logic, the ChatGPT relay
-  parsers, the mailgen backends. Tests run against fake HTTP, no network.
+- **Tests**: 21 suites / 293 tests in `tests/` covering the API-key provider
+  contract (catalog parsing, dormancy without keys, env activation, stream
+  parsing, error frame → exceptions), the auto routers (fair rotation,
+  demotion, anti-hijack of the router ids, the `auto-fast`/`auto-thinking`
+  pool partition, router-id recognition, pool-aware `/v1/models`
+  annotation), credential/jar logic, the ChatGPT relay parsers, the mailgen
+  backends. Tests run against fake HTTP, no network.
 
 ### 2.9 Configuration surface
 
@@ -287,6 +326,13 @@ them.
 9. **Everything switchable via env, with sane defaults.** `I4F_PROVIDERS`,
    `I4F_SELFHEAL`, `I4F_REFRESHER*`, `I4F_LLMTRIM`, `I4F_PROXY*`, …: every
    subsystem has a switch and no default requires configuration.
+10. **Router ids and pool contracts are public API.** `auto`, `auto-fast`,
+    `auto-thinking` and every `<prefix>/<kind>` variant are reserved and
+    their thinking contract is guaranteed by construction: the metadata
+    invariant `thinking_enabled = True` ⇔ the route can stream thinking
+    holds for every provider catalog (audited at registration), the pools
+    are filtered strictly and never relaxed, and no per-request flag can
+    break the router id's promise.
 
 ---
 
@@ -308,11 +354,11 @@ impressed in the code:
    dormant/env/stream tests + registration in `PROVIDER_MODULES`): a new
    provider is one file, one registry line, and — if it has a free tier — it
    enters the `auto` tables.
-2. **`auto` as the main product.** The `auto` model (and the `<provider>/auto`
-   routers) is the most important user surface: classification, category
-   preferences, fair and latency-ranked rotation must keep being refined (real
-   measurements, not theory), because that is where "aggregator" becomes
-   "experience".
+2. **The router family as the main product.** `auto`, `auto-fast`,
+   `auto-thinking` — global and per provider — are the most important user
+   surface: classification, category preferences, pool contracts, fair and
+   latency-ranked rotation must keep being refined (real measurements, not
+   theory), because that is where "aggregator" becomes "experience".
 3. **Agent coding first-class.** Multi-protocol tool calling, per-model
    capability probing, `reasoning_content`, honest published context limits:
    any agent framework must work on the first try. Every new tool-call
@@ -354,6 +400,12 @@ impressed in the code:
 - **Endpoint shape**: provider-prefixed models on `/v1/models`; chat body with
   tolerated extras (`thinking`, `search_enabled`, `disable_proxy`); errors in
   OpenAI shape.
+- **Router ids are owned by the Router**: `auto`, `auto-fast`,
+  `auto-thinking` and every `<prefix>/<kind>` variant are reserved synthetic
+  routes (`_reserved_ids`); an upstream model with a colliding id is
+  namespaced, never allowed to hijack the router. The pool routers have a
+  hard contract: `auto-fast` never streams thinking, `auto-thinking` always
+  does — the per-request `thinking` flag is ignored on them.
 - **Provider registration**: tuple `(name, module, class)` in
   `PROVIDER_MODULES` (router) + public prefix in `PUBLIC_PREFIX` +
   ownership in `OWNED_BY`; lazy imports mandatory.
@@ -367,18 +419,18 @@ impressed in the code:
 | Path | Role |
 |---|---|
 | `dsk/openai_server.py` | OpenAI-compatible server, multi-protocol tool-call emulation, playground, management endpoints |
-| `dsk/providers/router.py` | Dynamic 24-provider registry, `auto` router, retry/fallback, runtime health |
+| `dsk/providers/router.py` | Dynamic 29-provider registry, router family (`auto` / `auto-fast` / `auto-thinking`, global + per provider), retry/fallback, runtime health |
 | `dsk/providers/base.py` | `Provider`/`Route` contract, typed errors, resilient HTTP, images |
 | `dsk/providers/jar.py` | Shared bot-managed cookie-jar helpers (lock-safe read/merge/write, `COOKIES_DIR` or project root, dict/list/bypass formats) |
 | `dsk/providers/__init__.py` | Multi-provider package docstring: the unified stream-chunk contract |
-| `dsk/providers/*_provider.py` | The 24 providers (4 classes: web, keyless, dormant, free-API) |
+| `dsk/providers/*_provider.py` | The 29 providers (4 classes: web, keyless, dormant, free-API) |
 | `dsk/providers/duck_solver.js` | Node.js solver (sandboxed `vm`) of duck.ai's anti-abuse challenges |
 | `dsk/chatgpt_relay.py`, `dsk/qwen_relay.py` | Browser relays over the real UIs (Sentinel/WAF walls) |
 | `tools/qwen/` | Aliyun slide-captcha solver (`solve_fast.py`: whiteness-blob + masked-NCC target detection with track calibration; `fetch_solve.sh` challenge fetcher) used by the qwen signup rung |
 | `dsk/refresher.py` | Credential bot: HTTP refresh → re-login → auto-signup, daemon + CLI |
 | `dsk/mailgen.py` | 7 throwaway mailbox backends with OTP extraction |
 | `dsk/selfheal.py` | Periodic probing + validated LLM auto-patch of providers |
-| `dsk/toolprobe.py` | Dynamic tool-calling capability probing per model |
+| `dsk/toolprobe.py` | Dynamic tool-calling capability probing per model; pool-aware `tools` annotation of the router entries |
 | `dsk/llmtrim.py` | Always-on payload trimmer to the context budget |
 | `dsk/proxies.py` | Dynamic proxy pool, fast-only, per-provider, no-proxy first-class |
 | `dsk/browser.py` | Shared Chromium (1 process, N tabs, reaper, hygiene) |
@@ -386,7 +438,7 @@ impressed in the code:
 | `dsk/bypass.py`, `dsk/CloudflareBypasser.py`, `dsk/server.py`, `dsk/run_and_get_cookies.py` | Cloudflare bypass and legacy of the original project |
 | `dsk/static/index.html` | Web playground |
 | `example.py` | Legacy usage example of the original `dsk` library (kept from upstream) |
-| `tests/` | 19 offline suites (provider contracts, router, credentials, relay, mailgen) |
+| `tests/` | 21 offline suites (provider contracts, router family, credentials, relay, mailgen) |
 | `Dockerfile`, `docker-compose.yml`, `.env.example` | Docker packaging with data volume and complete env surface |
 
 ---

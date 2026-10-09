@@ -64,7 +64,7 @@ import queue
 import re
 import threading
 import time
-from typing import Any, Dict, Generator, List, Optional, Set
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
 from .base import (
     Route,
@@ -424,6 +424,28 @@ AUTO_THINKING_MODEL_ID = 'auto-thinking'
 AUTO_ROUTER_KINDS = (AUTO_MODEL_ID, AUTO_FAST_MODEL_ID, AUTO_THINKING_MODEL_ID)
 
 
+def router_id_parts(model_id: str) -> Optional[Tuple[str, str]]:
+    """Split a synthetic router id into ``(kind, base)``.
+
+    ``kind`` is one of :data:`AUTO_ROUTER_KINDS`; ``base`` is ``''`` for the
+    global routers and the public namespace base for the provider-scoped ones
+    ('z.ai' for 'z.ai/auto-fast', 'deepseek' for 'deepseek/auto'). ``None``
+    for anything that is not a router id — leaf models included. Matching is
+    case-insensitive and reserved-id-safe: discovery never leaves a leaf
+    model under a '<base>/<kind>' id, so a True answer here always means a
+    route the Router itself owns.
+    """
+    mid = (model_id or '').strip().lower()
+    if mid in AUTO_ROUTER_KINDS:
+        return mid, ''
+    if '/' not in mid:
+        return None
+    base, tail = mid.rsplit('/', 1)
+    if tail in AUTO_ROUTER_KINDS:
+        return tail, base
+    return None
+
+
 def is_router_model_id(model_id: str) -> bool:
     """True for synthetic router ids owned by the Router itself.
 
@@ -433,11 +455,7 @@ def is_router_model_id(model_id: str) -> bool:
     router id is never probed or tracked like a leaf model. Ids are matched
     case-insensitively, exactly like Router.resolve().
     """
-    mid = (model_id or '').strip().lower()
-    if mid in AUTO_ROUTER_KINDS:
-        return True
-    tail = mid.rsplit('/', 1)[-1] if '/' in mid else ''
-    return tail in (AUTO_FAST_MODEL_ID, AUTO_THINKING_MODEL_ID)
+    return router_id_parts(model_id) is not None
 
 AUTO_CATEGORIES: Dict[str, List[str]] = {
     # pollinations leads image_gen: keyless + fast, burns no account quota
@@ -1420,6 +1438,13 @@ class Router:
             chain = [route.model_id] + [f for f in route.fallbacks
                                         if f != route.model_id]
         last_error: Optional[ProviderError] = None
+        # Per-provider failure notes of THIS walk: when the chain is
+        # exhausted the client must see why the model it asked for failed,
+        # not just the last provider's complaint (a chatgpt request that
+        # walked through a busy relay to a muted deepseek must not read as
+        # "deepseek muted"). First note per provider wins — the retry
+        # ladder would otherwise repeat the same line per attempt.
+        chain_notes: Dict[str, str] = {}
         walk_start = time.time()
 
         if images or image_generation:
@@ -1570,6 +1595,7 @@ class Router:
                     return
                 except ProviderRateLimitError as e:
                     last_error = e
+                    chain_notes.setdefault(served_by, str(e)[:100])
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
                     # Deliberately NOT demoted out of the healthy front: a
@@ -1596,6 +1622,7 @@ class Router:
                     # target on a stall cooldown so later chain positions are
                     # not re-waited either
                     last_error = e
+                    chain_notes.setdefault(served_by, str(e)[:100])
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
                     try:
@@ -1611,6 +1638,7 @@ class Router:
                     break
                 except ProviderUnavailableError as e:
                     last_error = e
+                    chain_notes.setdefault(served_by, str(e)[:100])
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
                     if attempt <= MAX_RETRIES:
@@ -1626,6 +1654,7 @@ class Router:
                 except ProviderAuthError as e:
                     # Credentials rejected/missing: retrying cannot help.
                     last_error = e
+                    chain_notes.setdefault(served_by, str(e)[:100])
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
                     logger.warning('%s auth failed, skipping to fallback: %s', served_by, e)
@@ -1644,6 +1673,7 @@ class Router:
                     break
                 except ProviderError as e:
                     last_error = e
+                    chain_notes.setdefault(served_by, str(e)[:100])
                     if emitted:
                         raise  # mid-stream failure: fallback would duplicate output
                     logger.warning('%s failed, skipping to fallback: %s', served_by, e)
@@ -1656,6 +1686,7 @@ class Router:
                     if emitted:
                         raise
                     last_error = ProviderError(f'{type(e).__name__}: {e}')
+                    chain_notes.setdefault(served_by, f'{type(e).__name__}: {e}'[:100])
                     logger.warning('%s crashed, skipping to fallback: %s',
                                    served_by, e)
                     self._mark_failed(target.provider_name,
@@ -1666,5 +1697,15 @@ class Router:
                 logger.info('falling back: %s -> %s', route.model_id, chain[position + 1])
 
         if last_error is not None:
+            if len(chain_notes) > 1:
+                # Same type and attributes (a 429 stays a 429 with its
+                # Retry-After), richer message: the full chain history.
+                try:
+                    last_error.args = (
+                        f'{last_error} [fallback chain exhausted: '
+                        + ' | '.join(f'{k}: {v}'
+                                      for k, v in chain_notes.items()) + ']',)
+                except Exception:  # noqa: BLE001 — message shaping only
+                    pass
             raise last_error
         raise ProviderError(f'No provider available for model {route.model_id}')

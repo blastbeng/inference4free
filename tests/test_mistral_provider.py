@@ -20,6 +20,10 @@ Covered here:
   - the full line-framed stream: order preserved, auth-wall hold window,
     terminal stop chunk, quota frame -> ProviderRateLimitError
   - _parse_line stays usable without diff state (back-compat)
+  - the chunk's declared type is REMEMBERED per chunk index, so the
+    ``/contentChunks/N/text`` appends that carry the reasoning summary on a
+    reasoning-typed chunk stay ``thinking`` (the OpenWebUI leak: the summary
+    arriving as ``delta.content``)
 
 No network: the response object is faked.
 
@@ -273,6 +277,111 @@ def test_junk_lines_are_tolerated():
     assert p._parse_line('15:not-json') == []
     assert p._parse_line('15:null') == []
     assert p._parse_line('16:' + json.dumps({'json': {'type': 'metadata'}})) == []
+
+
+# ------------------------------------------------- chunk type memory (the leak)
+# The reasoning summary is NOT streamed on a ``reasoning`` field: the Work
+# harness streams it as ordinary appends on ``/contentChunks/N/text`` of the
+# chunk whose object declared ``type: reasoning``. Classifying those appends
+# from the field name alone says "text" -> the summary lands in
+# delta.content, which is the exact OpenWebUI symptom (the reply looks like
+# nothing but the thinking). The chunk type must be REMEMBERED.
+
+def test_reasoning_chunk_type_carries_to_later_text_appends():
+    lines = [
+        _frame([{'op': 'add', 'path': '/contentChunks/-',
+                 'value': {'type': 'reasoning', 'text': 'The user says "Say OK".'}}]),
+        _frame([{'op': 'append', 'path': '/contentChunks/0/text',
+                 'value': ' I just answer OK.'}]),
+        _frame([{'op': 'append', 'path': '/contentChunks/0/text',
+                 'value': ' Nothing else.'}]),
+    ]
+    out = _drain(lines)
+    assert _text_of(out, 'thinking') == ('The user says "Say OK".'
+                                         ' I just answer OK. Nothing else.')
+    assert _text_of(out, 'text') == ''
+
+
+def test_answer_chunk_appends_stay_text():
+    lines = [
+        _frame([{'op': 'add', 'path': '/contentChunks/-',
+                 'value': {'type': 'reasoning', 'text': 'plan: say OK'}}]),
+        _frame([{'op': 'add', 'path': '/contentChunks/-',
+                 'value': {'type': 'text', 'text': 'OK'}}]),
+        _frame([{'op': 'append', 'path': '/contentChunks/1/text',
+                 'value': '.'}]),
+    ]
+    out = _drain(lines)
+    assert _text_of(out, 'text') == 'OK.'
+    assert _text_of(out, 'thinking') == 'plan: say OK'
+
+
+def test_snapshot_string_entries_use_the_remembered_chunk_type():
+    lines = [
+        _frame([{'op': 'add', 'path': '/contentChunks/-',
+                 'value': {'type': 'reasoning', 'text': 'step 1'}}]),
+        # a snapshot of bare strings for the same chunk index
+        _frame([{'op': 'replace', 'path': '/contentChunks',
+                 'value': ['step 1, step 2']}]),
+    ]
+    out = _drain(lines)
+    assert _text_of(out, 'thinking') == 'step 1, step 2'
+    assert _text_of(out, 'text') == ''
+
+
+def test_untouched_chunks_still_default_to_text():
+    # No chunk object was ever seen for index 3: the append is prose.
+    p = _provider()
+    out = p._parse_line(_frame([{'op': 'append', 'path': '/contentChunks/3/text',
+                                 'value': 'plain prose'}]), {}, {}, {})
+    assert out[0]['type'] == 'text'
+
+
+def test_reasoning_chunk_type_survives_a_full_turn():
+    lines = [
+        _frame([{'op': 'add', 'path': '/contentChunks/-',
+                 'value': {'type': 'reasoning', 'text': 'The user just sent "Say OK".'}}]),
+        _frame([{'op': 'append', 'path': '/contentChunks/0/text',
+                 'value': ' Trivial: answer OK.'}]),
+        _frame([{'op': 'add', 'path': '/contentChunks/-',
+                 'value': {'type': 'text', 'text': 'OK'}}]),
+        _frame([{'op': 'append', 'path': '/contentChunks/1/text',
+                 'value': '!'}]),
+    ]
+    out = _drain(lines)
+    assert _text_of(out, 'thinking') == ('The user just sent "Say OK".'
+                                         ' Trivial: answer OK.')
+    assert _text_of(out, 'text') == 'OK!'
+    assert out[-1]['finish_reason'] == 'stop'
+
+
+def test_a_typeless_chunk_object_clears_the_memory():
+    # The chunk object is authoritative for its index: when the harness
+    # reuses the reasoning chunk's index for the answer (a snapshot with no
+    # 'type'), the appends must go back to being prose.
+    lines = [
+        _frame([{'op': 'add', 'path': '/contentChunks/-',
+                 'value': {'type': 'reasoning', 'text': 'plan'}}]),
+        _frame([{'op': 'replace', 'path': '/contentChunks/0',
+                 'value': {'text': 'plan OK'}}]),
+        _frame([{'op': 'append', 'path': '/contentChunks/0/text',
+                 'value': '!'}]),
+    ]
+    out = _drain(lines)
+    assert _text_of(out, 'thinking') == 'plan'
+    assert _text_of(out, 'text') == ' OK!'
+
+
+def test_parse_line_accepts_the_types_state_and_records_it():
+    p = _provider()
+    state, kinds = {}, {}
+    p._parse_line(_frame([{'op': 'replace', 'path': '/contentChunks/2',
+                           'value': {'type': 'thinking', 'text': 'x'}}]),
+                  state, {}, kinds)
+    assert kinds == {'contentChunks/2': 'thinking'}
+    nxt = p._parse_line(_frame([{'op': 'append', 'path': '/contentChunks/2/text',
+                                 'value': 'yy'}]), state, {}, kinds)
+    assert nxt[0]['type'] == 'thinking'
 
 
 if __name__ == '__main__':

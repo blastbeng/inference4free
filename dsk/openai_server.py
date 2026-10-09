@@ -41,6 +41,7 @@ Run:  python -m dsk.openai_server
 import base64
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -859,7 +860,15 @@ def _sse(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def _error_response(message: str, err_type: str, code: str, status: int) -> JSONResponse:
+def _error_response(message: str, err_type: str, code: str, status: int,
+                    retry_after: Optional[float] = None) -> JSONResponse:
+    headers: Dict[str, str] = {}
+    if retry_after and retry_after > 0:
+        # Free-tier quotas are day/IP-bound and a retry storm burns the whole
+        # window: tell the client (OpenWebUI, litellm, curl) when to come
+        # back. HTTP requires an integer, so round UP — rounding down would
+        # invite a retry inside the wall.
+        headers["Retry-After"] = str(int(math.ceil(retry_after)))
     return JSONResponse(
         status_code=status,
         content={
@@ -870,6 +879,7 @@ def _error_response(message: str, err_type: str, code: str, status: int) -> JSON
                 "code": code,
             }
         },
+        headers=headers,
     )
 
 
@@ -1562,7 +1572,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 None, _collect))
     except ProviderError as e:
         err_type, code, status = _error_status(e)
-        return _error_response(str(e), err_type, code, status)
+        return _error_response(str(e), err_type, code, status,
+                               getattr(e, 'retry_after', None))
     except Exception as e:  # noqa: BLE001 — always answer OpenAI-shaped
         return _error_response(f'{type(e).__name__}: {e}', 'api_error',
                                'upstream_error', 502)
@@ -1655,17 +1666,21 @@ async def _stream_completion(
     }
     yield _sse(first)
 
-    def _error_sse(message: str, err_type: str = "api_error", code: str = "upstream_error") -> str:
-        return _sse(
-            {
-                "error": {
-                    "message": message,
-                    "type": err_type,
-                    "param": None,
-                    "code": code,
-                }
-            }
-        )
+    def _error_sse(message: str, err_type: str = "api_error",
+                   code: str = "upstream_error",
+                   retry_after: Optional[float] = None) -> str:
+        payload: Dict[str, Any] = {
+            "message": message,
+            "type": err_type,
+            "param": None,
+            "code": code,
+        }
+        if retry_after and retry_after > 0:
+            # SSE has no headers to carry Retry-After, so the hint travels in
+            # the error object: free-tier quotas are day/IP-bound and a
+            # retry storm burns the whole window.
+            payload["retry_after"] = int(math.ceil(retry_after))
+        return _sse({"error": payload})
 
     # Thread-safe bridge: the worker runs in a plain thread, the consumer
     # awaits items via run_in_executor (asyncio.Queue is NOT thread-safe
@@ -1828,7 +1843,8 @@ async def _stream_completion(
         except ProviderRateLimitError as e:
             errored["flag"] = True
             _flush_prose()
-            q.put(_error_sse(f"Rate limit: {e}", "rate_limit_error", "rate_limit"))
+            q.put(_error_sse(f"Rate limit: {e}", "rate_limit_error", "rate_limit",
+                             getattr(e, "retry_after", None)))
             q.put(None)
         except ProviderError as e:
             errored["flag"] = True
@@ -1950,7 +1966,8 @@ async def images_generations(body: ImageGenerationRequest, request: Request):
     error, urls = await asyncio.get_running_loop().run_in_executor(None, _generate)
     if error is not None:
         err_type, code, status = _error_status(error)
-        return _error_response(str(error), err_type, code, status)
+        return _error_response(str(error), err_type, code, status,
+                               getattr(error, 'retry_after', None))
     if not urls:
         return _error_response("the model did not return any image",
                                "api_error", "no_image_returned", 502)
@@ -1971,7 +1988,8 @@ async def images_generations(body: ImageGenerationRequest, request: Request):
         data = await asyncio.get_running_loop().run_in_executor(None, _encode)
     except ProviderError as e:
         err_type, code, status = _error_status(e)
-        return _error_response(str(e), err_type, code, status)
+        return _error_response(str(e), err_type, code, status,
+                               getattr(e, 'retry_after', None))
     except Exception as e:  # noqa: BLE001 — always answer OpenAI-shaped
         return _error_response(f'{type(e).__name__}: {e}', 'api_error',
                                'upstream_error', 502)
@@ -1984,14 +2002,13 @@ def _child_reaper() -> None:
     As PID 1 the server receives every orphan; without this, crashed
     chromium launches accumulate hundreds of zombies until the container's
     pid limit chokes (observed: 500+ after a day of refresh cycles).
+
+    The SIGCHLD handler is installed by main() on the MAIN THREAD —
+    signal.signal() raises ValueError in any other thread, and a thread
+    that dies at startup reaps nothing while looking healthy in the logs.
     """
-    import signal
     import time as _time
 
-    def _handler(signum, frame):  # noqa: ARG001 — signal signature
-        pass
-
-    signal.signal(signal.SIGCHLD, _handler)
     while True:
         try:
             while True:
@@ -2004,12 +2021,27 @@ def _child_reaper() -> None:
 
 
 def main():
+    import signal
     import uvicorn
 
     # Surface dsk.* logger.info lines (llmtrim stats, registry updates,
     # refresher/copyist activity) on stderr alongside uvicorn's own logs.
     logging.basicConfig(level=logging.INFO,
                         format='%(levelname)s:%(name)s: %(message)s')
+
+    def _reap_handler(signum, frame):  # noqa: ARG001 — signal signature
+        pass
+
+    # A no-op SIGCHLD handler disables the kernel's auto-reap so the
+    # reaper thread's waitpid loop can drain the exit-status queue.
+    # signal.signal is MAIN-THREAD-ONLY: installing it inside the reaper
+    # thread killed the thread at startup (ValueError, 21x today) and
+    # the zombie protection it exists for never ran.
+    try:
+        signal.signal(signal.SIGCHLD, _reap_handler)
+    except ValueError:  # noqa: BLE001 — non-main entry (tests): no reaping
+        logger.warning('SIGCHLD handler not installed (not main thread); '
+                       'zombie reaping disabled')
     threading.Thread(target=_child_reaper, daemon=True,
                      name='child-reaper').start()
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")

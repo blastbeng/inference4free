@@ -84,6 +84,13 @@ def _kind_for(field: str, chunk_type: str) -> str:
     return 'thinking' if any(k in blob for k in _REASON_KEYS) else 'text'
 
 
+def _chunk_key(path: str) -> str:
+    """``/contentChunks/3/text`` -> ``contentChunks/3``: the identity of the
+    CHUNK a path writes into. Empty when the path has no numeric index."""
+    m = re.search(r'/contentChunks/(\d+)', path or '')
+    return f'contentChunks/{m.group(1)}' if m else ''
+
+
 MISTRAL_BASE_URL = 'https://chat.mistral.ai'
 MISTRAL_AUTH_URL = 'https://auth.mistral.ai'
 MISTRAL_CHAT_URL = f'{MISTRAL_BASE_URL}/api/chat'
@@ -410,11 +417,13 @@ class MistralProvider(Provider):
         held: List[Dict[str, Any]] = []   # pieces buffered during the window
         emitted: Dict[str, int] = {}      # chars already sent, per chunk field
         counters: Dict[str, int] = {}     # '/-' JSON-Pointer appends -> index
+        kinds: Dict[str, str] = {}        # chunk key -> its declared type
         for chunk in response.iter_content(chunk_size=None):
             buffer += decoder.decode(chunk or b'')
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
-                for piece in self._parse_line(line.strip(), emitted, counters):
+                for piece in self._parse_line(line.strip(), emitted, counters,
+                                              kinds):
                     if len(prefix) < 300:
                         head = piece.get('content') \
                             if piece.get('type') == 'text' else None
@@ -431,7 +440,8 @@ class MistralProvider(Provider):
                     yield piece
         buffer += decoder.decode(b'', final=True)
         if buffer.strip():
-            for piece in self._parse_line(buffer.strip(), emitted, counters):
+            for piece in self._parse_line(buffer.strip(), emitted, counters,
+                                          kinds):
                 while held:
                     yield held.pop(0)
                 yield piece
@@ -447,17 +457,33 @@ class MistralProvider(Provider):
                 f'{text[:120]}')
 
     def _chunk_pieces(self, chunk: Dict[str, Any], key: str,
-                      emitted: Dict[str, int]) -> List[Dict[str, Any]]:
+                      emitted: Dict[str, int],
+                      types: Optional[Dict[str, str]] = None
+                      ) -> List[Dict[str, Any]]:
         """Diff one contentChunk object against what was sent for ``key``.
 
         Snapshots (``replace`` with the full chunk list, ``add`` of a new
         chunk) carry the WHOLE text of the chunk, so the tail is what is
         emitted; appends on ``…/text`` are true deltas and are counted into
         the same key, which is what keeps the two paths from double-sending.
+
+        The chunk's ``type`` is also RECORDED in ``types`` under its chunk
+        key: the reasoning summary usually arrives as plain appends on
+        ``/contentChunks/N/text`` (no type in the patch), and the only thing
+        that says "chunk N is the reasoning chunk" is the chunk object seen
+        earlier. Without that memory those appends classify as ``text`` and
+        the summary lands in ``delta.content`` — the original bug.
         """
         ctype = str(chunk.get('type') or '').lower()
         if ctype in _SKIP_CHUNK_TYPES:
             return []
+        if types is not None:
+            # The chunk object is AUTHORITATIVE for its index: a type-less
+            # snapshot clears an earlier type, so a later answer that reuses
+            # the index is not classified by the reasoning chunk's type.
+            ck = _chunk_key(key)
+            if ck:
+                types[ck] = ctype
         out: List[Dict[str, Any]] = []
         for field in _TEXT_KEYS + _REASON_KEYS:
             value = chunk.get(field)
@@ -475,7 +501,8 @@ class MistralProvider(Provider):
 
     def _parse_line(self, line: str,
                     emitted: Optional[Dict[str, int]] = None,
-                    counters: Optional[Dict[str, int]] = None
+                    counters: Optional[Dict[str, int]] = None,
+                    types: Optional[Dict[str, str]] = None
                     ) -> List[Dict[str, Any]]:
         if not line or ':' not in line:
             return []
@@ -513,6 +540,7 @@ class MistralProvider(Provider):
         # Callers that pass no state get stateless (append-semantics) parsing.
         sent = emitted if emitted is not None else {}
         counts = counters if counters is not None else {}
+        kinds = types if types is not None else {}
         out: List[Dict[str, Any]] = []
         for patch in j.get('patches', []):
             if not isinstance(patch, dict):
@@ -534,7 +562,9 @@ class MistralProvider(Provider):
                     continue
                 self._wall_check(value)
                 field = path.rsplit('/', 1)[-1]
-                kind = _kind_for(field, '')
+                # The chunk's remembered type is the only signal that a
+                # ``…/text`` append belongs to the reasoning chunk.
+                kind = _kind_for(field, kinds.get(_chunk_key(path), ''))
                 done = sent.get(path, 0)
                 if op == 'append':
                     sent[path] = done + len(value)
@@ -549,16 +579,19 @@ class MistralProvider(Provider):
                 for i, entry in enumerate(value):
                     if isinstance(entry, dict):
                         out.extend(self._chunk_pieces(
-                            entry, f"{path}/{i}", sent))
+                            entry, f"{path}/{i}", sent, kinds))
                     elif isinstance(entry, str) and entry:
                         self._wall_check(entry)
                         ck = f"{path}/{i}/text"
                         done = sent.get(ck, 0)
                         if len(entry) > done:
                             sent[ck] = len(entry)
-                            out.append({'content': entry[done:], 'type': 'text',
+                            out.append({'content': entry[done:],
+                                        'type': _kind_for(
+                                            'text',
+                                            kinds.get(_chunk_key(ck), '')),
                                         'finish_reason': None})
                 continue
             if isinstance(value, dict):
-                out.extend(self._chunk_pieces(value, path, sent))
+                out.extend(self._chunk_pieces(value, path, sent, kinds))
         return out

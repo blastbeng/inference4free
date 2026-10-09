@@ -433,6 +433,160 @@ def test_pool_rotations_use_independent_cursors(tmp):
     assert any(k.startswith('pauto:auto-fast:qwen') for k in keys), keys
 
 
+# ----------------------- 6. router-id recognition & /v1/models tools flag
+
+def test_router_id_helpers(tmp):
+    """router_id_parts/is_router_model_id cover ALL router kinds — including
+    '<prefix>/auto' (regression: the tail check used to know only about the
+    two pool kinds, so deepseek/auto stopped being recognized as a router id
+    by the /v1 gates and the toolprobe)."""
+    parts = router_mod.router_id_parts
+    is_rid = router_mod.is_router_model_id
+
+    # global routers
+    assert parts('auto') == ('auto', '')
+    assert parts('auto-fast') == ('auto-fast', '')
+    assert parts('auto-thinking') == ('auto-thinking', '')
+    # provider-scoped routers — every kind, public prefix or bare name
+    assert parts('deepseek/auto') == ('auto', 'deepseek')
+    assert parts('z.ai/auto-fast') == ('auto-fast', 'z.ai')
+    assert parts('alibaba/auto-thinking') == ('auto-thinking', 'alibaba')
+    # case-insensitive, exactly like resolve()
+    assert parts('AUTO') == ('auto', '')
+    assert parts('DeepSeek/Auto') == ('auto', 'deepseek')
+    assert is_rid('Z.AI/AUTO-FAST')
+    # leaf ids never match
+    assert parts('deepseek-chat') is None
+    assert parts('deepseek/deepseek-chat') is None
+    assert parts('z.ai/glm-4.7') is None
+    assert parts('') is None
+    assert parts(None) is None
+    assert parts('auto/custom') is None
+    assert parts('x/auto-fast-turbo') is None
+    assert not is_rid('deepseek/deepseek-chat')
+    # the regression itself: '<prefix>/auto' must stay a router id
+    assert is_rid('deepseek/auto')
+    assert is_rid('openai/auto')
+
+
+def test_annotate_models_router_tools_flag(tmp):
+    """The /v1/models 'tools' flag on router entries is pool-aware: global
+    routers look at every provider's pool leaves, provider-scoped routers
+    only at their own, and auto-fast/auto-thinking only at their pool's
+    leaves (same strict partition the router serves with)."""
+    from dsk import toolprobe
+    saved_state, saved_loaded = toolprobe._state, toolprobe._loaded
+    saved_hide = os.environ.get('I4F_HIDE_TOOLLESS')
+    toolprobe._state = {}
+    toolprobe._loaded = True          # _load() becomes a no-op: no disk I/O
+    os.environ['I4F_HIDE_TOOLLESS'] = '0'
+    try:
+        toolprobe._state.update({
+            'deepseek/deepseek-chat': {'status': 'ok'},
+            'deepseek/deepseek-reasoner': {'status': 'failed'},
+            'z.ai/glm-4.6': {'status': 'ok'},
+            'z.ai/glm-4.7': {'status': 'unknown'},
+        })
+        data = [
+            {'id': 'auto'},
+            {'id': 'auto-fast'},
+            {'id': 'auto-thinking'},
+            {'id': 'deepseek/auto'},
+            {'id': 'deepseek/auto-fast'},
+            {'id': 'deepseek/auto-thinking'},
+            {'id': 'deepseek/deepseek-chat',
+             'thinking_enabled': False, 'search_enabled': False},
+            {'id': 'deepseek/deepseek-reasoner',
+             'thinking_enabled': True, 'search_enabled': False},
+            {'id': 'z.ai/glm-4.6',
+             'thinking_enabled': False, 'search_enabled': False},
+            {'id': 'z.ai/glm-4.7',
+             'thinking_enabled': True, 'search_enabled': False},
+        ]
+        out = {e['id']: e for e in toolprobe.annotate_models(data)}
+        assert out['auto']['tools'] is True            # any leaf ok
+        assert out['auto-fast']['tools'] is True       # glm-4.6 ok in pool
+        assert out['auto-thinking']['tools'] is True   # glm-4.7 unknown
+        assert out['deepseek/auto']['tools'] is True   # deepseek-chat ok
+        assert out['deepseek/auto-fast']['tools'] is True
+        assert out['deepseek/auto-thinking']['tools'] is False  # all failed
+        assert out['deepseek/deepseek-reasoner']['tools'] is False
+
+        # every deepseek leaf failed: the provider routers flip to False,
+        # the global routers survive on z.ai
+        toolprobe._state['deepseek/deepseek-chat']['status'] = 'failed'
+        out = {e['id']: e for e in toolprobe.annotate_models(data)}
+        assert out['deepseek/auto']['tools'] is False
+        assert out['deepseek/auto-fast']['tools'] is False
+        assert out['auto']['tools'] is True
+        assert out['auto-fast']['tools'] is True       # z.ai/glm-4.6 ok
+
+        # all thinking leaves failed -> auto-thinking False, auto still True
+        toolprobe._state['z.ai/glm-4.7']['status'] = 'failed'
+        out = {e['id']: e for e in toolprobe.annotate_models(data)}
+        assert out['auto-thinking']['tools'] is False
+        assert out['auto']['tools'] is True
+
+        # hide_toolless drops failed LEAVES but never router entries
+        os.environ['I4F_HIDE_TOOLLESS'] = '1'
+        ids = [e['id'] for e in toolprobe.annotate_models(data)]
+        assert 'deepseek/deepseek-reasoner' not in ids
+        assert 'z.ai/glm-4.7' not in ids
+        for rid in ('auto', 'auto-fast', 'auto-thinking',
+                    'deepseek/auto', 'deepseek/auto-fast',
+                    'deepseek/auto-thinking'):
+            assert rid in ids, ids
+    finally:
+        toolprobe._state = saved_state
+        toolprobe._loaded = saved_loaded
+        if saved_hide is None:
+            os.environ.pop('I4F_HIDE_TOOLLESS', None)
+        else:
+            os.environ['I4F_HIDE_TOOLLESS'] = saved_hide
+
+
+# ------------------------------------- chain-exhaustion error aggregation
+
+def test_chain_exhaustion_names_every_failed_provider(tmp):
+    """The client must see WHY its model failed, not the last provider's
+    complaint: a chatgpt request that walked a busy relay into a muted
+    deepseek must not read as "deepseek muted" alone."""
+    a = FakeProvider('chatgpt', [{'id': 'gpt-5'}],
+                     error=ProviderError('chatgpt browser relay: relay busy '
+                                         'with another stream'))
+    b = FakeProvider('deepseek', [{'id': 'deepseek-chat'}],
+                     error=ProviderAuthError('deepseek account muted '
+                                             '(biz_code=5: user is muted)'))
+    router = build_router({'chatgpt': a, 'deepseek': b})
+    route = router.resolve('auto')
+    with no_refresher(), no_retries():
+        try:
+            list(router.stream(route, 'hi'))
+            raise AssertionError('expected the chain to exhaust into an error')
+        except ProviderAuthError as e:
+            msg = str(e)
+    # the LAST provider's exception type is preserved (auth -> 401 mapping)
+    assert 'deepseek account muted' in msg
+    # and the full chain history travels with it
+    assert 'relay busy with another stream' in msg
+    assert 'fallback chain exhausted' in msg
+
+
+def test_single_provider_failure_message_stays_untouched(tmp):
+    """One provider, one failure: no chain summary is appended — the
+    message must stay byte-identical to the provider's own error."""
+    a = FakeProvider('chatgpt', [{'id': 'gpt-5'}],
+                     error=ProviderError('relay busy with another stream'))
+    router = build_router({'chatgpt': a})
+    route = router.resolve('chatgpt-gpt-5')
+    with no_refresher(), no_retries():
+        try:
+            list(router.stream(route, 'hi'))
+            raise AssertionError('expected the provider error to surface')
+        except ProviderError as e:
+            assert str(e) == 'relay busy with another stream'
+
+
 # ------------------------------------------------------------- runner
 
 def _main() -> int:

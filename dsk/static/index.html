@@ -582,23 +582,32 @@ function renderModelList(data) {
   const prev = modelSel.dataset.want || modelSel.value || '';
   modelInfo = {};
   modelSel.innerHTML = '';
-  // 'auto' smart router first, in its own group; it is the default pick.
-  const autoEntry = (data.data || []).find((m) => m.id === 'auto');
-  if (autoEntry) {
-    modelInfo['auto'] = autoEntry;
-    const og = document.createElement('optgroup');
-    og.label = '⚡ smart router';
+  // Global smart routers first, in their own group; 'auto' is the default
+  // pick. Per-provider routers ('deepseek/auto', 'z.ai/auto-fast', …) stay
+  // inside their provider group below, marked with ⚡.
+  const ROUTERS = [
+    ['auto', '⚡ auto — smart router (best model per request)'],
+    ['auto-fast', '⚡ auto-fast — never thinks (no reasoning output)'],
+    ['auto-thinking', '⚡ auto-thinking — always thinks (reasoning output)']
+  ];
+  const routerIds = new Set(ROUTERS.map(([id]) => id));
+  const routerGroup = document.createElement('optgroup');
+  routerGroup.label = '⚡ smart routers';
+  for (const [rid, label] of ROUTERS) {
+    const entry = (data.data || []).find((m) => m.id === rid);
+    if (!entry) continue;
+    modelInfo[rid] = entry;
     const opt = document.createElement('option');
-    opt.value = 'auto';
-    opt.textContent = '⚡ auto — smart router (best model per request)';
-    og.appendChild(opt);
-    modelSel.appendChild(og);
+    opt.value = rid;
+    opt.textContent = label;
+    routerGroup.appendChild(opt);
   }
+  if (routerGroup.children.length) modelSel.appendChild(routerGroup);
   // providers (optgroups) sorted alphabetically, models sorted within each
   // group — independent of whatever order the API returns them in.
   const groups = {};   // owned_by -> [{...model}]
   for (const m of data.data || []) {
-    if (m.id === 'auto') continue;
+    if (routerIds.has(m.id)) continue;
     modelInfo[m.id] = m;
     const owner = m.owned_by || 'other';
     (groups[owner] = groups[owner] || []).push(m);
@@ -615,7 +624,9 @@ function renderModelList(data) {
       if (m.search_enabled) bits.push('🔍');
       if (m.vision) bits.push('📷');
       if (m.image_gen) bits.push('🎨');
-      opt.textContent = m.id + (bits.length ? '  ' + bits.join(' ') : '');
+      const isRouter = /\/(auto|auto-fast|auto-thinking)$/.test(m.id);
+      opt.textContent = (isRouter ? '⚡ ' : '') + m.id
+        + (bits.length ? '  ' + bits.join(' ') : '');
       og.appendChild(opt);
     }
     modelSel.appendChild(og);

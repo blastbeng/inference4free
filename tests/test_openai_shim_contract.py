@@ -138,6 +138,30 @@ def test_rate_limit_arrives_as_an_error_event_without_a_stop():
                for e in events for c in (e.get('choices') or []))
 
 
+def test_rate_limit_carries_the_retry_hint():
+    # SSE has no headers, so the quota window travels in the error object:
+    # clients must be able to back off instead of burning the whole day.
+    def gen():
+        # a yield is what makes this a GENERATOR: without it the raise fires
+        # at call time, outside the shim, and the test proves nothing.
+        yield {'content': '', 'type': 'text', 'finish_reason': None}
+        raise ProviderRateLimitError('Message rate limit reached', retry_after=1830.4)
+
+    events = _events(gen())
+    errs = [e['error'] for e in events if 'error' in e]
+    assert errs[0].get('retry_after') == 1831
+
+
+def test_rate_limit_without_a_hint_sends_no_retry_after():
+    def gen():
+        yield {'content': '', 'type': 'text', 'finish_reason': None}
+        raise ProviderRateLimitError('rate limited')
+
+    events = _events(gen())
+    errs = [e['error'] for e in events if 'error' in e]
+    assert 'retry_after' not in errs[0]
+
+
 def test_auth_failure_is_reported_as_invalid_token():
     def gen():
         yield {'content': 'x', 'type': 'thinking', 'finish_reason': None}

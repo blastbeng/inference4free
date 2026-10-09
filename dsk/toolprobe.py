@@ -392,28 +392,53 @@ def annotate_models(data: List[Dict[str, Any]]
     """Set the ``tools`` flag on /v1/models entries and drop toolless ones.
 
     Leaf models: flag from their own probe state ('failed' -> False).
-    Router entries ('auto', '<prefix>/auto'): True while ANY sibling leaf is
-    ok or unknown (they re-route at serve time), False only when every
-    sibling leaf is known-failed; router entries are never hidden — they can
-    still serve plain chat."""
+    Router entries ('auto', 'auto-fast', 'auto-thinking' plus every
+    '<prefix>/<kind>' variant): True while ANY leaf in the router's POOL is
+    ok or unknown (the router re-routes at serve time), False only when
+    every pool leaf is known-failed; router entries are never hidden — they
+    can still serve plain chat. The pool is the same strict partition the
+    router serves with (auto-fast: leaves that can never think and never
+    search; auto-thinking: thinking-capable leaves), read from the
+    /v1/models capability metadata. Global routers consider every
+    provider's pool leaves; provider-scoped routers ('z.ai/auto-fast', …)
+    only that provider's."""
+    from dsk.providers.router import (AUTO_FAST_MODEL_ID,
+                                      AUTO_THINKING_MODEL_ID,
+                                      router_id_parts)
     hide = hide_toolless()
     out: List[Dict[str, Any]] = []
-    leaf_status: Dict[str, str] = {}
+    leaf_status: Dict[str, Tuple[str, Dict[str, Any]]] = {}
     for e in data:
         mid = str(e.get('id') or '')
         if not _is_router_model(mid):
-            leaf_status[mid] = capability(mid)
+            leaf_status[mid] = (capability(mid), e)
+
+    def _pool_leaves(kind: str, base: str) -> List[str]:
+        found: List[str] = []
+        for m, (_st, e) in leaf_status.items():
+            if base and m.split('/', 1)[0] != base:
+                continue  # provider-scoped router: only its own leaves
+            if kind == AUTO_FAST_MODEL_ID:
+                # pool: models that can never think and never search
+                if e.get('thinking_enabled') or e.get('search_enabled'):
+                    continue
+            elif kind == AUTO_THINKING_MODEL_ID:
+                if not e.get('thinking_enabled'):
+                    continue
+            found.append(m)
+        return found
+
     for e in data:
         mid = str(e.get('id') or '')
-        if _is_router_model(mid):
-            prefix = mid[:-len('/auto')] if mid != 'auto' else ''
-            statuses = [s for m, s in leaf_status.items()
-                        if (m.split('/', 1)[0] == prefix) or not prefix]
+        parts = router_id_parts(mid)
+        if parts is not None:
+            kind, base = parts
+            statuses = [leaf_status[m][0] for m in _pool_leaves(kind, base)]
             e['tools'] = (True if any(s != 'failed' for s in statuses)
                           else (False if statuses else 'unknown'))
             out.append(e)
             continue
-        st = leaf_status.get(mid, 'unknown')
+        st = leaf_status.get(mid, ('unknown', None))[0]
         e['tools'] = {'ok': True, 'failed': False}.get(st, 'unknown')
         if hide and st == 'failed':
             continue
