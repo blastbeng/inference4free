@@ -605,6 +605,133 @@ def test_single_provider_failure_message_stays_untouched(tmp):
             assert str(e) == 'relay busy with another stream'
 
 
+# --------------------------------------------- EMPTY ANSWER fallback walk
+# Measured live (2026-10-09): duck/tinfoil/gpt-oss-120b closed its stream
+# with finish 'stop' and ZERO deltas — the client (OpenWebUI) received a
+# 200 with an empty message; other targets reported only reasoning deltas
+# and no answer ("mostra solo il pensiero"). An empty completion is not a
+# success: the walk must continue to the next target.
+
+class ScriptedProvider:
+    """Fake provider whose stream() replays scripted chunk sequences."""
+
+    def __init__(self, name, models, script):
+        self.name = name
+        self._models = list(models)
+        self._script = dict(script)     # upstream model -> list of chunks
+        self.calls = []
+
+    def available(self, auth_key=None):
+        return True
+
+    def list_models(self, auth_key=None):
+        return list(self._models)
+
+    def stream(self, prompt, model=None, **kwargs):
+        self.calls.append(model)
+        yield from self._script.get(model, [])
+
+
+def test_empty_stream_falls_back_to_the_next_target(tmp):
+    """A target that ends with zero answer chunks (duck's live failure:
+    a single empty finish frame) must not be served to the client as a
+    success — the next target answers instead."""
+    empty = ScriptedProvider('duck', [{'id': 'oss-120b'}], {
+        # the live shape: one chunk, no content, finish 'stop'
+        'oss-120b': [{'content': '', 'type': 'text',
+                      'finish_reason': 'stop'}],
+    })
+    glm = FakeProvider('glm', [{'id': 'glm-4.7'}])
+    router = build_router({'duck': empty, 'glm': glm})
+    # duck measured fast, glm slow: the empty target LEADS the chain
+    router._lat['duck'] = 0.5
+    router._lat['glm'] = 50.0
+    chunks = list(router.stream(router.resolve('auto'), 'hi'))
+    texts = [c.get('content') for c in chunks
+             if c.get('type') == 'text' and c.get('content')]
+    assert 'glm:glm-4.7' in texts, chunks
+    # the empty target was tried exactly once, then walked past
+    assert empty.calls == ['oss-120b']
+    assert glm.calls == ['glm-4.7']
+
+
+def test_zero_chunk_stream_falls_back(tmp):
+    """A generator that closes without yielding ANY chunk is the same
+    defect: a silent 200 with an empty message must never be a success."""
+    silent = ScriptedProvider('silent', [{'id': 'silent-m1'}], {'silent-m1': []})
+    glm = FakeProvider('glm', [{'id': 'glm-4.7'}])
+    router = build_router({'silent': silent, 'glm': glm})
+    router._lat['silent'] = 0.5
+    router._lat['glm'] = 50.0
+    chunks = list(router.stream(router.resolve('auto'), 'hi'))
+    texts = [c.get('content') for c in chunks
+             if c.get('type') == 'text' and c.get('content')]
+    assert 'glm:glm-4.7' in texts, chunks
+    assert silent.calls == ['silent-m1']
+
+
+def test_reasoning_only_stream_falls_back_and_keeps_the_thinking(tmp):
+    """The OpenWebUI report: thinking streamed, then the target closed
+    without an answer. The already-streamed reasoning stays; the walk
+    continues (it cannot duplicate ANSWER text — none was emitted)."""
+    thinker = ScriptedProvider('thinker', [{'id': 't1'}], {
+        't1': [
+            {'content': 'plan: use the web search tool', 'type': 'thinking',
+             'finish_reason': None},
+            {'content': '', 'type': 'text', 'finish_reason': 'stop'},
+        ],
+    })
+    glm = FakeProvider('glm', [{'id': 'glm-4.7'}])
+    router = build_router({'thinker': thinker, 'glm': glm})
+    router._lat['thinker'] = 0.5
+    router._lat['glm'] = 50.0
+    chunks = list(router.stream(router.resolve('auto'), 'hi'))
+    thinking = [c.get('content') for c in chunks
+                if c.get('type') == 'thinking']
+    assert 'plan: use the web search tool' in thinking, chunks
+    texts = [c.get('content') for c in chunks
+             if c.get('type') == 'text' and c.get('content')]
+    assert 'glm:glm-4.7' in texts, chunks
+    assert thinker.calls == ['t1']
+    assert glm.calls == ['glm-4.7']
+
+
+def test_image_only_answer_is_not_an_empty_answer(tmp):
+    """Image renders answer with a markdown picture and no text — that IS
+    an answer: no fallback may follow a served image chunk."""
+    painter = ScriptedProvider('painter', [{'id': 'img-model'}], {
+        'img-model': [{'content': '![img](http://x/y.png)', 'type': 'image',
+                       'finish_reason': 'stop'}],
+    })
+    glm = FakeProvider('glm', [{'id': 'glm-4.7'}])
+    router = build_router({'painter': painter, 'glm': glm})
+    chunks = list(router.stream(
+        router.resolve('img-model'), 'draw a cat'))
+    kinds = [c.get('type') for c in chunks if c.get('content')]
+    assert 'image' in kinds, chunks
+    # the safety net was appended but never reached: painter answered
+    assert glm.calls == [], glm.calls
+
+
+def test_empty_answer_chain_exhaustion_surfaces_a_typed_error(tmp):
+    """Every target empty: the request fails with the OpenAI error shape
+    (502 upstream_error), naming every empty target — never a silent 200."""
+    empty1 = ScriptedProvider('e1', [{'id': 'ma'}], {
+        'ma': [{'content': '', 'type': 'text', 'finish_reason': 'stop'}]})
+    empty2 = ScriptedProvider('e2', [{'id': 'mb'}], {'mb': []})
+    router = build_router({'e1': empty1, 'e2': empty2})
+    router._lat['e1'] = 0.5
+    router._lat['e2'] = 1.0
+    with no_refresher(), no_retries():
+        try:
+            list(router.stream(router.resolve('auto'), 'hi'))
+            raise AssertionError('expected the empty chain to error')
+        except ProviderError as e:
+            msg = str(e)
+    assert 'fallback chain exhausted' in msg, msg
+    assert 'e1/ma' in msg and 'e2/mb' in msg, msg
+
+
 # --------------------------------- cross-provider LAST-RESORT safety net
 
 def _muted_specs():

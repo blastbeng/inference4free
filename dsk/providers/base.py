@@ -208,7 +208,17 @@ class FirstTokenTimeoutError(ProviderUnavailableError):
         super().__init__(message)
 
 
+class EmptyAnswerError(ProviderUnavailableError):
+    """Upstream finished its stream without any answer-worthy output.
 
+    Measured live: a target yields reasoning deltas (or nothing at all) and
+    then closes with ``finish_reason: stop`` — the client receives a 200
+    with an empty message (OpenWebUI renders only the collapsed "Pensiero"
+    panel). Like a stall, this is not something a same-target retry ladder
+    helps: the router walks to the next chain target immediately. Fallback
+    cannot duplicate client-visible ANSWER text, because none was emitted —
+    reasoning already streamed simply stays, and the next target appends
+    its own."""
 
 
 class Provider:

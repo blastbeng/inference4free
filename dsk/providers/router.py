@@ -72,6 +72,7 @@ from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 from .base import (
     Route,
     Provider,
+    EmptyAnswerError,
     FirstTokenTimeoutError,
     ProviderAuthError,
     ProviderError,
@@ -313,6 +314,20 @@ FALLBACK_NET = (os.getenv('I4F_FALLBACK_NET', '1').strip().lower()
 #      the sequential wave on the NEXT pass, declared or not.
 DISCOVERY_SLOW_ABOVE_S = max(
     1.0, float(os.getenv('I4F_DISCOVERY_SLOW_ABOVE_S', '10') or 10))
+
+
+def _is_answer_chunk(chunk: Any) -> bool:
+    """True when a unified chunk carries client-visible ANSWER output.
+
+    Only ``text`` and ``image`` content counts: a ``thinking`` chunk streams
+    into ``reasoning_content`` and is NOT an answer (a stream that yields
+    only thinking leaves the client with an empty message — measured live
+    on duck/tinfoil/gpt-oss-120b and reported from OpenWebUI as "shows only
+    the thinking").
+    """
+    return (isinstance(chunk, dict)
+            and chunk.get('type', '') in ('text', 'image')
+            and bool((chunk.get('content') or '').strip()))
 
 
 def _first_chunk(gen, timeout: float) -> Optional[Dict[str, Any]]:
@@ -1767,6 +1782,12 @@ class Router:
             while True:
                 attempt += 1
                 emitted = False
+                # answer-worthy output of THIS attempt: text/image content.
+                # A stream that ends with none (reasoning-only, or fully
+                # empty) is an EmptyAnswerError, not a success — measured
+                # live: duck/tinfoil/gpt-oss-120b closed with finish 'stop'
+                # and zero deltas, OpenWebUI showed only the think panel.
+                answer_emitted = False
                 try:
                     t_target = time.time()
                     gen = provider.stream(
@@ -1806,6 +1827,8 @@ class Router:
                                     'served_pub',
                                     public_model_id(target.provider_name,
                                                     target.model_id))
+                            if _is_answer_chunk(first):
+                                answer_emitted = True
                             yield first
                     rest = (_silence_guard(gen, STREAM_SILENCE_TIMEOUT)
                             if (first is not None
@@ -1824,7 +1847,15 @@ class Router:
                                 'served_pub',
                                 public_model_id(target.provider_name,
                                                 target.model_id))
+                        if _is_answer_chunk(chunk):
+                            answer_emitted = True
                         yield chunk
+                    if not answer_emitted:
+                        # The target closed its stream without an answer:
+                        # a 200 with an empty message is never a success.
+                        raise EmptyAnswerError(
+                            f'{served_by}: stream ended without an answer '
+                            f'(no text, tool call or image)')
                     return
                 except ProviderRateLimitError as e:
                     last_error = e
@@ -1868,6 +1899,20 @@ class Router:
                     self._mark_failed(target.provider_name, 'first-token stall')
                     logger.warning('%s stalled without first token, skipping '
                                    'to fallback: %s', served_by, e)
+                    break
+                except EmptyAnswerError as e:
+                    # The target finished without an answer (reasoning-only
+                    # or fully empty stream). Whatever it DID yield was
+                    # reasoning, not answer text — so unlike a mid-stream
+                    # failure, walking on cannot duplicate client-visible
+                    # output: the next target simply appends its own stream.
+                    # No same-target retry (an empty answer is upstream
+                    # behavior for this prompt, not a transient outage) and
+                    # no demotion (stochastic, not provider-wide).
+                    last_error = e
+                    chain_notes.setdefault(served_by, str(e)[:100])
+                    logger.warning('%s returned no answer, skipping to '
+                                   'fallback: %s', served_by, e)
                     break
                 except ProviderUnavailableError as e:
                     last_error = e

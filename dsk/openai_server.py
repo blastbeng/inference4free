@@ -1767,9 +1767,19 @@ async def _stream_completion(
             for chunk in _guard():
                 ctype = chunk.get("type", "")
                 content = chunk.get("content", "") or ""
-                if not served_holder["by"] and chunk.get("served_by"):
+                # served_by names the model the client should credit. The
+                # router may walk targets mid-stream (an empty/reasoning-only
+                # target falls back to the next one), so ANSWER-bearing
+                # chunks (text/image content) re-own the attribution — first
+                # touch only kept the fallback victim's name. This mirrors
+                # the non-streaming collector (last-wins).
+                if chunk.get("served_by") and (
+                        not served_holder["by"]
+                        or (ctype in ("text", "image") and content)):
                     served_holder["by"] = chunk["served_by"]
-                if not served_holder["pub"] and chunk.get("served_pub"):
+                if chunk.get("served_pub") and (
+                        not served_holder["pub"]
+                        or (ctype in ("text", "image") and content)):
                     served_holder["pub"] = chunk["served_pub"]
                 if not content:
                     continue
