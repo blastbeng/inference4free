@@ -94,6 +94,7 @@ HEALABLE: Dict[str, Path] = {
     'huggingchat': _BASE / 'providers' / 'huggingchat_provider.py',
     'groq': _BASE / 'providers' / 'groq_provider.py',
     'cerebras': _BASE / 'providers' / 'cerebras_provider.py',
+    'modelscope': _BASE / 'providers' / 'modelscope_provider.py',
 }
 
 _MODULE_NAMES = {
@@ -114,6 +115,7 @@ _MODULE_NAMES = {
     'huggingchat': 'dsk.providers.huggingchat_provider',
     'groq': 'dsk.providers.groq_provider',
     'cerebras': 'dsk.providers.cerebras_provider',
+    'modelscope': 'dsk.providers.modelscope_provider',
 }
 
 _PROVIDER_MODULES = {
@@ -153,6 +155,7 @@ _PROVIDER_CLASSES = {
     'huggingchat': 'HuggingChatProvider',
     'groq': 'GroqProvider',
     'cerebras': 'CerebrasProvider',
+    'modelscope': 'ModelScopeProvider',
 }
 
 # Markers grepped out of the upstream's JS bundles as fixer evidence.
@@ -197,6 +200,9 @@ _EVIDENCE_PATTERNS = {
     'cerebras': [r'api\.cerebras\.ai[A-Za-z0-9_/{}$.\\-]{0,60}',
                  r'csk-[A-Za-z0-9]{10,}', r'wrong_api_key',
                  r'rate_limit_exceeded'],
+    'modelscope': [r'api-inference\.modelscope\.cn[A-Za-z0-9_/{}$.\\-]{0,60}',
+                     r'ms-[0-9a-fA-F]{8}-', r'Authentication failed',
+                     r'request_id'],
 }
 
 
@@ -479,7 +485,8 @@ def _upstream_evidence(name: str, cap: int = 7000) -> str:
             'arena': 'https://arena.ai',
             'huggingchat': 'https://huggingface.co/chat',
             'groq': 'https://groq.com',
-            'cerebras': 'https://cerebras.ai'}.get(name, '')
+            'cerebras': 'https://cerebras.ai',
+            'modelscope': 'https://modelscope.cn'}.get(name, '')
     patterns = [re.compile(p) for p in
                 _EVIDENCE_PATTERNS.get(name, [r'[A-Za-z]{4,}'])]
     chunks: List[str] = []
