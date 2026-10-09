@@ -806,6 +806,7 @@ pytest tests -q
 | API changes break the client | Update to the latest version — DeepSeek's web API changes frequently |
 | `chatgpt relay busy with another stream` | The anonymous relay serves one stream at a time (the web UI is a single chat) — concurrent ChatGPT requests fall back; retry shortly or route through `auto` |
 | `fallback chain exhausted: …` | Every provider in the chain failed and the message names each one — fix the first entry (usually credentials or quota), the rest follow |
+| `deepseek signup is captcha-gated` | DeepSeek's send-code endpoint refused with `RECAPTCHA_VERIFY_FAILED`: the Turnstile token never rendered for the automated browser (typical for datacenter egress). Point `I4F_SIGNUP_PROXY` at a residential proxy, or seed `DEEPSEEK_LOGIN_EMAIL`/`DEEPSEEK_LOGIN_PASSWORD` with a ready account — requests keep being served from the fallback chain meanwhile |
 | 429 with `Retry-After` | Free-tier quota window — honour the header; hammering burns the whole window |
 | Thinking shows up as the answer in your client | Your client is reading `delta.content` only — read `delta.reasoning_content` (streaming) / `message.reasoning_content` (non-streaming) for the thinking panel, as OpenWebUI/LiteLLM do |
 
