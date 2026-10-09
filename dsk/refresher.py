@@ -2503,6 +2503,11 @@ def browser_login(name: str) -> Tuple[bool, str]:
             # gemini (Google) — best effort, heavy anti-bot
             page.get('https://accounts.google.com/ServiceLogin')
             time.sleep(4)
+            # EU egress bounces ServiceLogin through the consent
+            # interstitial, which covers the email input and makes the
+            # probe read "no field" forever — dismiss it first
+            _dismiss_consents(page)
+            time.sleep(2)
             if not _fill_first(page, _GEMINI_EMAIL_SELECTORS, email):
                 return False, 'google email field not found'
             _click_any(page, ['Next', 'Weiter'])
