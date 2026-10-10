@@ -483,6 +483,51 @@ def _probe_once(name: str) -> Tuple[str, str]:
             if not first:
                 return 'structural', 'perplexity completion produced no events'
             return 'ok', 'completion responds (anonymous session accepted)'
+        if name == 'glm':
+            # list_models proves nothing here either: /api/models answers with
+            # the full anonymous catalog even when generation is refused.
+            # z.ai now gates the anonymous tier ("Model not available for
+            # current user level", code 403) and a stale guest session streams
+            # an empty body — both look like a healthy "13 models" to the
+            # generic branch. Only a tiny REAL completion tells the truth
+            # (same reasoning as deepseek/perplexity/chatgpt).
+            from .providers.glm_provider import GlmProvider
+            provider = GlmProvider()
+            if not provider.available():
+                return 'auth', 'no GLM transport configured'
+            try:
+                models = provider.list_models()
+            except Exception as e:  # noqa: BLE001
+                return _classify(e), f'{type(e).__name__}: {e}'[:300]
+            if not models:
+                return 'structural', 'glm discovered 0 models'
+            # Prefer an anonymous z.ai route; fall back to whatever backend the
+            # catalog exposes (chatglm when a refresh token is configured).
+            target = next((m['id'] for m in models
+                           if m.get('backend') == 'zai'),
+                          models[0]['id'])
+            gen = provider.stream('ping', model=target,
+                                  thinking_enabled=False, search_enabled=False,
+                                  max_tokens=8)
+            try:
+                first = next(gen, None)
+            except Exception as e:  # noqa: BLE001 — classify by message
+                low = str(e).lower()
+                # A stale anonymous session streaming nothing, or a busy
+                # browser slot, is transient — never let it trigger an LLM
+                # auto-patch (a code rewrite cannot fix a gated account).
+                if any(k in low for k in ('no content', 'no usable stream',
+                                          'busy', 'timed out', 'timeout')):
+                    verdict = 'network'
+                else:
+                    verdict = _classify(e)
+                return verdict, f'{type(e).__name__}: {e}'[:300]
+            finally:
+                gen.close()
+            if first is None:
+                return 'network', ('glm completion produced no events '
+                                   '(stale anonymous session?)')
+            return 'ok', 'completion responds'
         module = importlib.import_module(_PROVIDER_MODULES[name])
         provider = getattr(module, _PROVIDER_CLASSES[name])()
         if not provider.available():

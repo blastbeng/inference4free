@@ -196,9 +196,12 @@ disable. **The LLM fixer never sees credentials.**
 
 Probes are **honest per provider** (`_probe_once`): DeepSeek gets a real
 completion through its PoW pipeline, qwen a `validate_token` call, ChatGPT the
-sentinel gate, gemini real cookies + `list_models`, perplexity a real
-completion (its `available()` is unconditional and the anonymous catalog
-lists models that are auth-walled — the generic JS-bundle evidence fallback
+sentinel gate, gemini real cookies + `list_models`, perplexity and glm real
+completions (perplexity's `available()` is unconditional and its anonymous
+catalog lists models that are auth-walled; z.ai's `/api/models` likewise
+answers with the full anonymous catalog even when generation is refused with a
+"Model not available for current user level" 403 or a stale guest session
+streams an empty body — in both cases the generic JS-bundle evidence fallback
 would report a misleading `ok`); only providers without a dedicated probe
 fall back to bundle-evidence grep.
 
