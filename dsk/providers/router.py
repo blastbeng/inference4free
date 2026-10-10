@@ -1506,10 +1506,16 @@ class Router:
             })
         # Per-provider smart routers (deepseek/auto, deepseek/auto-fast,
         # z.ai/auto-thinking, …): listed right after the global ones.
-        # Capability flags are the union of the provider's DISCOVERED models
-        # in that router's pool (all-True before discovery completes so
-        # clients do not pre-gate — the router filters at serve time). The
-        # thinking/search contract flags are fixed per kind.
+        # The thinking/search CONTRACT flags are fixed per kind — the pool
+        # router id IS the contract (auto-fast never thinks nor searches,
+        # auto-thinking always thinks) — and must NOT be unioned over the
+        # pool. A provider whose whole catalog is thinking-only (alibaba:
+        # every qwen route thinks) has an EMPTY auto-fast pool; the union/
+        # all-True-when-empty rule would then advertise thinking_enabled=True
+        # on auto-fast, contradicting the README §7 contract. Only the
+        # remaining capability flags (vision/image_gen) stay a union over the
+        # pool's models, all-True while the pool is empty so clients do not
+        # pre-gate (the router filters at serve time).
         for r in self.routes.values():
             if r.provider_name != 'router' or r.model_id in AUTO_ROUTER_KINDS:
                 continue
@@ -1517,17 +1523,24 @@ class Router:
                         if s.provider_name == r.upstream_model]
             tail = r.model_id.rsplit('/', 1)[-1]
             if tail == AUTO_FAST_MODEL_ID:
-                # pool: models that can never think and never search — the
-                # unions over these siblings then advertise exactly the
-                # auto-fast contract (thinking/search always False)
+                # pool: models that can never think and never search
                 pool_siblings = [s for s in siblings
                                  if not s.thinking_enabled
                                  and not s.search_enabled]
+                think_flag, search_flag = False, False
             elif tail == AUTO_THINKING_MODEL_ID:
                 # pool: models that can think (search-capable ones included)
                 pool_siblings = [s for s in siblings if s.thinking_enabled]
+                think_flag, search_flag = True, True
             else:
                 pool_siblings = siblings
+                # 'auto' keeps the legacy union semantics (and its all-True
+                # pre-discovery fallback): it re-routes to a capable model.
+                think_flag = search_flag = None
+            think_union = (not pool_siblings
+                           or any(s.thinking_enabled for s in pool_siblings))
+            search_union = (not pool_siblings
+                            or any(s.search_enabled for s in pool_siblings))
             entries.append({
                 'id': r.model_id,
                 'object': 'model',
@@ -1537,12 +1550,10 @@ class Router:
                 'max_model_len': 131072,
                 'max_completion_tokens': 32768,
                 'max_tokens': 32768,
-                'thinking_enabled': (not pool_siblings
-                                     or any(s.thinking_enabled
-                                            for s in pool_siblings)),
-                'search_enabled': (not pool_siblings
-                                   or any(s.search_enabled
-                                          for s in pool_siblings)),
+                'thinking_enabled': (think_union if think_flag is None
+                                     else think_flag),
+                'search_enabled': (search_union if search_flag is None
+                                   else search_flag),
                 'vision': (not pool_siblings
                            or any(s.vision for s in pool_siblings)),
                 'image_gen': (not pool_siblings

@@ -432,6 +432,36 @@ def test_list_models_advertises_pool_contracts(tmp):
     assert entries['z.ai/auto-thinking']['vision'] is True  # glm-4.7 has it
 
 
+def test_list_models_pool_contract_survives_an_empty_pool(tmp):
+    """A provider whose whole catalog sits in ONE pool must still advertise the
+    FIXED contract flags on its other pool router — never the union/
+    all-True-when-empty fallback. Live shape (README §7): alibaba's every qwen
+    route thinks, so its auto-fast pool is EMPTY, yet alibaba/auto-fast
+    advertised ``thinking_enabled: true`` + ``search_enabled: true``,
+    contradicting the contract ('auto-fast advertises thinking_enabled:
+    false', 'auto-fast never searches')."""
+    # thinking-only catalog (the alibaba shape): the auto-fast pool is EMPTY
+    glm_only_think = FakeProvider('glm', [{'id': 'glm-4.7',
+                                           'thinking_enabled': True}])
+    router = build_router({'glm': glm_only_think})
+    entries = {e['id']: e for e in router.list_models()}
+    assert entries['z.ai/auto-fast']['thinking_enabled'] is False
+    assert entries['z.ai/auto-fast']['search_enabled'] is False
+    assert entries['z.ai/auto-thinking']['thinking_enabled'] is True
+    # plain 'auto' keeps the union semantics (every model thinks => True)
+    assert entries['z.ai/auto']['thinking_enabled'] is True
+
+    # never-thinking catalog: the auto-thinking pool is EMPTY, yet the fixed
+    # contract still guarantees auto-thinking thinks (and auto-fast never does)
+    deepseek_fast_only = FakeProvider('deepseek', [{'id': 'deepseek-chat'}])
+    router = build_router({'deepseek': deepseek_fast_only})
+    entries = {e['id']: e for e in router.list_models()}
+    assert entries['deepseek/auto-thinking']['thinking_enabled'] is True
+    assert entries['deepseek/auto-thinking']['search_enabled'] is True
+    assert entries['deepseek/auto-fast']['thinking_enabled'] is False
+    assert entries['deepseek/auto-fast']['search_enabled'] is False
+
+
 def test_pool_rotations_use_independent_cursors(tmp):
     specs = _pool_router_specs()
     # a provider with two never-thinking models: its provider-scoped fast
