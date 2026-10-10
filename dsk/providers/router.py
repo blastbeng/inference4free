@@ -967,6 +967,31 @@ class Router:
         return [mid for mid in ordered
                 if getattr(routes[mid], 'thinking_enabled', False)]
 
+    def _capability_filter(self, chain: List[str],
+                           category: str) -> List[str]:
+        """Drop targets that cannot answer the request's modality.
+
+        A text request must never be served by an image-render route
+        (measured twice: 'say OK' on auto-fast AND 'pollinations/auto' came
+        back as ![image](…) when rotation luck put an image model such as
+        pollinations' 'sana' at the head of the chain — a text client then
+        shows a broken image instead of an answer). A vision/image-gen
+        request must only reach capable targets.
+
+        The filter is applied only when at least one capable route exists:
+        otherwise the chain is left intact, so a wrong-modality answer still
+        beats a hard error when nothing else is left (preserves legacy
+        behaviour for single-modality providers).
+        """
+        if category in ('vision', 'image_gen'):
+            cap = 'image_gen' if category == 'image_gen' else 'vision'
+            capable = [mid for mid in chain
+                       if getattr(self.routes[mid], cap, False)]
+            return capable or chain
+        text_capable = [mid for mid in chain
+                        if not getattr(self.routes[mid], 'image_gen', False)]
+        return text_capable or chain
+
     def _auto_chain(self, category: str,
                     thinking_override: Optional[bool] = None,
                     search_override: Optional[bool] = None,
@@ -1062,22 +1087,9 @@ class Router:
                                   len(plain) or 1)
             chain.extend((plain[m_off:] + plain[:m_off]) + searchy)
         chain.extend(unhealthy)
-        if category in ('vision', 'image_gen'):
-            cap = 'image_gen' if category == 'image_gen' else 'vision'
-            capable = [mid for mid in chain if getattr(self.routes[mid], cap)]
-            if capable:
-                chain = capable
-        else:
-            # Text request: image-render routes answer with a picture, never
-            # with text (measured: 'say OK' on auto-fast came back as
-            # ![image](…) from an image model that rotation luck put at the
-            # head) — they are out of text chains whenever any text-capable
-            # route exists.
-            text_capable = [mid for mid in chain
-                            if not getattr(self.routes[mid], 'image_gen',
-                                           False)]
-            if text_capable:
-                chain = text_capable
+        # Text chains never lead with an image-render route; vision/image-gen
+        # requests only reach capable targets (shared with the scoped routers).
+        chain = self._capability_filter(chain, category)
         return [mid for mid in chain
                 if self.routes.get(mid) is not None
                 and self.routes[mid].provider_name != 'router']
@@ -1655,7 +1667,12 @@ class Router:
             else:
                 # Provider-scoped smart router ('<prefix>/auto-fast', …): the
                 # same serve-time machinery restricted to one provider's
-                # models and one thinking pool.
+                # models and one thinking pool. The request category is
+                # classified here too, so the modality filter (a text chain
+                # never leads with an image-render model) applies to the
+                # scoped routers exactly as it does to the global one.
+                category = classify_request(prompt, bool(images),
+                                            image_generation)
                 chain = self._provider_chain(route.upstream_model,
                                              thinking_override,
                                              search_override, pool=pool)
@@ -1674,8 +1691,18 @@ class Router:
                 # them with one auth error) the cross-provider net backstops
                 # the request with the rest of the registry.
                 chain = chain + self._safety_net(chain, pool=pool)
-                logger.info('%s: chain=%s', route.model_id,
-                            ' -> '.join(chain[:5])
+                # Modality rule of the global 'auto' chain, applied to the
+                # FULL combined chain. A text request must never lead with
+                # this provider's image-render route when any text-capable
+                # target exists (measured: 'pollinations/auto' and
+                # '/auto-fast' answered a plain prompt with ![image](…)
+                # because pollinations' fast pool holds only its image model
+                # 'sana'). Filtering the provider chain alone cannot fix it —
+                # the text targets live in the cross-provider net, so the
+                # rule is applied here, after the net is appended.
+                chain = self._capability_filter(chain, category)
+                logger.info('%s: category=%s chain=%s', route.model_id,
+                            category, ' -> '.join(chain[:5])
                             + ('…' if len(chain) > 5 else ''))
         else:
             chain = [route.model_id] + [f for f in route.fallbacks

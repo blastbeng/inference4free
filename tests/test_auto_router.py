@@ -865,6 +865,44 @@ def test_image_models_never_serve_text_requests(tmp):
     assert 'sana' in img_chain
 
 
+def test_scoped_auto_router_never_serves_images_for_text(tmp):
+    """Regression: 'pollinations/auto' / '/auto-fast' answered a plain prompt
+    with ![image](…) — the provider-scoped chain lacked the modality filter
+    the global 'auto' chain already had. Modelled on pollinations' LIVE
+    catalog: its only text model ('openai-fast') is thinking-capable, so the
+    'fast' pool holds ONLY the image route ('sana'). Filtering the provider
+    chain alone cannot fix it — the text targets live in the cross-provider
+    net, so the rule is applied to the full combined chain."""
+    pollinations = FakeProvider('pollinations', [
+        {'id': 'openai-fast', 'thinking_enabled': True},
+        {'id': 'sana', 'image_gen': True},
+    ])
+    deepseek = FakeProvider('deepseek', [{'id': 'deepseek-chat'}])
+    router = build_router({'pollinations': pollinations, 'deepseek': deepseek})
+
+    # a text request on the plain scoped router lands on the text route.
+    # (openai-fast is thinking, so it also stays out of the fast pool.)
+    chunks = list(router.stream(router.resolve('pollinations/auto'), 'say OK'))
+    assert chunks[0]['served_by'] == 'pollinations/openai-fast', chunks[0]
+
+    # …and 'auto-fast' — whose pool holds only the image route — serves the
+    # net's text route instead of answering with a picture.
+    for _ in range(3):
+        chunks = list(router.stream(router.resolve('pollinations/auto-fast'),
+                                    'say OK'))
+        assert 'sana' not in chunks[0]['served_by'], chunks[0]
+
+    # an image request still reaches the capable image route.
+    chunks = list(router.stream(router.resolve('pollinations/auto'), 'a cat',
+                                image_generation=True))
+    assert 'sana' in chunks[0]['served_by'], chunks[0]
+
+    # the provider chain itself stays unfiltered (the net/filter do the work
+    # at serve time), so a leaf walk still probes every discovered model.
+    assert set(router._provider_chain('pollinations')) == {
+        'openai-fast', 'sana'}
+
+
 def test_unmeasured_browser_providers_never_lead_a_chain(tmp):
     """Right after a restart the latency table is empty and plain rotation
     opened fallback walks with a browser-relay cold boot (qwen stalled a
