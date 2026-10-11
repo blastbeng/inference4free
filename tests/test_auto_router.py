@@ -517,10 +517,12 @@ def test_router_id_helpers(tmp):
 
 
 def test_annotate_models_router_tools_flag(tmp):
-    """The /v1/models 'tools' flag on router entries is pool-aware: global
-    routers look at every provider's pool leaves, provider-scoped routers
-    only at their own, and auto-fast/auto-thinking only at their pool's
-    leaves (same strict partition the router serves with)."""
+    """The /v1/models 'tools' flag is PROOF-based: a leaf is tool-capable
+    only when its verdict is 'ok' ('unknown' == not verified yet), router
+    entries are pool-aware (global routers look at every provider's leaves,
+    provider-scoped only at their own, auto-fast/auto-thinking only at
+    their pool's leaves) and are hidden when no leaf of their pool is
+    proven (they re-list on their own once a probe passes)."""
     from dsk import toolprobe
     saved_state, saved_loaded = toolprobe._state, toolprobe._loaded
     saved_hide = os.environ.get('I4F_HIDE_TOOLLESS')
@@ -551,13 +553,15 @@ def test_annotate_models_router_tools_flag(tmp):
              'thinking_enabled': True, 'search_enabled': False},
         ]
         out = {e['id']: e for e in toolprobe.annotate_models(data)}
-        assert out['auto']['tools'] is True            # any leaf ok
+        assert out['auto']['tools'] is True            # glm-4.6 proven
         assert out['auto-fast']['tools'] is True       # glm-4.6 ok in pool
-        assert out['auto-thinking']['tools'] is True   # glm-4.7 unknown
+        # 'unknown' is NOT capability: no proven thinking leaf yet
+        assert out['auto-thinking']['tools'] is False
         assert out['deepseek/auto']['tools'] is True   # deepseek-chat ok
         assert out['deepseek/auto-fast']['tools'] is True
         assert out['deepseek/auto-thinking']['tools'] is False  # all failed
         assert out['deepseek/deepseek-reasoner']['tools'] is False
+        assert out['z.ai/glm-4.7']['tools'] is False   # unknown -> not proven
 
         # every deepseek leaf failed: the provider routers flip to False,
         # the global routers survive on z.ai
@@ -568,21 +572,42 @@ def test_annotate_models_router_tools_flag(tmp):
         assert out['auto']['tools'] is True
         assert out['auto-fast']['tools'] is True       # z.ai/glm-4.6 ok
 
-        # all thinking leaves failed -> auto-thinking False, auto still True
+        # the only thinking leaf turns failed -> auto-thinking False, auto True
         toolprobe._state['z.ai/glm-4.7']['status'] = 'failed'
         out = {e['id']: e for e in toolprobe.annotate_models(data)}
         assert out['auto-thinking']['tools'] is False
         assert out['auto']['tools'] is True
 
-        # hide_toolless drops failed LEAVES but never router entries
+        # hide_toolless drops every leaf that is not PROVEN capable (failed
+        # AND unverified) and every router whose pool has no proven leaf.
+        # (has_evidence() is True here: the state carries real verdicts.)
         os.environ['I4F_HIDE_TOOLLESS'] = '1'
         ids = [e['id'] for e in toolprobe.annotate_models(data)]
         assert 'deepseek/deepseek-reasoner' not in ids
         assert 'z.ai/glm-4.7' not in ids
-        for rid in ('auto', 'auto-fast', 'auto-thinking',
-                    'deepseek/auto', 'deepseek/auto-fast',
-                    'deepseek/auto-thinking'):
-            assert rid in ids, ids
+        assert 'deepseek/deepseek-chat' not in ids     # now failed
+        assert 'z.ai/glm-4.6' in ids                   # proven: kept
+        # routers with no proven pool leaf are hidden too
+        assert 'auto' in ids                           # z.ai/glm-4.6 proven
+        assert 'auto-fast' in ids                      # z.ai/glm-4.6 in pool
+        for rid in ('auto-thinking', 'deepseek/auto',
+                    'deepseek/auto-fast', 'deepseek/auto-thinking'):
+            assert rid not in ids, ids
+
+        # boot window: with no verdict at all nothing is hidden, so a cold
+        # process never serves an empty catalog (the first discovery probes
+        # every model at once)
+        toolprobe._state = {}
+        try:
+            boot = [e['id'] for e in toolprobe.annotate_models(data)]
+        finally:
+            toolprobe._state.update({
+                'deepseek/deepseek-chat': {'status': 'failed'},
+                'deepseek/deepseek-reasoner': {'status': 'failed'},
+                'z.ai/glm-4.6': {'status': 'ok'},
+                'z.ai/glm-4.7': {'status': 'failed'},
+            })
+        assert len(boot) == len(data), boot
     finally:
         toolprobe._state = saved_state
         toolprobe._loaded = saved_loaded
@@ -590,6 +615,71 @@ def test_annotate_models_router_tools_flag(tmp):
             os.environ.pop('I4F_HIDE_TOOLLESS', None)
         else:
             os.environ['I4F_HIDE_TOOLLESS'] = saved_hide
+
+
+def test_toolprobe_reconcile_never_excludes_permanently(tmp):
+    """Capability verdicts are re-verified at EVERY discovery: reconcile
+    forgets models gone upstream, force-probes brand-new ids and makes the
+    unproven ones due again — nothing is ever excluded for good."""
+    from dsk import toolprobe
+    saved_state, saved_loaded = toolprobe._state, toolprobe._loaded
+    saved_now = set(toolprobe._probe_now)
+    toolprobe._state = {
+        'gone/model': {'status': 'ok'},
+        'kept/failed': {'status': 'failed', 'last_checked': 1.0},
+        'kept/ok': {'status': 'ok', 'last_checked': 1.0},
+    }
+    toolprobe._loaded = True
+    toolprobe._probe_now = set()
+    try:
+        toolprobe.reconcile(['kept/failed', 'kept/ok', 'fresh/model'])
+        assert 'gone/model' not in toolprobe._state     # vanished -> pruned
+        # a disproven model is made due again (last_checked reset)
+        assert toolprobe._state['kept/failed']['last_checked'] == 0.0
+        # a proven one keeps its verdict and its clock
+        assert toolprobe._state['kept/ok']['last_checked'] == 1.0
+        # a brand-new model is probed at once
+        assert 'fresh/model' in toolprobe._probe_now
+        # 'unknown' placeholders do not count as evidence
+        assert toolprobe.has_evidence() is True
+        toolprobe._state = {'a/b': {'status': 'unknown'}}
+        assert toolprobe.has_evidence() is False
+    finally:
+        toolprobe._state = saved_state
+        toolprobe._loaded = saved_loaded
+        toolprobe._probe_now = saved_now
+
+
+def test_smart_routers_only_route_to_proven_tool_capable(tmp):
+    """The three smart routers must land ONLY on models proven tool-capable
+    (the OpenAI surface is tool-only). Unverified/disproven leaves drop out
+    of the chain; with no probe evidence yet the router stays permissive so
+    it is never unroutable during the boot window."""
+    from dsk import toolprobe
+    glm = FakeProvider('glm', [{'id': 'glm-4.6'}, {'id': 'glm-4.7'}])
+    router = build_router({'glm': glm})
+
+    saved_state, saved_loaded = toolprobe._state, toolprobe._loaded
+    toolprobe._loaded = True
+    try:
+        # no evidence at all: permissive (chains keep every model)
+        toolprobe._state = {}
+        assert router._tool_ok_ids() is None
+        assert set(router._auto_chain('general')) == {'glm-4.6', 'glm-4.7'}
+
+        # evidence exists -> only the proven leaf survives
+        toolprobe._state = {'z.ai/glm-4.6': {'status': 'ok'},
+                            'z.ai/glm-4.7': {'status': 'unknown'}}
+        assert router._auto_chain('general') == ['glm-4.6']
+
+        # nothing proven -> empty chain (the caller reports it cleanly)
+        toolprobe._state = {'z.ai/glm-4.6': {'status': 'failed'},
+                            'z.ai/glm-4.7': {'status': 'failed'}}
+        assert router._auto_chain('general') == []
+        assert router._provider_chain('glm') == []
+    finally:
+        toolprobe._state = saved_state
+        toolprobe._loaded = saved_loaded
 
 
 # ------------------------------------- chain-exhaustion error aggregation

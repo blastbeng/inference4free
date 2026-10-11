@@ -5,13 +5,18 @@ through the FULL server stack — the same ``/v1/chat/completions`` path real
 tool traffic takes, so the taught protocol, the parsers and the provider
 transport are all exercised exactly as a client would.
 
-Models that repeatedly answer without producing a tool call are excluded
-from ``/v1/models``; excluded models keep being re-probed on the same
-schedule, so one that starts working again (quota window reset, fresh
-credentials from the renewal bot) reappears on its own. Real traffic feeds
-the same state: a tools-request that produced a tool call is a positive
-signal, one that answered without calling under ``tool_choice='required'``
-is an unambiguous soft failure (K consecutive -> excluded).
+The OpenAI surface is tool-only: a model is advertised on ``/v1/models``
+and eligible for the smart routers ONLY once a canary or real traffic
+PROVED it can produce a tool call (status ``ok``). ``unknown`` is not
+capability — it means "not verified yet" — so an unverified model stays
+hidden until the canary tests it. Nothing is ever excluded PERMANENTLY:
+every model discovery re-schedules the unverified/failed models
+(:func:`reconcile`), a canary or traffic that passes re-includes a model
+instantly, and one that reappears upstream is probed again from scratch.
+Real traffic feeds the same state: a tools-request that produced a tool
+call is a positive signal (instant re-include); one that answered without
+calling under ``tool_choice='required'`` is an unambiguous soft failure
+(K consecutive -> excluded).
 
 State lives in ``<data>/toolcall_state.json`` and survives restarts.
 Infra failures (timeouts, 5xx, auth walls) never count toward exclusion:
@@ -23,7 +28,8 @@ Env:
   I4F_TOOLPROBE_BUDGET_S  min seconds between probes of ONE provider (3600)
   I4F_TOOLPROBE_SOFT_K    soft failures before exclusion (default 3)
   I4F_TOOLPROBE_TIMEOUT   canary request timeout (default 120)
-  I4F_HIDE_TOOLLESS       hide failed models from /v1/models (default on)
+  I4F_HIDE_TOOLLESS       hide models not PROVEN tool-capable from
+                          /v1/models (default on) — the API is tool-only
 """
 import json
 import os
@@ -129,10 +135,44 @@ def _entry(model_id: str) -> Dict[str, Any]:
 
 
 def capability(model_id: str) -> str:
-    """'ok' | 'failed' | 'unknown' for one PUBLIC model id."""
+    """'ok' | 'failed' | 'unknown' for one PUBLIC model id.
+
+    Read-only: querying the verdict of a never-probed id must not create a
+    state entry (it would pollute /toolcall/status and the persisted file)."""
     with _lock:
         _load()
-        return str(_entry(model_id).get('status') or 'unknown')
+        e = _state.get(model_id)
+        return str((e or {}).get('status') or 'unknown')
+
+
+def capable(model_id: str) -> bool:
+    """True ONLY when a canary/traffic probe PROVED tool calling works.
+
+    'unknown' is not capability: the OpenAI surface advertises tool-capable
+    models only, so an unverified model is not yet eligible (and is
+    re-tested at the next discovery, never excluded for good)."""
+    return capability(model_id) == 'ok'
+
+
+def capable_ids() -> set:
+    """PUBLIC ids of every model currently proven tool-capable."""
+    with _lock:
+        _load()
+        return {mid for mid, e in _state.items()
+                if str(e.get('status') or '') == 'ok'}
+
+
+def has_evidence() -> bool:
+    """True once the prober has recorded at least one REAL verdict.
+
+    'unknown' placeholders do not count: with no evidence at all (fresh
+    process, probe disabled) the router must not exclude every target, or
+    the registry would be unroutable during the boot window. The discovery
+    hook (:func:`reconcile`) probes immediately, so the window is short."""
+    with _lock:
+        _load()
+        return any(str(e.get('status') or '') in ('ok', 'failed')
+                   for e in _state.values())
 
 
 def status_snapshot() -> Dict[str, Any]:
@@ -215,6 +255,38 @@ def force_probe(model_id: str) -> None:
     """Schedule an immediate canary for one model (/toolcall/reprobe)."""
     with _lock:
         _probe_now.add(model_id)
+    _kick_event.set()
+
+
+def reconcile(served: List[str]) -> None:
+    """Re-verify tool capability on every model discovery.
+
+    Called by the router after each discovery pass with the PUBLIC ids of
+    every served leaf. Tool capability is therefore measured AGAIN at every
+    discovery — a verdict is never permanent:
+
+    * a model gone upstream is forgotten (a stale 'ok'/'failed' would
+      otherwise linger and mislabel a same-named re-discovery);
+    * a brand-new model is force-probed at once (it is hidden until
+      proven, so waiting for the regular cycle would leave it invisible
+      for a whole interval);
+    * an already-known model that is not proven ('unknown'/'failed') is
+      made due for the next probe cycle (provider budget still applies).
+    """
+    served_set = {str(m) for m in (served or []) if m}
+    if not served_set:
+        return
+    fresh: List[str] = []
+    with _lock:
+        _load()
+        for mid in [m for m in _state if m not in served_set]:
+            _state.pop(mid, None)
+        fresh = [mid for mid in served_set if mid not in _state]
+        for mid, e in _state.items():
+            if mid in served_set and str(e.get('status') or 'unknown') != 'ok':
+                e['last_checked'] = 0.0   # due for the next probe cycle
+        _probe_now.update(fresh)
+        _save()
     _kick_event.set()
 
 
@@ -389,23 +461,35 @@ def _is_router_model(model_id: str) -> bool:
 # ------------------------------------------------------------ /v1/models glue
 def annotate_models(data: List[Dict[str, Any]]
                     ) -> List[Dict[str, Any]]:
-    """Set the ``tools`` flag on /v1/models entries and drop toolless ones.
+    """Set the ``tools`` flag on /v1/models entries and advertise only
+    models PROVEN tool-capable.
 
-    Leaf models: flag from their own probe state ('failed' -> False).
+    The OpenAI surface is tool-only, so a leaf is listed (and flagged
+    ``tools: True``) ONLY when its own probe verdict is 'ok'. 'unknown'
+    (not verified yet) and 'failed' are both hidden while
+    ``I4F_HIDE_TOOLLESS`` is on; nothing is excluded for good — the next
+    discovery re-probes them and a pass re-lists the model on its own.
+
     Router entries ('auto', 'auto-fast', 'auto-thinking' plus every
-    '<prefix>/<kind>' variant): True while ANY leaf in the router's POOL is
-    ok or unknown (the router re-routes at serve time), False only when
-    every pool leaf is known-failed; router entries are never hidden — they
-    can still serve plain chat. The pool is the same strict partition the
-    router serves with (auto-fast: leaves that can never think and never
-    search; auto-thinking: thinking-capable leaves), read from the
-    /v1/models capability metadata. Global routers consider every
-    provider's pool leaves; provider-scoped routers ('z.ai/auto-fast', …)
-    only that provider's."""
+    '<prefix>/<kind>' variant) advertise ``tools: True`` only when at least
+    one leaf of their POOL is proven capable (the router re-routes at serve
+    time and itself only ever picks proven leaves); a router with no proven
+    leaf would 502 on every request, so it is hidden like a toolless leaf.
+    The pool is the same strict partition the router serves with
+    (auto-fast: leaves that can never think and never search;
+    auto-thinking: thinking-capable leaves), read from the /v1/models
+    capability metadata. Global routers consider every provider's pool
+    leaves; provider-scoped routers ('z.ai/auto-fast', …) only that
+    provider's.
+
+    Boot window: while the prober has no verdict at all
+    (:func:`has_evidence` False) nothing is hidden — an empty catalog would
+    be worse than an unverified one, and the first discovery probes every
+    model immediately."""
     from dsk.providers.router import (AUTO_FAST_MODEL_ID,
                                       AUTO_THINKING_MODEL_ID,
                                       router_id_parts)
-    hide = hide_toolless()
+    hide = hide_toolless() and has_evidence()
     out: List[Dict[str, Any]] = []
     leaf_status: Dict[str, Tuple[str, Dict[str, Any]]] = {}
     for e in data:
@@ -434,13 +518,21 @@ def annotate_models(data: List[Dict[str, Any]]
         if parts is not None:
             kind, base = parts
             statuses = [leaf_status[m][0] for m in _pool_leaves(kind, base)]
-            e['tools'] = (True if any(s != 'failed' for s in statuses)
-                          else (False if statuses else 'unknown'))
+            # Only a PROVEN leaf makes the router tool-capable. The router
+            # itself only ever serves proven leaves, so a pool with none of
+            # them would answer every request with a clean 'no tool-capable
+            # target' error — it is hidden like a toolless leaf while the
+            # prober re-tests its pool (never for good).
+            e['tools'] = any(s == 'ok' for s in statuses)
+            if hide and not e['tools']:
+                continue
             out.append(e)
             continue
         st = leaf_status.get(mid, ('unknown', None))[0]
-        e['tools'] = {'ok': True, 'failed': False}.get(st, 'unknown')
-        if hide and st == 'failed':
+        # 'unknown' is not capability — the API is tool-only, so anything
+        # unproven (or disproven) is hidden until a probe passes.
+        e['tools'] = (st == 'ok')
+        if hide and st != 'ok':
             continue
         out.append(e)
     return out

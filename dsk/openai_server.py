@@ -1443,9 +1443,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     _from_probe = (request.headers.get("x-i4f-toolprobe") == "1"
                    and _client_host in ("127.0.0.1", "::1"))
     if use_tools and route.provider_name != 'router' and not _from_probe:
-        # Dynamic tool-calling gate: a model the canary/traffic probe proved
-        # incapable answers 400 with the tool-capable alternatives — it is
-        # re-probed on a schedule and becomes selectable again on pass.
+        # Dynamic tool-calling gate: a leaf that is not PROVEN tool-capable
+        # (unverified or disproven) answers 400 with the tool-capable
+        # alternatives — every discovery re-probes it, so a model that passes
+        # becomes selectable again on its own.
         _gate = None
         try:
             from dsk import toolprobe as _gate
@@ -1453,10 +1454,16 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             _gate = None
         if _gate is not None:
             _pub_model = public_model_id(route.provider_name, route.model_id)
-            if _gate.capability(_pub_model) == 'failed':
+            # The OpenAI surface is tool-only: a leaf that is not PROVEN
+            # tool-capable is refused for tool traffic (the prober re-tests it
+            # on every discovery, so a passing model becomes usable on its
+            # own). Before the first verdict the gate stays open — refusing
+            # every model during the boot window would be worse than
+            # optimistic routing.
+            if _gate.has_evidence() and not _gate.capable(_pub_model):
                 try:
                     _capable = [m['id'] for m in _gate.annotate_models(
-                        ROUTER.list_models()) if m.get('tools') is not False]
+                        ROUTER.list_models()) if m.get('tools') is True]
                 except Exception:  # noqa: BLE001
                     _capable = []
                 raise HTTPException(
@@ -1464,8 +1471,9 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     detail={
                         "error": {
                             "message": (
-                                f"Model {_pub_model} does not support tool "
-                                "calling. Tool-capable models: "
+                                f"Model {_pub_model} is not a verified "
+                                "tool-calling model (unverified or "
+                                "disproven). Tool-capable models: "
                                 + ", ".join(_capable[:10])),
                             "type": "invalid_request_error",
                             "code": "model_does_not_support_tools",

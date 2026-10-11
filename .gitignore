@@ -169,3 +169,4 @@ data/
 .aider*
 .playwright-mcp/
 docker-compose.yml.bak-*
+toolcall_state.json

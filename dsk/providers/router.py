@@ -703,6 +703,14 @@ class Router:
             if changed:
                 logger.info('model registry updated: %d models available',
                             len(self.routes))
+            # Tool capability is re-verified at EVERY discovery: drop verdicts
+            # of models gone upstream, force-probe brand-new ones and make the
+            # unverified/failed ones due again. Nothing is excluded for good.
+            try:
+                from dsk import toolprobe as _toolprobe
+                _toolprobe.reconcile(self._served_leaf_ids())
+            except Exception as e:  # noqa: BLE001 — probing is best-effort
+                logger.info('toolprobe reconcile skipped: %s', e)
             return changed
 
     def _registry_thin(self) -> bool:
@@ -967,6 +975,49 @@ class Router:
         return [mid for mid in ordered
                 if getattr(routes[mid], 'thinking_enabled', False)]
 
+    def _tool_ok_ids(self) -> Optional[set]:
+        """PUBLIC ids of every model PROVEN tool-capable, or ``None`` when
+        the tool-only restriction must not be enforced.
+
+        The OpenAI surface is tool-only (see ``dsk/toolprobe.py``): the smart
+        routers may only land on a model a canary/traffic probe proved can
+        call tools. ``None`` means "no evidence yet" — a fresh process or a
+        disabled prober — where refusing every target would leave the router
+        unroutable; the discovery hook probes immediately, so that window is
+        short. An EMPTY set (evidence exists, nothing proven) is honoured
+        strictly: the caller reports a clean error instead of serving a
+        model that would derail a tool call.
+        """
+        try:
+            from dsk import toolprobe as _tp
+        except Exception:  # pragma: no cover - defensive
+            return None
+        try:
+            if not _tp.enabled() or not _tp.has_evidence():
+                return None
+            return _tp.capable_ids()
+        except Exception:  # noqa: BLE001 — never break routing on the probe
+            return None
+
+    def _filter_tool_capable(self, chain: List[str],
+                             ok: Optional[set]) -> List[str]:
+        """Drop targets not proven tool-capable (no-op when ``ok`` is None)."""
+        if ok is None:
+            return chain
+        kept: List[str] = []
+        for mid in chain:
+            route = self.routes.get(mid)
+            if route is None:
+                continue
+            if public_model_id(route.provider_name, mid) in ok:
+                kept.append(mid)
+        return kept
+
+    def _served_leaf_ids(self) -> List[str]:
+        """PUBLIC ids of every discovered leaf model (no synthetic routers)."""
+        return [public_model_id(r.provider_name, r.model_id)
+                for r in self.routes.values() if r.provider_name != 'router']
+
     def _capability_filter(self, chain: List[str],
                            category: str) -> List[str]:
         """Drop targets that cannot answer the request's modality.
@@ -1046,6 +1097,13 @@ class Router:
 
         # Pool contract (auto-fast / auto-thinking): strict capability filter.
         ordered = self._filter_pool(ordered, pool)
+        if not ordered:
+            return []
+        # Tool-only surface: the smart routers must never land on a model that
+        # cannot call tools. ``None`` = no probe evidence yet (see
+        # _tool_ok_ids); once evidence exists only proven leaves survive, and
+        # an empty result is surfaced as a clean error by the caller.
+        ordered = self._filter_tool_capable(ordered, self._tool_ok_ids())
         if not ordered:
             return []
 
@@ -1282,6 +1340,9 @@ class Router:
                               if route.provider_name == provider_name]
         # Pool contract first: capability is a hard filter, not a preference.
         ordered = self._filter_pool(ordered, pool)
+        # Tool-only surface: a provider router may only serve models that are
+        # PROVEN tool-capable (None = no evidence yet, see _tool_ok_ids).
+        ordered = self._filter_tool_capable(ordered, self._tool_ok_ids())
         for flag, requested in (('thinking_enabled', thinking_override),
                                 ('search_enabled', search_override)):
             if requested:
@@ -1351,7 +1412,10 @@ class Router:
             net = text_net
         # A pool router's contract survives the net: auto-fast must never
         # serve a thinking model, auto-thinking never a non-thinking one.
-        return self._filter_pool(net, pool)
+        net = self._filter_pool(net, pool)
+        # The tool-only surface survives the net too: a fallback must never
+        # hand a tool request to a model that cannot call tools.
+        return self._filter_tool_capable(net, self._tool_ok_ids())
 
     def _rr_next(self, key: str, n: int) -> int:
         """Next round-robin offset (0..n-1) for a router key.
@@ -1601,9 +1665,9 @@ class Router:
 
         ``images``/``image_generation`` restrict the fallback chain to
         vision/image-gen capable targets and are forwarded to the provider.
-        ``tools`` restricts it to targets whose dynamic tool-calling probe
-        (see dsk/toolprobe.py) has not failed; excluded models re-enter the
-        chain automatically when a later probe passes.
+        ``tools`` restricts it to targets PROVEN tool-capable by the dynamic
+        probe (see dsk/toolprobe.py); unverified/disproven models drop out
+        and re-enter the chain automatically when a later probe passes.
         """
         # Boot-window guard (see _ensure_fast_registry): a request that
         # lands in the first seconds of a cold process must be served from
@@ -1748,32 +1812,25 @@ class Router:
             chain = capable
 
         if tools and not tools_ignore_probe:
-            # Tool-calling requests may only be served by targets whose
-            # dynamic probe (canary or real traffic) has not disproved the
-            # capability. Unknown targets stay in (optimistic — they are
-            # probed on a schedule); known-failed ones drop out and re-enter
-            # automatically when a later probe passes.
-            try:
-                from dsk import toolprobe as _toolprobe
-            except Exception:  # pragma: no cover - defensive
-                _toolprobe = None
-            if _toolprobe is not None:
-                tool_capable = [mid for mid in chain
-                                if (tgt := self.routes.get(mid))
-                                and _toolprobe.capability(
-                                    public_model_id(tgt.provider_name, mid))
-                                != 'failed']
+            # Tool-calling requests may only be served by a target the probe
+            # PROVED can call tools ('ok'). Unverified ('unknown') and
+            # disproven ('failed') targets drop out; both re-enter
+            # automatically when a later probe passes. ``ok is None`` means
+            # no evidence yet (fresh process / probe disabled) — the chain is
+            # then left untouched rather than made unroutable.
+            ok = self._tool_ok_ids()
+            if ok is not None:
+                tool_capable = self._filter_tool_capable(chain, ok)
                 if tool_capable:
                     chain = tool_capable
                 else:
-                    # Every target is known-failed: keep the original chain.
-                    # The /v1 gate already 400s failed leaf models (except
-                    # the canary, which must reach them to re-test) — refusing
-                    # here would make excluded models unreachable for their
-                    # own re-probe (dead loop).
+                    # Nothing in the chain is proven capable. Keep the
+                    # original chain: the canary needs to reach unverified
+                    # targets, and the /v1 gate already 400s the leaves a
+                    # normal client may not use.
                     logger.info(
-                        'toolprobe: no tool-capable target in chain of %s — '
-                        'serving the original chain', route.model_id)
+                        'toolprobe: no proven tool-capable target in chain of '
+                        '%s — serving the original chain', route.model_id)
 
         for position, model_id in enumerate(chain):
             target = self.routes.get(model_id)

@@ -220,19 +220,26 @@ The web providers have no native function calling: the server emulates it.
   OpenAI `tool_calls` with streaming deltas; tool results return into the
   prompt with an explicit anti-loop instruction ("the call is DONE…").
 - **`toolprobe`**: periodic canary (`get_weather`) for EVERY model through the
-  full real stack; models that cannot call tools are excluded from
-  `/v1/models` (re-entering on their own if they recover); real traffic feeds
-  the same state (soft-fail only if `tool_choice='required'` produced no
-  calls); infrastructure failures do not count. Persistent state in
+  full real stack; the OpenAI surface is **tool-only**, so a model is listed
+  on `/v1/models` only once a canary or real traffic **proved** it produces a
+  real tool call (`ok`); `unknown` (not verified yet) and `failed` are hidden,
+  a leaf that is not proven is refused for tool traffic. Nothing is excluded
+  for good: every discovery calls `reconcile` (prunes models gone upstream,
+  force-probes brand-new ones, makes the unproven ones due again) and a
+  passing probe re-lists a model instantly. Real traffic feeds the same state
+  (soft-fail only if `tool_choice='required'` produced no calls);
+  infrastructure failures do not count. Persistent state in
   `data/toolcall_state.json`.
 - **Router-aware annotation** (`annotate_models`): router ids are recognized
   via `is_router_model_id` and never probed or tracked as leaf models (the
   per-model probe endpoint refuses them with a 400); on `/v1/models` a
-  router's `tools` flag mirrors its pool — global routers weigh every
-  provider's pool leaves, provider-scoped ones only their own, with
-  `auto-fast` / `auto-thinking` restricted to the pool partition — `false`
-  only when every pool leaf is known-failed, and router entries are never
-  hidden by `I4F_HIDE_TOOLLESS`.
+  router's `tools` flag is `true` only when at least one leaf of its pool is
+  **proven** capable — global routers weigh every provider's pool leaves,
+  provider-scoped ones only their own, with `auto-fast` / `auto-thinking`
+  restricted to the pool partition — and a router with no proven leaf is
+  hidden by `I4F_HIDE_TOOLLESS` like a toolless leaf. The smart routers
+  themselves only ever route to proven leaves; the boot window (no verdict at
+  all yet) leaves everything visible so a cold process is never unroutable.
 
 ### 2.7 Cross-cutting modules
 
